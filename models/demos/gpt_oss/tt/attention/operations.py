@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 
 import ttnn
 
@@ -265,7 +266,24 @@ def apply_allreduce(tensor, mesh_config, ccl_manager, hidden_size: int):
     Returns:
         Tensor after allreduce (if TP > 1) or original tensor
     """
-    if mesh_config.tp > 1:
+    if mesh_config.tp > 1 and os.environ.get("GPT_OSS_PREFILL_ATTN_AR", "ttnn") == "ttnn":
+        # ttnn.all_reduce (as the MoE prefill): the reduce_scatter_minimal_async + all_gather_async pair below gave a
+        # nondeterministic 32-row block on one device in prefill whenever the L1 / DRAM layout changed (e.g. any extra
+        # allocation such as the DFlash buffers).
+        tensor_allreduced = ttnn.all_reduce(
+            tensor, num_links=ccl_manager.num_links, topology=ttnn.Topology.Ring, cluster_axis=mesh_config.tp_axis
+        )
+        tensor.deallocate(True)
+        tensor = tensor_allreduced
+        local_hidden = hidden_size // mesh_config.tp
+        if ((local_hidden + 31) // 32) * 32 != local_hidden:
+            shape = tensor.shape
+            tensor_sliced = ttnn.slice(
+                tensor, starts=[0, 0, 0, 0], ends=[shape[0], shape[1], shape[2], hidden_size], steps=[1, 1, 1, 1]
+            )
+            tensor.deallocate(True)
+            tensor = tensor_sliced
+    elif mesh_config.tp > 1:
         tensor_allreduced = mesh_config.allreduce(tensor, ccl_manager, pad_size=0, axis=mesh_config.tp_axis)
         # ``mesh_config.allreduce`` now frees its input internally between
         # reduce_scatter and all_gather to keep peak DRAM within bounds for
