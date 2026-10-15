@@ -149,6 +149,8 @@ class DecoderLayer:
             hidden_states = ttnn.to_memory_config(embeddings, self.residual_memory_config, dtype=ttnn.bfloat16)
             embeddings.deallocate(True)
         residual = hidden_states
+        if self.capture_input is not None:  # DFlash: the previous layer's output, one row per user
+            self.capture_input(residual, "rows")
         # The DRAM-sharded QKV (batched_decode.BatchedQKV) reshards the normed shards straight into its input layout.
         attn_in = self.input_layernorm.forward_sharded(hidden_states)
         attn_partial = self.self_attn(
@@ -184,6 +186,10 @@ class DecoderLayer:
         self.is_last_layer = is_last_layer
         self.lm_head_fused = lm_head_fused
 
+    # DFlash (models/demos/gpt_oss/tt/dflash): callable(tensor, kind) receiving this layer's input residual (the
+    # previous layer's output), set by Model.enable_dflash_capture.
+    capture_input = None
+
     def _consumer_input(self, pending):
         """The input of a boundary's consumer op: the pending boundary itself when it runs fused into that op
         (fused_decode.config.DECODE_BOUNDARY_FUSE_CONSUMER), else its normed output after running it on its own."""
@@ -214,6 +220,8 @@ class DecoderLayer:
             is_decode=True,
         )
         residual = pending.residual_out
+        if self.capture_input is not None:  # DFlash: the previous layer's output (flat replicated vector)
+            self.capture_input(residual, "flat")
         pending.x.deallocate(True)
         pending.residual.deallocate(True)
 
@@ -260,6 +268,8 @@ class DecoderLayer:
 
         # hidden_states: [1, 1, tokens/num_rows, hidden_size/num_columns]
         # residual: [1, 1, tokens/num_rows, hidden_size/num_columns]
+        if self.capture_input is not None:  # DFlash: the previous layer's output, one row per token
+            self.capture_input(hidden_states, "prefill")
         residual = hidden_states
         hidden_states_post_norm = self.input_layernorm(hidden_states)
 
