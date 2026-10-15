@@ -80,16 +80,16 @@ void kernel_main() {
 
     cb_wait_front(cb_x, kt);
     cb_wait_front(cb_id, 1);
-    cb_wait_front(cb_sc, num_sel);
-    for (uint32_t e = 0; e < num_sel; ++e) {
+    // one union expert (processing index e) from weight CB wcb
+    auto expert = [&](uint32_t e, uint32_t wcb) {
         for (uint32_t p = 0; p < pairs; ++p) {
             tile_regs_acquire();
-            cb_wait_front(cb_w, kt);
-            custom_mm_block<true>(cb_x, cb_w, 0, 0, 0, kt);
-            cb_pop_front(cb_w, kt);
-            cb_wait_front(cb_w, kt);
-            custom_mm_block<true>(cb_x, cb_w, 0, 0, 1, kt);
-            cb_pop_front(cb_w, kt);
+            cb_wait_front(wcb, kt);
+            custom_mm_block<true>(cb_x, wcb, 0, 0, 0, kt);
+            cb_pop_front(wcb, kt);
+            cb_wait_front(wcb, kt);
+            custom_mm_block<true>(cb_x, wcb, 0, 0, 1, kt);
+            cb_pop_front(wcb, kt);
             custom_mm_block_init_short<transpose, split_acc, dense_packing>(cb_sc, cb_id, cb_act);
             custom_mm_block<true>(cb_sc, cb_id, e, 0, 2, 1);  // row weights
 
@@ -120,8 +120,33 @@ void kernel_main() {
             tile_regs_release();
             cb_push_back(cb_act, 1);
 
-            custom_mm_block_init_short<transpose, split_acc, dense_packing>(cb_x, cb_w, cb_act);
+            custom_mm_block_init_short<transpose, split_acc, dense_packing>(cb_x, wcb, cb_act);
         }
+    };
+    uint32_t e = 0;
+#ifdef MOE_PRED
+    // the P predicted experts' columns come in MOE_PRED_CB (prefetched by the reader before the union was known);
+    // hit bit k (writer, mailbox): prediction k was routed and is processed now, else its columns are skipped
+    uint32_t hits = 0;
+    UNPACK(hits = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+    MATH(hits = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+    PACK(hits = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+    for (uint32_t k = 0; k < MOE_PRED; ++k) {
+        if ((hits >> k) & 1) {
+            cb_wait_front(cb_sc, e + 1);
+            custom_mm_block_init_short<transpose, split_acc, dense_packing>(cb_x, MOE_PRED_CB, cb_act);
+            expert(e, MOE_PRED_CB);
+            ++e;
+        } else {
+            cb_wait_front(MOE_PRED_CB, 2 * pairs * kt);
+            cb_pop_front(MOE_PRED_CB, 2 * pairs * kt);
+        }
+    }
+    custom_mm_block_init_short<transpose, split_acc, dense_packing>(cb_x, cb_w, cb_act);
+#endif
+    for (; e < num_sel; ++e) {
+        cb_wait_front(cb_sc, e + 1);  // the writer pushes the scale tiles one by one
+        expert(e, cb_w);
     }
     cb_pop_front(cb_x, kt);
     cb_pop_front(cb_sc, num_sel);

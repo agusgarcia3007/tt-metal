@@ -115,9 +115,13 @@ void kernel_main() {
     const uint32_t num_sel = uni[0];
     uint32_t order[32];
 #ifdef MOE_PRED
+    uint32_t hits = 0;
     {
         uint32_t kept_pred[P];
-        moe_order::make_order<P>(pred, uni, order, kept_pred);
+        const uint32_t kept = moe_order::make_order<P>(pred, uni, order, kept_pred);
+        for (uint32_t j = 0; j < kept; ++j) {
+            hits |= 1u << kept_pred[j];
+        }
     }
 #else
     for (uint32_t e = 0; e < num_sel; ++e) {
@@ -127,6 +131,11 @@ void kernel_main() {
     ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, num_sel);
     ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, num_sel);
     ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, num_sel);
+#ifdef MOE_PRED
+    ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, hits);
+    ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, hits);
+    ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, hits);
+#endif
 
     volatile tt_l1_ptr uint16_t* w = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr + 128);
     cb_reserve_back(cb_sc, num_sel);
@@ -141,8 +150,8 @@ void kernel_main() {
                 t[(row_face + r * 32) / 4 + q] = pair;  // face 1, row r
             }
         }
+        cb_push_back(cb_sc, 1);  // compute starts on expert i as soon as its scale tile is here
     }
-    cb_push_back(cb_sc, num_sel);
 
     for (uint32_t e = 0; e < num_sel; ++e) {
         for (uint32_t p = 0; p < pairs; ++p) {

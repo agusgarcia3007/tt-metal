@@ -264,6 +264,11 @@ inline void rows_topk(
                 ins((hi & 0x8000) ? (~hi & 0xFFFF) : (hi | 0x8000), f * 16 + 2 * q + 1);
             }
         }
+#ifdef MOE_FUSED
+        if (r == r0) {
+            DeviceTimestampedData("MOE_T", 120 + r0);
+        }
+#endif
         const uint32_t bk[4] = {b0, b1, b2, b3};
         const uint32_t bi[4] = {i0, i1, i2, i3};
         int32_t v0 = 0;
@@ -281,9 +286,17 @@ inline void rows_topk(
         }
         for (uint32_t j = 0; j < topk; ++j) {
             ids[r * topk + j] = bi[j];
-            wq[r * topk + j] = (e[j] << 15) / (sum >> 1);
+            wq[r * topk + j] = q16_to_bf16((e[j] << 15) / (sum >> 1));  // BF16 (converted here, on both RISCs)
         }
+#ifdef MOE_FUSED
+        if (r == r0) {
+            DeviceTimestampedData("MOE_T", 130 + r0);
+        }
+#endif
     }
+#ifdef MOE_FUSED
+    DeviceTimestampedData("MOE_T", 140 + r0);
+#endif
 }
 
 template <uint32_t topk, uint32_t rows>
@@ -318,7 +331,7 @@ inline void rows_finish(
             wt[i] = 0;
         }
         for (uint32_t j = 0; j < topk; ++j) {
-            wt[slot[ids[r * topk + j]]] = q16_to_bf16(wq[r * topk + j]);
+            wt[slot[ids[r * topk + j]]] = static_cast<uint16_t>(wq[r * topk + j]);
         }
         for (uint32_t i = 0; i < 16; ++i) {
             wts_w[16 * r + i] = wt[2 * i] | (static_cast<uint32_t>(wt[2 * i + 1]) << 16);

@@ -51,6 +51,7 @@ void kernel_main() {
         get_write_ptr(cb_idx) + 128,
         MOE_PRED_SEM,
         pred);
+    cb_reserve_back(MOE_PRED_CB, P * cols * kt);
     const uint32_t pre = get_write_ptr(MOE_PRED_CB);
     for (uint32_t k = 0; k < P; ++k) {
         const uint64_t src = get_noc_addr_from_bank_id<true>(bank_id, w_addr + pred[k] * expert_stride + reader_offset);
@@ -75,15 +76,8 @@ void kernel_main() {
 #ifdef MOE_PRED
     uint32_t kept_pred[P];
     const uint32_t kept = moe_order::make_order<P>(pred, uni, order, kept_pred);
-    noc_async_read_barrier();              // the prefetch
-    for (uint32_t j = 0; j < kept; ++j) {  // predicted and routed: copy the prefetched columns into the ring
-        for (uint32_t c = 0; c < cols; ++c) {
-            cb_reserve_back(cb_w, kt);
-            noc_async_read(get_noc_addr(pre + (kept_pred[j] * cols + c) * col_bytes), get_write_ptr(cb_w), col_bytes);
-            noc_async_read_barrier();
-            cb_push_back(cb_w, kt);
-        }
-    }
+    noc_async_read_barrier();                  // the prefetch
+    cb_push_back(MOE_PRED_CB, P * cols * kt);  // compute takes the routed ones, skips the others
     e0 = kept;
 #else
     for (uint32_t e = 0; e < num_sel; ++e) {
