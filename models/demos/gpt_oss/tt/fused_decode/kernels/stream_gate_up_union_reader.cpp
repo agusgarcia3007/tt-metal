@@ -28,8 +28,12 @@ void kernel_main() {
     constexpr auto uni_args = TensorAccessorArgs<7>();
 
     constexpr uint32_t col_bytes = kt * tile_bytes;
-    constexpr uint32_t pages_per_col = col_bytes / page_bytes;
-    static_assert(pages_per_col * page_bytes == col_bytes, "page size must divide the column");
+    // Packets of up to 16 KB regardless of tile boundaries (the column is one contiguous block in DRAM and in the
+    // ring): full packets then a tail.
+    constexpr uint32_t pkt = NOC_MAX_BURST_SIZE < col_bytes ? NOC_MAX_BURST_SIZE : col_bytes;
+    constexpr uint32_t full_pkts = col_bytes / pkt;
+    constexpr uint32_t tail = col_bytes - full_pkts * pkt;
+    (void)page_bytes;
 
     cb_reserve_back(cb_idx, 1);
     const uint32_t idx_l1 = get_write_ptr(cb_idx);
@@ -46,7 +50,7 @@ void kernel_main() {
 
     const uint64_t w_base = get_noc_addr_from_bank_id<true>(bank_id, w_addr);
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, noc_index);
-    noc_async_read_one_packet_set_state<true>(w_base, page_bytes, vc);
+    noc_async_read_one_packet_set_state<true>(w_base, pkt, vc);
 
     // Triple-buffered columns, one extra column in flight (transaction ids 1..3).
     constexpr uint32_t num_buffers = 3;
@@ -64,10 +68,17 @@ void kernel_main() {
         uint32_t src = offsets[e];
         for (uint32_t c = 0; c < cols; ++c) {
             noc_async_read_set_trid(trid);
-            for (uint32_t p = 0; p < pages_per_col; ++p) {
+            for (uint32_t p = 0; p < full_pkts; ++p) {
                 noc_async_read_one_packet_with_state_with_trid(w_base, src, l1_write, trid);
-                src += page_bytes;
-                l1_write += page_bytes;
+                src += pkt;
+                l1_write += pkt;
+            }
+            if constexpr (tail > 0) {
+                noc_async_read_one_packet_set_state<true>(w_base, tail, vc);
+                noc_async_read_one_packet_with_state_with_trid(w_base, src, l1_write, trid);
+                noc_async_read_one_packet_set_state<true>(w_base, pkt, vc);
+                src += tail;
+                l1_write += tail;
             }
             ++issued;
             if (free_blocks == num_buffers - extra_in_flight) {
