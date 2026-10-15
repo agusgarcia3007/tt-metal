@@ -51,6 +51,7 @@
 #define BND_WAIT_N 1
 #endif
 #include "router_topk.hpp"
+#include "bfp8_row.hpp"
 
 #ifndef ROWS
 #define ROWS 1
@@ -484,6 +485,9 @@ void kernel_main() {
 #ifdef MOE_FUSED
         DeviceTimestampedData("MOE_T", 103);
 #endif
+#ifdef LIN_T  // (profiling: output column c arrived)
+        DeviceTimestampedData("LIN_T", 10 + c);
+#endif
 #ifdef QKV_ROPE_KV
         const uint32_t n = slot_column(c);
 #else
@@ -611,13 +615,35 @@ void kernel_main() {
                 // K (rotated) / V rows -> their prefetched cache tiles (row pos % 32), written back.
                 const uint32_t t0 = kv_l1 + (scr_pages + 2 * c) * kv_tile_bytes;
                 invalidate_l1_cache();  // src was written by the packer
-                for (uint32_t i = 0; i < rows; ++i) {
+#ifdef KV_SPLIT
+                // the first output column (a K / V column on every core, qkv_column_order): rows [rows / 2, rows) were
+                // converted by the reader (kernels/stream_linear_reader.cpp) into KV_SPLIT_CB_STAGE
+                const uint32_t i1 = c == 0 ? rows / 2 : rows;
+#else
+                constexpr uint32_t i1 = rows;
+#endif
+                for (uint32_t i = 0; i < i1; ++i) {
                     bfp8_write_row(
                         t0 + row_group(i) * kv_tile_bytes,
                         src + i * half_row,
                         src + row_face + i * half_row,
                         row_pos[i] % 32);
                 }
+#ifdef KV_SPLIT
+                if (c == 0) {
+                    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(KV_SPLIT_SEM)), 1);
+                    invalidate_l1_cache();
+                    volatile tt_l1_ptr uint32_t* st =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(KV_SPLIT_CB_STAGE));
+                    for (uint32_t i = rows / 2; i < rows; ++i) {
+                        for (uint32_t hh = 0; hh < 2; ++hh) {
+                            volatile tt_l1_ptr uint32_t* e = st + 8 * (2 * i + hh);
+                            const uint32_t man[4] = {e[1], e[2], e[3], e[4]};
+                            bfp8_row::put(t0 + row_group(i) * kv_tile_bytes, row_pos[i] % 32, hh, e[0], man);
+                        }
+                    }
+                }
+#endif
                 noc_async_write(t0, kv_cache_addr_g(n, 0), kv_tile_bytes);
                 if (two_groups) {
                     noc_async_write(t0 + kv_tile_bytes, kv_cache_addr_g(n, 1), kv_tile_bytes);
@@ -659,6 +685,9 @@ void kernel_main() {
             noc_async_writes_flushed();
         }
         cb_pop_front(cb_out, 1);
+#ifdef LIN_T  // (profiling: output column c written)
+        DeviceTimestampedData("LIN_T", 40 + c);
+#endif
     }
     if constexpr (out_mode == 6) {
         // Through the (now drained) activation staging of cb_x.

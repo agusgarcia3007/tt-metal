@@ -631,6 +631,19 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("BND_WAIT_N", str(b_.H))]
         if extra_defines:
             defines = (defines or []) + list(extra_defines)
+        if os.environ.get("LIN_T") and rope_kv is not None:  # (profiling: the QKV writer's per-column timeline)
+            defines = (defines or []) + [("LIN_T", "1")]
+        # DFLASH_KV_SPLIT=1 (multi-row QKV with the K / V cache write): the reader converts half the rows of the first
+        # (K / V) output column to BFP8 while the writer converts the others (kernels/stream_linear_reader.cpp)
+        kv_split = rope_kv is not None and M > 1 and os.environ.get("DFLASH_KV_SPLIT", "1") == "1"
+        if kv_split:
+            defines = (defines or []) + [
+                ("KV_SPLIT", "1"),
+                ("KV_SPLIT_SEM", "2"),
+                ("KV_SPLIT_CB_OUT", str(cb_out)),
+                ("KV_SPLIT_CB_STAGE", "13"),
+            ]
+            cbs.append(self._cb(13, ttnn.uint32, 64 * M, 1))
 
         def build():
             program = self._program(
@@ -653,6 +666,11 @@ class LinearStream(_BankStreamOp):
                 program.kernels = list(program.kernels) + fused_kernels
                 program.cbs = list(program.cbs) + fused_cbs
                 program.semaphores = list(program.semaphores) + list(fused_semaphores)
+            if kv_split:
+                assert all(sd.id != 2 for sd in program.semaphores)
+                program.semaphores = list(program.semaphores) + [
+                    ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, self.cores, 0)
+                ]
             return program
 
         assert not (send and pending), "an op is either a boundary producer or its consumer"

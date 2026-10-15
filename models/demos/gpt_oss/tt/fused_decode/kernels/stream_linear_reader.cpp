@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
+#include "bfp8_row.hpp"
 #ifdef MOE_SPLIT_ROWS
 #include "router_topk.hpp"
 #endif
@@ -71,6 +72,36 @@ void kernel_main() {
         cb_push_back(cb_w, kt);
         trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
     }
+#ifdef KV_SPLIT
+    // Multi-row QKV with the K / V cache write (stream_linear_writer.cpp): this core's first output column is a K / V
+    // column; convert rows [rows / 2, rows) of it to BFP8 (shared exponent + 4 mantissa words per 16-value half, 32 B
+    // apart in KV_SPLIT_CB_STAGE) while the writer converts the others; the writer pops the tile.
+    {
+        constexpr uint32_t rows = ROWS;
+        constexpr uint32_t half_row = 32;  // one row of a [rows, 16] face
+        constexpr uint32_t row_face = 32 * rows;
+        cb_wait_front(KV_SPLIT_CB_OUT, 1);
+        invalidate_l1_cache();
+        const uint32_t src = get_read_ptr(KV_SPLIT_CB_OUT);
+        volatile tt_l1_ptr uint32_t* st =
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(KV_SPLIT_CB_STAGE));
+        for (uint32_t i = rows / 2; i < rows; ++i) {
+            for (uint32_t hh = 0; hh < 2; ++hh) {
+                uint32_t shared, man[4];
+                bfp8_row::half_row(
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src + hh * row_face + i * half_row), shared, man);
+                volatile tt_l1_ptr uint32_t* e = st + 8 * (2 * i + hh);
+                e[0] = shared;
+                for (uint32_t q = 0; q < 4; ++q) {
+                    e[1 + q] = man[q];
+                }
+            }
+        }
+        asm volatile("fence" ::: "memory");
+        noc_semaphore_inc(get_noc_addr(get_semaphore(KV_SPLIT_SEM)), 1);
+        noc_async_atomic_barrier();
+    }
+#endif
 #ifdef MOE_SPLIT_ROWS
     // Router of the fused MoE (dflash/moe_fused.py): the second half of the rows' top-k (stream_linear_writer.cpp
     // runs the first half and the union), from the logits tile in cb_out (the writer pops it after the union).
