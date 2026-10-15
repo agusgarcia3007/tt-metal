@@ -39,7 +39,7 @@ class ArgmaxGather:
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(CORE, CORE)])
         self.coords = [ttnn.MeshCoordinate(0, c) for c in range(mesh_device.shape[1])]
 
-    def _kernel(self, ct, rt_args, scratch):
+    def _kernel(self, ct, rt_args, scratch, defines=None):
         rt = ttnn.RuntimeArgs()
         rt[CORE.x][CORE.y] = rt_args
         k = ttnn.KernelDescriptor(
@@ -48,6 +48,7 @@ class ArgmaxGather:
             compile_time_args=ct,
             runtime_args=rt,
             config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0),
+            defines=list(defines or []),
         )
         cb = ttnn.CBDescriptor(
             total_size=scratch,
@@ -56,7 +57,7 @@ class ArgmaxGather:
         )
         return ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[cb])
 
-    def __call__(self, lists, tokens_src, out):
+    def __call__(self, lists, tokens_src, out, accept=None):
         """lists: the LM head's [1, n_lists * rows * 2] UINT32 lists; tokens_src: kind 0 the drafter's token input
         (element 0 = the block's first token), kind 1 the verify block tokens; out: kind 0 the verify token input
         [1, rows] UINT32, kind 1 a [1, 2 * rows] UINT32 result buffer."""
@@ -83,9 +84,15 @@ class ArgmaxGather:
         ct1 = [1, rows, n_dev, self.kind, 0, 4096, out_page, src_page]
         for t in (self.gathered, out, tokens_src):
             ct1 += ttnn.TensorAccessorArgs(t).get_compile_time_args()
-        prog = self._kernel(
-            ct1,
-            [self.gathered.buffer_address(), out.buffer_address(), tokens_src.buffer_address()],
-            n_dev * 4096 + max(src_page, 64),
-        )
-        ttnn.generic_op([self.gathered, tokens_src, out], prog)
+        rt1 = [self.gathered.buffer_address(), out.buffer_address(), tokens_src.buffer_address()]
+        io = [self.gathered, tokens_src, out]
+        defines = None
+        if accept is not None:  # (mask id, [vpos, t_toks, t_pos, t_rot, t_bound, t_cpos, t_crot]): device rounds
+            mask_id, ts = accept
+            for t in ts:
+                ct1 += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+            rt1 += [t.buffer_address() for t in ts]
+            io += list(ts)
+            defines = [("ACCEPT", "1"), ("ACCEPT_MASK_ID", str(mask_id))]
+        prog = self._kernel(ct1, rt1, n_dev * 4096 + max(src_page, 64) + 1024, defines)
+        ttnn.generic_op(io, prog)

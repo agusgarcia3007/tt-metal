@@ -187,6 +187,15 @@ class FastDFlashRunner:
             draft.fused = FusedDraft(draft, self.verify)
             self.verify.set_context_target_rowtile(draft.fused.ctx_buf, draft.fused.ctx_split)
         self.verify_trace = None
+        # Device rounds: the verify pass's argmax merge also computes the acceptance and writes the next round's
+        # drafter / verify / context inputs, so the host only reads the result.
+        self.device_rounds = os.environ.get("DFLASH_DEVICE_ROUNDS", "1") == "1"
+        if self.device_rounds:
+            d = draft
+            self.verify.accept = (
+                d.mask_token_id,
+                [self.verify.pos, d.t_toks, d.t_pos, d.t_rot, d.t_bound, d.t_cpos, d.t_crot],
+            )
 
     def _verify(self, block, start):
         self.verify.set_inputs(block, start)
@@ -232,8 +241,9 @@ class FastDFlashRunner:
             t = time.perf_counter()
             start = len(ids) - 1
             # draft -> (on device) verify block -> verify -> one host read of [block, target argmaxes]
-            self.draft.set_draft_inputs(ids[-1], start)
-            self.verify.set_positions(start)
+            if not (self.device_rounds and accept):  # device rounds: the previous verify pass wrote the inputs
+                self.draft.set_draft_inputs(ids[-1], start)
+                self.verify.set_positions(start)
             if self.verify_trace is None:
                 self.draft._draft_device()
                 self.verify.forward()
@@ -248,7 +258,10 @@ class FastDFlashRunner:
             while k < B - 1 and d[k] == post[k]:
                 k += 1
             ids += d[:k] + [post[k]]
-            self.draft.add_context_traced(None, range(start, start + k + 1))
+            if self.device_rounds:  # the context positions are on device already
+                self.draft.run_context()
+            else:
+                self.draft.add_context_traced(None, range(start, start + k + 1))
             t3 = time.perf_counter()
             accept.append(k + 1)
             rounds.append((t1 - t, t2 - t1, t3 - t2))

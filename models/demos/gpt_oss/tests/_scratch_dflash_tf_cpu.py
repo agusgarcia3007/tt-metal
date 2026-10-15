@@ -44,6 +44,7 @@ def test_tf_cpu(mesh_device, device_params):
     lm, emb = head["lm_head.weight"], head["model.embed_tokens.weight"]
     refs = torch.load(Path(__file__).parents[4] / "generated" / "dflash_reference.pt")
     allacc = []
+    allacc_v = {}
     for w, r in enumerate(refs):
         ids = r["prompt_ids"]
         L = len(ids)
@@ -58,18 +59,27 @@ def test_tf_cpu(mesh_device, device_params):
             warmup_prefill=False,
         )
         feats = cap.prefill_features(len(full))  # [n, 5 * hidden]
-        pos, acc = 0, []
-        while pos < NEW:
-            start = L + pos
-            block = [ref[pos]] + [ref_d.mask_token_id] * 7
-            hid = ref_d.forward(feats[:start], emb[block], range(start), range(start, start + 8))
-            d = (hid[1:] @ lm.T).argmax(-1).tolist()
-            k = 0
-            while k < 7 and d[k] == ref[pos + 1 + k]:
-                k += 1
-            acc.append(k + 1)
-            pos += k + 1
-        allacc += acc
-        print(f"TFCPU prompt {w}: accept {sum(acc) / len(acc):.3f} over {len(acc)} rounds", flush=True)
+        vocabs = [int(v) for v in os.environ.get("TF_VOCAB", "0").split(",")]  # 0: full; N: ids < N only
+        for V in vocabs:
+            pos, acc = 0, []
+            while pos < NEW:
+                start = L + pos
+                block = [ref[pos]] + [ref_d.mask_token_id] * 7
+                hid = ref_d.forward(feats[:start], emb[block], range(start), range(start, start + 8))
+                if V:  # ids < V plus the special tokens (>= 199998)
+                    sub = torch.cat([torch.arange(V), torch.arange(199998, lm.shape[0])])
+                    d = sub[(hid[1:] @ lm[sub].T).argmax(-1)].tolist()
+                else:
+                    d = (hid[1:] @ lm.T).argmax(-1).tolist()
+                k = 0
+                while k < 7 and d[k] == ref[pos + 1 + k]:
+                    k += 1
+                acc.append(k + 1)
+                pos += k + 1
+            allacc_v.setdefault(V, []).extend(acc)
+            print(f"TFCPU prompt {w} vocab {V}: accept {sum(acc) / len(acc):.3f} over {len(acc)} rounds", flush=True)
+        allacc = allacc_v[vocabs[0]]
+    for V, a in allacc_v.items():
+        print(f"TFCPU vocab {V}: mean accept {sum(a) / len(a):.3f} over {len(a)} rounds", flush=True)
     hist = [allacc.count(k) for k in range(1, 9)]
     print(f"TFCPU mean accept {sum(allacc) / len(allacc):.3f} over {len(allacc)} rounds; histogram {hist}", flush=True)

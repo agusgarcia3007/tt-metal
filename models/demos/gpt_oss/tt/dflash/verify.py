@@ -213,6 +213,9 @@ class FusedVerify:
         self.features = {}
         self.fused = self.boundary.ccl == "fabric"  # producer-sent / consumer-fused boundaries need the fabric CCL
         self.debug = None  # list: (tag, host [M, hidden]) after every boundary (debugging)
+        # (mask id, next-round input tensors): the device computes the round's acceptance and writes the next round's
+        # inputs (dflash/argmax.py ACCEPT; FastDFlashRunner device rounds)
+        self.accept = None
 
     def enable_device_argmax(self):
         """Merge the LM head's argmax lists on device (dflash/argmax.py): result = [block tokens, 8 argmaxes] (UINT32
@@ -314,7 +317,7 @@ class FusedVerify:
             pending = PendingBoundary(b, res, gamma, self.partial, "moe", sent=True)
         self.lm_head(pending, self.lm_weights, self.lists)
         if getattr(self, "argmax_gather", None) is not None:
-            self.argmax_gather(self.lists, self.tokens, self.result)
+            self.argmax_gather(self.lists, self.tokens, self.result, accept=self.accept)
         pending.x.deallocate(True)
         pending.residual.deallocate(True)
         pending.residual_out.deallocate(True)
@@ -460,7 +463,7 @@ class FusedVerify:
         res.deallocate(True)
         self.lm_head(x, self.lm_weights, self.lists)
         if getattr(self, "argmax_gather", None) is not None:
-            self.argmax_gather(self.lists, self.tokens, self.result)
+            self.argmax_gather(self.lists, self.tokens, self.result, accept=self.accept)
         x.deallocate(True)
 
     def _dbg(self, tag, res, x):

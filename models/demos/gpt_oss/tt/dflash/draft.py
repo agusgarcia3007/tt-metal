@@ -842,6 +842,13 @@ class DFlashDraft:
         else:
             ttnn.execute_trace(self.mesh_device, self.trace_ctx, cq_id=0, blocking=False)
 
+    def run_context(self):
+        """The context pass on positions already written on device (t_cpos / t_crot)."""
+        if self.trace_ctx is None:
+            self._context_device()
+        else:
+            ttnn.execute_trace(self.mesh_device, self.trace_ctx, cq_id=0, blocking=False)
+
     def draft_traced(self, last_token, start):
         """The 7 draft tokens (host) after `last_token` at position `start`."""
         self.set_draft_inputs(last_token, start)
