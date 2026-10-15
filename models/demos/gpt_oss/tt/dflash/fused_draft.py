@@ -148,9 +148,13 @@ class FusedDraft:
         def dram(t, dt=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mc=ttnn.DRAM_MEMORY_CONFIG):
             return ttnn.from_torch(t, dtype=dt, layout=layout, device=mesh, memory_config=mc, mesh_mapper=rep)
 
-        self.q = dram(torch.zeros(1, ROWS, nq, hd))
-        self.k = dram(torch.zeros(1, ROWS, nkv, hd))
-        self.vv = dram(torch.zeros(1, ROWS, nkv, hd))
+        # DFLASH_L1_INTER=1: the per-layer q / k / v head tensors (and the SDPA output) in L1 instead of DRAM
+        self.inter_mc = (
+            ttnn.L1_MEMORY_CONFIG if os.environ.get("DFLASH_L1_INTER", "1") == "1" else ttnn.DRAM_MEMORY_CONFIG
+        )
+        self.q = dram(torch.zeros(1, ROWS, nq, hd), mc=self.inter_mc)
+        self.k = dram(torch.zeros(1, ROWS, nkv, hd), mc=self.inter_mc)
+        self.vv = dram(torch.zeros(1, ROWS, nkv, hd), mc=self.inter_mc)
         S = self.slices
         self.act = act_buffer(mesh, I_pad // S, M, slots=S, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         u = torch.zeros(1, 64, dtype=torch.int32)
@@ -417,7 +421,7 @@ class FusedDraft:
                 scale=d.hd**-0.5,
                 program_config=d.sdpa_pc,
                 compute_kernel_config=d.ck,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                memory_config=self.inter_mc,
             )
             qr.deallocate(True)
             self.o(attn, self.w_o[i], v.partial, send=(b, "attn") if fab else None)

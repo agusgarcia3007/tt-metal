@@ -204,6 +204,7 @@ class FusedVerify:
         rep = ttnn.ReplicateTensorToMesh(mesh)
         dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
         # Logical [1, M, heads, head_dim] (tile-padded to 32 head rows): SDPA takes the head count from the shape.
+        # (DRAM: the long-context trace's ttnn SDPA takes an unsharded Q from DRAM only)
         self.q = ttnn.from_torch(
             torch.zeros(1, M, self.nq, self.hd),
             dtype=ttnn.bfloat16,
