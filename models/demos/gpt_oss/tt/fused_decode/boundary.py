@@ -144,10 +144,23 @@ class DecodeBoundary:
     partial into a slot before every device has consumed layer i's (the two sites alternate)."""
 
     def __init__(
-        self, mesh_device, hidden, eps, cluster_axis, sites=("attn", "moe"), ccl=DECODE_BOUNDARY_CCL, rows=1, links=None
+        self,
+        mesh_device,
+        hidden,
+        eps,
+        cluster_axis,
+        sites=("attn", "moe"),
+        ccl=DECODE_BOUNDARY_CCL,
+        rows=1,
+        links=None,
+        helpers=None,
     ):
         """rows > 1: `rows` tokens per call (multi-row decode, e.g. the DFlash verify block): every flat buffer holds
-        `rows` flat vectors back to back and the RMSNorm runs per vector."""
+        `rows` flat vectors back to back and the RMSNorm runs per vector.
+        helpers (rows > 1, fabric): logical cores that split the boundary's work by page range (kernels/bnd_mc_*.cpp):
+        the sender delivers page range h of every partial to helper h (one fabric packet each), the residual stays
+        sharded over the helpers, they share the RMSNorm statistic and write the normed output to the boundary core,
+        whose relay (kernels/bnd_relay.cpp) notifies the consumers."""
         assert ccl in ("fabric", "ttnn"), ccl
         self.rows = rows
         self.links = links or DECODE_BOUNDARY_LINKS  # fabric links of the producer-fused send (sending_program)
@@ -210,19 +223,55 @@ class DecodeBoundary:
             ttnn.MeshCoordinate(r, c) for r in range(mesh_device.shape[0]) for c in range(mesh_device.shape[1])
         ]
         self.residual_rows_config = residual_memory_config(mesh_device, hidden)
+        self.mc = bool(helpers)
+        if self.mc:
+            assert rows > 1 and ccl == "fabric", "helpers: multi-row fabric boundaries"
+            self.helpers = [ttnn.CoreCoord(*h) for h in helpers]
+            self.H = len(self.helpers)
+            self.PH = -(-self.all // self.H)
+            self.all_pad = self.H * self.PH
+            assert self.PH * PAGE <= max_payload, f"one helper's pages ({self.PH * PAGE} B) must fit one fabric packet"
+            self.chunk, self.chunks = self.PH * PAGE, -(-self.payload // (self.PH * PAGE))
+            assert self.chunks == self.H
+            self.helper_cores = ttnn.CoreRangeSet([ttnn.CoreRange(h, h) for h in self.helpers])
+            self.helper_noc = [mesh_device.worker_core_from_logical_core(h) for h in self.helpers]
+            assert [(c.x, c.y) for c in ttnn.corerange_to_cores(self.helper_cores, row_wise=True)] == [
+                (h.x, h.y) for h in self.helpers
+            ], "helpers in row-major order (shard order)"
+            self.mc_config = self._helper_config(self.PH)
+            for name in sites:  # receive slots on the helpers: [slot][PH pages] each, zero (pad pages stay zero)
+                self.sites[name] = (
+                    ttnn.from_torch(
+                        torch.zeros(flat_shape(hidden, self.ring * self.all_pad)),
+                        dtype=ttnn.bfloat16,
+                        layout=ttnn.TILE_LAYOUT,
+                        device=mesh_device,
+                        memory_config=self._helper_config(self.ring * self.PH),
+                        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+                    ),
+                    self.sites[name][1],
+                )
+
+    def _helper_config(self, shard_pages):
+        return ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(self.helper_cores, (TILE, shard_pages * TILE), ttnn.ShardOrientation.ROW_MAJOR),
+        )
 
     def flat_gamma(self, norm):
         """The RMSNorm weight as a flat BF16 [1, 1, 1, 32 * 32 * pages] row-major DRAM tensor (one page); rows > 1: in
         the row-tile layout, repeated for every row."""
         w = ttnn.to_torch(ttnn.get_device_tensors(norm.tt_weight)[0]).reshape(-1).float()
-        flat = torch.zeros(1, 1, 1, self.all * TILE * TILE)
+        n_pages = self.all_pad if getattr(self, "mc", False) else self.all
+        flat = torch.zeros(1, 1, 1, n_pages * TILE * TILE)
         if self.rows == 1:
             flat[..., : self.hidden] = w[: self.hidden]
         else:
             c = rows_to_rowtile(w[: self.hidden][None].repeat(self.rows, 1))  # [32, 32 * pages] container
-            flat[0, 0, 0] = tile_rows_to_flat(c, self.all * TILE * TILE)
+            flat[0, 0, 0, : self.all * TILE * TILE] = tile_rows_to_flat(c, self.all * TILE * TILE)
         if self.rows > 1:  # one 2 KB page per tile, interleaved over the DRAM banks (parallel reads)
-            flat = flat.reshape(1, 1, self.all, TILE * TILE)
+            flat = flat.reshape(1, 1, n_pages, TILE * TILE)
         return ttnn.from_torch(
             flat,
             dtype=ttnn.bfloat16,
@@ -232,7 +281,15 @@ class DecodeBoundary:
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
         )
 
-    def _empty_flat(self):
+    def _empty_flat(self, residual=False):
+        if residual and self.mc:
+            return ttnn.empty(
+                flat_shape(self.hidden, self.all_pad),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.mesh_device,
+                memory_config=self.mc_config,
+            )
         return ttnn.empty(
             flat_shape(self.hidden, self.all),
             dtype=ttnn.bfloat16,
@@ -268,18 +325,19 @@ class DecodeBoundary:
         `links` > 1, sender `link` (RISCV_0 for link 0, RISCV_1 for link 1) sends every links-th packet."""
         recv, sem = self.sites[site]
         rt = ttnn.RuntimeArgs()
+        slot = coord[self.cluster_axis] * (self.chunk if self.mc else self.payload)
         rt[self.core.x][self.core.y] = [
             partial.buffer_address(),
-            recv.buffer_address() + coord[self.cluster_axis] * self.payload,
+            recv.buffer_address() + slot,
             self.noc_xy[0],
             self.noc_xy[1],
             ttnn.get_global_semaphore_address(sem),
-        ]
+        ] + ([v for p in self.helper_noc for v in (p.x, p.y)] if self.mc else [])
         return ttnn.KernelDescriptor(
             kernel_source=str(KERNEL_DIR / "boundary_sender.cpp"),
             core_ranges=self.cores,
             compile_time_args=[self.payload, self.chunk, self.fwd_hops, self.bwd_hops, producers, sem_id]
-            + [link, links, 1 if link == 0 else 0],
+            + [link, links, 1 if link == 0 else 0, 1 if self.mc else 0],
             runtime_args=rt,
             config=ttnn.DataMovementConfigDescriptor(
                 processor=(ttnn.DataMovementProcessor.RISCV_0, ttnn.DataMovementProcessor.RISCV_1)[link],
@@ -330,10 +388,128 @@ class DecodeBoundary:
         """Producer writer compile-time args: [notify, boundary core NOC x, y, semaphore id]."""
         return [1, self.noc_xy[0], self.noc_xy[1], 0]
 
+    RELAY_SEM, XCHG_SEM = 5, 6  # multi-core boundary program semaphores (boundary core, helpers)
+
+    def _parts_mc(self, residual, gamma, partial, site, entry, norm, sent):
+        """_parts with helpers (kernels/bnd_mc_*.cpp on the helper cores). The returned kernel builder's kernels run on
+        the helpers; the caller adds the boundary-core relay (or nothing) and semaphores mc_semaphores()."""
+        assert norm and self.ccl == "fabric"
+        slots = self.ring if partial is not None else 0  # entry boundaries: no all-reduce
+        res_mode = 2 if entry == "zero" else (1 if entry else 0)
+        if res_mode == 2:
+            residual = gamma  # accessor placeholder, never read
+        out_res = self._empty_flat(residual=True)
+        out_x = self._empty_flat()
+        recv, sem = self.sites[site] if slots else (None, None)
+        sem_addr = ttnn.get_global_semaphore_address(sem) if slots else 0
+        PH, Hn, A = self.PH, self.H, self.all
+        cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, cb_y = 8, 9, 10, 11, 24, 25, 26, 27, 28
+        cb_p, cb_rsum, cb_v, cb_xchg = 29, 30, 31, 12
+        hc = self.helper_cores
+
+        def cb(index, size, dtype=ttnn.bfloat16, tensor=None):
+            fmt = [
+                ttnn.CBFormatDescriptor(
+                    buffer_index=index, data_format=dtype, page_size=PAGE if dtype == ttnn.bfloat16 else 4096
+                )
+            ]
+            if tensor is not None:
+                d = ttnn.cb_descriptor_from_sharded_tensor(index, tensor)
+                d.total_size = size
+                d.format_descriptors = fmt
+                return d
+            return ttnn.CBDescriptor(total_size=size, core_ranges=hc, format_descriptors=fmt)
+
+        f32 = ttnn.float32
+        cbs = [
+            cb(cb_res, PH * PAGE, tensor=None if res_mode else residual),
+            cb(cb_res_out, PH * PAGE, tensor=out_res),
+            cb(cb_gamma, PH * PAGE),
+            cb(cb_scaler, PAGE),
+            cb(cb_sq, 4096, f32),
+            cb(cb_rs, 4096, f32),
+            cb(cb_x, PH * PAGE),
+            cb(cb_y, PH * 4096, f32),
+            cb(cb_p, PAGE),
+            cb(cb_rsum, 4096, f32),
+            cb(cb_v, 4096, f32),
+            cb(cb_xchg, Hn * 4096, f32),
+        ]
+        if slots:
+            cbs.append(cb(cb_recv, slots * PH * PAGE, tensor=recv))
+        reader_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, PH, slots, slots, res_mode, self.hidden * 2]
+        reader_ct += [self.rows, cb_p, cb_xchg, Hn, self.XCHG_SEM]
+        reader_ct += ttnn.TensorAccessorArgs(gamma).get_compile_time_args()
+        reader_ct += ttnn.TensorAccessorArgs(residual).get_compile_time_args()
+        compute_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, PH, slots]
+        compute_ct += [_f32_bits(1.0 / self.hidden), _f32_bits(self.eps), cb_y, cb_p, cb_rsum, cb_v, cb_xchg, Hn]
+        writer_ct = [cb_v, cb_xchg, cb_x, PH, Hn, self.XCHG_SEM, self.RELAY_SEM]
+        hnoc = [v for p in self.helper_noc for v in (p.x, p.y)]
+        reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for h, c in enumerate(self.helpers):
+            page0 = h * PH
+            reader_rt[c.x][c.y] = [gamma.buffer_address(), sem_addr, residual.buffer_address(), page0]
+            writer_rt[c.x][c.y] = [out_x.buffer_address(), self.noc_xy[0], self.noc_xy[1], page0]
+            writer_rt[c.x][c.y] = list(writer_rt[c.x][c.y]) + [max(0, min(PH, A - page0)), h] + hnoc
+        dm = ttnn.DataMovementConfigDescriptor
+
+        def kernels(coord):
+            return [
+                ttnn.KernelDescriptor(
+                    kernel_source=str(KERNEL_DIR / "bnd_mc_reader.cpp"),
+                    core_ranges=hc,
+                    compile_time_args=reader_ct,
+                    runtime_args=reader_rt,
+                    config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_1),
+                ),
+                ttnn.KernelDescriptor(
+                    kernel_source=str(KERNEL_DIR / "bnd_mc_compute.cpp"),
+                    core_ranges=hc,
+                    compile_time_args=compute_ct,
+                    runtime_args=[],
+                    config=ttnn.ComputeConfigDescriptor(
+                        math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, math_approx_mode=False
+                    ),
+                ),
+                ttnn.KernelDescriptor(
+                    kernel_source=str(KERNEL_DIR / "bnd_mc_writer.cpp"),
+                    core_ranges=hc,
+                    compile_time_args=writer_ct,
+                    runtime_args=writer_rt,
+                    config=dm(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0),
+                ),
+            ]
+
+        io = [residual, out_res, out_x, gamma] + ([partial, recv] if slots else [])
+        return kernels, cbs, io, out_res, out_x, bool(slots) and not sent, None, cb_x
+
+    def mc_semaphores(self):
+        return [
+            ttnn.SemaphoreDescriptor(self.RELAY_SEM, ttnn.CoreType.WORKER, self.cores, 0),
+            ttnn.SemaphoreDescriptor(self.XCHG_SEM, ttnn.CoreType.WORKER, self.helper_cores, 0),
+        ]
+
+    def _relay_kernel(self, consumer_cores):
+        consumers = [
+            self.mesh_device.worker_core_from_logical_core(c)
+            for c in ttnn.corerange_to_cores(consumer_cores, row_wise=True)
+        ]
+        rt = ttnn.RuntimeArgs()
+        rt[self.core.x][self.core.y] = [v for p in consumers for v in (p.x, p.y)]
+        return ttnn.KernelDescriptor(
+            kernel_source=str(KERNEL_DIR / "bnd_relay.cpp"),
+            core_ranges=self.cores,
+            compile_time_args=[self.H, self.RELAY_SEM, len(consumers), 0],
+            runtime_args=rt,
+            config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_1),
+        )
+
     def _parts(self, residual, gamma, partial, site, entry, norm, sent):
         """The boundary-core part of a boundary: (per-device kernel list builder, CBs, io tensors, residual', x).
         entry: False, True (residual = the embedding rows) or "zero" (no residual: residual' = the reduced partial;
         `residual` is ignored)."""
+        if self.mc:
+            return self._parts_mc(residual, gamma, partial, site, entry, norm, sent)
         res_mode = 2 if entry == "zero" else (1 if entry else 0)
         if res_mode == 2:
             residual = gamma  # accessor placeholder, never read
@@ -431,7 +607,9 @@ class DecodeBoundary:
         )
         mesh_program = ttnn.MeshProgramDescriptor()
         for coord in self.coords:
-            program = ttnn.ProgramDescriptor(kernels=kernels(coord), semaphores=[], cbs=cbs)
+            program = ttnn.ProgramDescriptor(
+                kernels=kernels(coord), semaphores=self.mc_semaphores() if self.mc else [], cbs=cbs
+            )
             if send:
                 links = min(self.links, self.chunks)
                 for link in range(links):
@@ -455,6 +633,15 @@ class DecodeBoundary:
             pending.residual, pending.gamma, pending.partial, pending.site, pending.entry, True, True
         )
         assert not send and reduced is None, "consumer fusion needs the producer-sent fabric all-reduce"
+        if self.mc:
+            pending.residual_out, pending.x = out_res, out_x
+            semaphores = [ttnn.SemaphoreDescriptor(0, ttnn.CoreType.WORKER, consumer_cores.merge(self.cores), 0)]
+            return (
+                kernels(self.coords[0]) + [self._relay_kernel(consumer_cores)],
+                cbs,
+                semaphores + self.mc_semaphores(),
+                io,
+            )
         rt = ttnn.RuntimeArgs()
         consumer_list = ttnn.corerange_to_cores(consumer_cores, row_wise=True)
         noc = [self.mesh_device.worker_core_from_logical_core(c) for c in consumer_list]

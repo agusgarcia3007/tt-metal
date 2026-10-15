@@ -222,33 +222,50 @@ inline void rows_topk(
     uint32_t r1,
     volatile tt_l1_ptr uint32_t* ids,
     volatile tt_l1_ptr uint32_t* wq) {
+    static_assert(topk == 4, "rows_topk: register top-4");
     for (uint32_t r = r0; r < r1; ++r) {
-        uint32_t bk[topk];
-        uint32_t bi[topk];
-        for (uint32_t j = 0; j < topk; ++j) {
-            bk[j] = 0;
-            bi[j] = 0;
-        }
-        for (uint32_t f = 0; f < 2; ++f) {
-            const uint32_t* w = words + 8 * (f * rows + r);
-            for (uint32_t q = 0; q < 8; ++q) {
-                const uint32_t v = w[q];
-                for (uint32_t h = 0; h < 2; ++h) {
-                    const uint32_t b = h ? (v >> 16) : (v & 0xFFFF);
-                    const uint32_t key = (b & 0x8000) ? (~b & 0xFFFF) : (b | 0x8000);
-                    if (key > bk[topk - 1]) {
-                        uint32_t p = topk - 1;
-                        while (p > 0 && key > bk[p - 1]) {
-                            bk[p] = bk[p - 1];
-                            bi[p] = bi[p - 1];
-                            --p;
+        // sorted top-4 in registers (b0 >= b1 >= b2 >= b3; strict > keeps the lower id first on ties)
+        uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0, i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+        auto ins = [&](uint32_t key, uint32_t id) __attribute__((always_inline)) {
+            if (key > b3) {
+                if (key > b2) {
+                    b3 = b2;
+                    i3 = i2;
+                    if (key > b1) {
+                        b2 = b1;
+                        i2 = i1;
+                        if (key > b0) {
+                            b1 = b0;
+                            i1 = i0;
+                            b0 = key;
+                            i0 = id;
+                        } else {
+                            b1 = key;
+                            i1 = id;
                         }
-                        bk[p] = key;
-                        bi[p] = f * 16 + 2 * q + h;
+                    } else {
+                        b2 = key;
+                        i2 = id;
                     }
+                } else {
+                    b3 = key;
+                    i3 = id;
                 }
             }
+        };
+#pragma GCC unroll 2
+        for (uint32_t f = 0; f < 2; ++f) {
+            const uint32_t* w = words + 8 * (f * rows + r);
+#pragma GCC unroll 8
+            for (uint32_t q = 0; q < 8; ++q) {
+                const uint32_t v = w[q];
+                const uint32_t lo = v & 0xFFFF, hi = v >> 16;
+                ins((lo & 0x8000) ? (~lo & 0xFFFF) : (lo | 0x8000), f * 16 + 2 * q);
+                ins((hi & 0x8000) ? (~hi & 0xFFFF) : (hi | 0x8000), f * 16 + 2 * q + 1);
+            }
         }
+        const uint32_t bk[4] = {b0, b1, b2, b3};
+        const uint32_t bi[4] = {i0, i1, i2, i3};
         int32_t v0 = 0;
         uint32_t e[topk];
         uint32_t sum = 0;

@@ -40,10 +40,16 @@ void kernel_main() {
     constexpr uint32_t first_chunk = get_compile_time_arg_val(6);
     constexpr uint32_t chunk_step = get_compile_time_arg_val(7);
     constexpr uint32_t local = get_compile_time_arg_val(8);
+    // mc: multi-core boundary (DecodeBoundary helpers): chunk c goes to helper c's receive slots (runtime args 5..:
+    // helper noc x, y per chunk), each chunk with its own receive-semaphore increment; slot_addr is then the slot
+    // offset in the helpers' receive buffer.
+    constexpr uint32_t mc = get_compile_time_arg_val(9);
     constexpr uint32_t chunks = (payload + chunk - 1) / chunk;
+    auto hx = [](uint32_t c) -> uint32_t { return get_arg_val<uint32_t>(5 + 2 * c); };
+    auto hy = [](uint32_t c) -> uint32_t { return get_arg_val<uint32_t>(6 + 2 * c); };
 
     DeviceZoneScopedN("BND_S_SEND");
-    size_t arg_idx = 5;
+    size_t arg_idx = 5 + (mc ? 2 * chunks : 0);
     auto fabric = FabricConnectionManager::build_from_args<
         FabricConnectionManager::BuildFromArgsMode::BUILD_AND_OPEN_CONNECTION_START_ONLY>(arg_idx);
 
@@ -55,18 +61,20 @@ void kernel_main() {
     constexpr uint32_t ring_hdrs = my_chunks <= 4 ? my_chunks : 4;
     volatile PACKET_HEADER_TYPE* fwd_hdr[ring_hdrs];
     volatile PACKET_HEADER_TYPE* bwd_hdr[ring_hdrs];
-    const uint64_t sem_noc = safe_get_noc_addr(recv_noc_x, recv_noc_y, sem_addr, 0);
+    const uint64_t sem_noc0 = safe_get_noc_addr(recv_noc_x, recv_noc_y, sem_addr, 0);
     // Plain writes; only this sender's last chunk carries the receive-semaphore increment (packets of one route
     // arrive in order), so a receiver counts one increment per sender and source device (as ttnn's all-reduce does:
     // a fused atomic per packet costs more than the write).
     constexpr uint32_t last_chunk = first_chunk + (my_chunks - 1) * chunk_step;
     auto prepare = [&](uint32_t c, uint32_t h) {
         const uint32_t bytes = c + 1 < chunks ? chunk : payload - c * chunk;
-        const uint64_t dst = safe_get_noc_addr(recv_noc_x, recv_noc_y, slot_addr + c * chunk, 0);
+        const uint64_t dst = mc ? safe_get_noc_addr(hx(c), hy(c), slot_addr, 0)
+                                : safe_get_noc_addr(recv_noc_x, recv_noc_y, slot_addr + c * chunk, 0);
+        const uint64_t sem_noc = mc ? safe_get_noc_addr(hx(c), hy(c), sem_addr, 0) : sem_noc0;
         if constexpr (fwd_hops > 0) {
             fwd_hdr[h]->to_chip_multicast(
                 tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(fwd_hops)});
-            if (c == last_chunk) {
+            if (mc || c == last_chunk) {
                 fwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
                     tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
             } else {
@@ -76,7 +84,7 @@ void kernel_main() {
         if constexpr (bwd_hops > 0) {
             bwd_hdr[h]->to_chip_multicast(
                 tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(bwd_hops)});
-            if (c == last_chunk) {
+            if (mc || c == last_chunk) {
                 bwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
                     tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
             } else {
@@ -99,7 +107,14 @@ void kernel_main() {
     }
     DeviceTimestampedData("BND_T", 1);  // producers done: the send starts
     if constexpr (local) {
-        noc_async_write(partial_addr, get_noc_addr(slot_addr), payload);
+        if constexpr (mc) {
+            for (uint32_t c = 0; c < chunks; ++c) {
+                const uint32_t bytes = c + 1 < chunks ? chunk : payload - c * chunk;
+                noc_async_write(partial_addr + c * chunk, get_noc_addr(hx(c), hy(c), slot_addr), bytes);
+            }
+        } else {
+            noc_async_write(partial_addr, get_noc_addr(slot_addr), payload);
+        }
     }
 
     uint32_t i = 0;
@@ -127,7 +142,13 @@ void kernel_main() {
 
     if constexpr (local) {
         noc_async_write_barrier();
-        noc_semaphore_inc(get_noc_addr(sem_addr), 1);
+        if constexpr (mc) {
+            for (uint32_t c = 0; c < chunks; ++c) {
+                noc_semaphore_inc(get_noc_addr(hx(c), hy(c), sem_addr), 1);
+            }
+        } else {
+            noc_semaphore_inc(get_noc_addr(sem_addr), 1);
+        }
     }
     DeviceTimestampedData("BND_T", 2);  // every packet handed to the fabric
     fabric.close();

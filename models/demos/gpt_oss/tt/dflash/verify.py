@@ -71,6 +71,9 @@ class FusedVerify:
             rows=M,
             links=int(os.environ.get("DFLASH_BOUNDARY_LINKS", "1")),
             ccl=os.environ.get("DFLASH_CCL", "fabric"),
+            # DFLASH_BOUNDARY_HELPERS=n: the multi-core boundary on n helper cores of grid row 2 (no streamed-op worker
+            # sits there)
+            helpers=[(x, 2) for x in range(int(os.environ.get("DFLASH_BOUNDARY_HELPERS", "4")))] or None,
         )
         b = self.boundary
         self.gamma_in = [b.flat_gamma(L.input_layernorm) for L in self.layers]
@@ -378,14 +381,28 @@ class FusedVerify:
             a, z = max(lo, s_), min(hi, e)
             n = max(0, z - a)
             rt = ttnn.RuntimeArgs()
-            rt[b.core.x][b.core.y] = [
-                res.buffer_address() + (a - lo) * tb if n else 0,
-                buf.buffer_address() + (a - s_) * tb if n else 0,
-                n * tb,
-            ]
+            if b.mc:
+                # the residual is sharded over the helpers (b.PH pages each): each copies its part of the range
+                shard = b.PH * 2048
+                src0, src1 = (a - lo) * tb, (a - lo) * tb + n * tb
+                for h, c in enumerate(b.helpers):
+                    u, v = max(src0, h * shard), min(src1, (h + 1) * shard)
+                    rt[c.x][c.y] = [
+                        res.buffer_address() + (u - h * shard) if v > u else 0,
+                        buf.buffer_address() + (a - s_) * tb + (u - src0) if v > u else 0,
+                        max(0, v - u),
+                    ]
+                cores = b.helper_cores
+            else:
+                rt[b.core.x][b.core.y] = [
+                    res.buffer_address() + (a - lo) * tb if n else 0,
+                    buf.buffer_address() + (a - s_) * tb if n else 0,
+                    n * tb,
+                ]
+                cores = b.cores
             kernel = ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / "l1_copy.cpp"),
-                core_ranges=b.cores,
+                core_ranges=cores,
                 compile_time_args=[1 if buf.memory_config().buffer_type == ttnn.BufferType.DRAM else 0],
                 runtime_args=rt,
                 config=ttnn.DataMovementConfigDescriptor(

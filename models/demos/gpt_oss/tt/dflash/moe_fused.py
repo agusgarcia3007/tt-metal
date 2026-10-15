@@ -52,6 +52,7 @@ class MoEFused:
         assert len(router.assignments) == 1
         rc = router.assignments[0][0]
         taken = [(rc.x, rc.y), (boundary.core.x, boundary.core.y)]
+        taken += [(h.x, h.y) for h in getattr(boundary, "helpers", [])] if getattr(boundary, "mc", False) else []
         self.gate_up = ExpertGateUpUnion(
             mesh_device, hidden, inter_pad, swiglu_limit, alpha, readers=gate_up_readers, rows=rows, exclude=taken
         )
@@ -149,7 +150,8 @@ class MoEFused:
             notify_args=[1, b.noc_xy[0], b.noc_xy[1], 2],
             extra_reader_rt=[rx, ry, pred_addr] if P else None,
         )
-        assert len(rprog.semaphores) == 1  # semaphore 0: x ready (R, G, B)
+        # semaphore 0: x ready (R, G, B) (+ the multi-core boundary's 5 / 6)
+        assert {sd.id for sd in rprog.semaphores} <= {0, 5, 6}
         sems = list(rprog.semaphores) + [
             ttnn.SemaphoreDescriptor(1, ttnn.CoreType.WORKER, self.G.merge(self.D), 0),
             ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, self.D.merge(b.cores), 0),
@@ -189,6 +191,7 @@ class DenseMLPFused:
     ):
         self.mesh, self.boundary, self.slices = mesh_device, boundary, slices
         taken = [(boundary.core.x, boundary.core.y)]
+        taken += [(h.x, h.y) for h in getattr(boundary, "helpers", [])] if getattr(boundary, "mc", False) else []
         self.gate_up = ExpertGateUpUnion(
             mesh_device,
             hidden,
