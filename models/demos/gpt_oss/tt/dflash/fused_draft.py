@@ -79,6 +79,8 @@ class FusedDraft:
             rows=M,
             gather_split=os.environ.get("DFLASH_OPROJ_SPLIT", "1") == "1",
         )
+        # DFLASH_DRAFT_MLP_BFP4=1: the MLP weights in BFP4 (half the bytes of the drafter's largest stream)
+        self.mlp_dtype = ttnn.bfloat4_b if os.environ.get("DFLASH_DRAFT_MLP_BFP4", "0") == "1" else dtype
         # DFLASH_DRAFT_MLP_FUSED=1: boundary + gate|up + down as one program (dflash/moe_fused.py DenseMLPFused),
         # the MLP split into `slices` column slices so down overlaps gate|up.
         self.mlp_fused = None
@@ -87,14 +89,22 @@ class FusedDraft:
             from .moe_fused import DenseMLPFused
 
             self.slices = int(os.environ.get("DFLASH_DRAFT_MLP_SLICES", "2"))
-            self.mlp_fused = DenseMLPFused(mesh, b, H, I_pad // self.slices, self.slices, M, dtype)
+            self.mlp_fused = DenseMLPFused(mesh, b, H, I_pad // self.slices, self.slices, M, self.mlp_dtype)
             self.gu, self.down = self.mlp_fused.gate_up, self.mlp_fused.down
         else:
             self.gu = ExpertGateUpUnion(
-                mesh, H, I_pad, 0.0, 1.0, readers=4, rows=M, dense_silu=True, max_experts=1, weight_dtype=dtype
+                mesh, H, I_pad, 0.0, 1.0, readers=4, rows=M, dense_silu=True, max_experts=1, weight_dtype=self.mlp_dtype
             )
             self.down = ExpertDownUnion(
-                mesh, H, I_pad, readers=4, rows=M, expert_outer=True, max_experts=1, weight_dtype=dtype, num_buffers=2
+                mesh,
+                H,
+                I_pad,
+                readers=4,
+                rows=M,
+                expert_outer=True,
+                max_experts=1,
+                weight_dtype=self.mlp_dtype,
+                num_buffers=2,
             )
         self._load_weights(dtype, banks)
         # LM head: the verify pass's (BF8) by default; DFLASH_DRAFT_LM_BFP4=1: a BFP4 copy (drafts only need the argmax
@@ -280,7 +290,7 @@ class FusedDraft:
         dt = {ttnn.bfloat8_b: "bfp8", ttnn.bfloat4_b: "bfp4", ttnn.bfloat16: "bf16"}[dtype]
         cache_dir = os.environ.get("TT_CACHE_PATH")
         S = self.slices
-        sfx = f"_s{S}" if S > 1 else ""
+        sfx = (f"_s{S}" if S > 1 else "") + ("_mlp4" if self.mlp_dtype != dtype else "")
         base = None if cache_dir is None else f"{cache_dir}/dflash_fused_draft_{dt}_b{banks}_i{I_pad}{sfx}"
         marker = None if base is None else Path(base + ".built")
         w = None
@@ -329,14 +339,14 @@ class FusedDraft:
                     dd = torch.nn.functional.pad(dn[dv * I : (dv + 1) * I], (0, 0, 0, I_pad - I))
                     lay["down"].append(stream_down_layout(dd.reshape(S, Is, H), torch.zeros(S, H), banks))
 
-            def put(name, rows):
+            def put(name, rows, dt=dtype):
                 cache = None if base is None else f"{base}_l{i}_{name}"
-                return as_stream_tensor(self.mesh, lay[name], rows, dtype, cache)
+                return as_stream_tensor(self.mesh, lay[name], rows, dt, cache)
 
             self.w_qkv.append(put("qkv", self.qkv.weight_rows()))
             self.w_o.append(put("o", self.o.weight_rows()))
-            self.w_gu.append(put("gu", self.gu.weight_rows(S)))
-            self.w_down.append(put("down", self.down.weight_rows(S)))
+            self.w_gu.append(put("gu", self.gu.weight_rows(S), self.mlp_dtype))
+            self.w_down.append(put("down", self.down.weight_rows(S), self.mlp_dtype))
         if marker is not None:
             marker.touch()
 
