@@ -18,13 +18,29 @@ void kernel_main() {
     constexpr uint32_t tile = 2048;
     cb_wait_front(cb_qo, 2);
     noc_async_write(get_read_ptr(cb_qo), get_noc_addr(q_out), 2 * tile);
+#ifdef PREP_JOINT
+    // the joint tile's k rows NQ .. NQ + NKV - 1 -> rows 0 .. NKV - 1 of the K shard (faces 0 / 1, 32 bytes each)
+    for (uint32_t d = 0; d < 2; ++d) {
+        for (uint32_t f = 0; f < 2; ++f) {
+            for (uint32_t h = 0; h < NKV; ++h) {
+                noc_async_write(
+                    get_read_ptr(cb_qo) + d * tile + f * 512 + (NQ + h) * 32,
+                    get_noc_addr(k_out + d * tile + f * 512 + h * 32),
+                    32);
+            }
+        }
+    }
+#else
     cb_wait_front(cb_ko, 2);
     noc_async_write(get_read_ptr(cb_ko), get_noc_addr(k_out), 2 * tile);
+#endif
     noc_async_write_barrier();
 #ifdef PREP_NOTIFY
     // K shard written: tell the fused KV write (semaphore 0 on its core)
     noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(2), get_arg_val<uint32_t>(3), get_semaphore(0)), 1);
 #endif
     cb_pop_front(cb_qo, 2);
+#ifndef PREP_JOINT
     cb_pop_front(cb_ko, 2);
+#endif
 }

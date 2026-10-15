@@ -62,11 +62,30 @@ void kernel_main() {
     }
     noc_async_read_barrier();
     invalidate_l1_cache();
+#ifdef PREP_JOINT
+    // q and k in one tile: k's head rows 0 .. NKV - 1 -> rows NQ .. NQ + NKV - 1 of the q tile (NQ + NKV <= 16: faces
+    // 0 / 1, 32 bytes per face row); compute normalizes and rotates both at once (per-row weights)
+    for (uint32_t d = 0; d < 2; ++d) {
+        for (uint32_t f = 0; f < 2; ++f) {
+            for (uint32_t h = 0; h < NKV; ++h) {
+                volatile tt_l1_ptr uint32_t* src =
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_k) + d * tile + f * 512 + h * 32);
+                volatile tt_l1_ptr uint32_t* dst = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                    get_write_ptr(cb_q) + d * tile + f * 512 + (NQ + h) * 32);
+                for (uint32_t i = 0; i < 8; ++i) {
+                    dst[i] = src[i];
+                }
+            }
+        }
+    }
+#endif
     const uint32_t p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr)[r];
     noc_async_read(s_cos.get_noc_addr(p), scr + 128, row_bytes);
     noc_async_read(s_sin.get_noc_addr(p), scr + 256, row_bytes);
     cb_push_back(cb_q, 2);
+#ifndef PREP_JOINT
     cb_push_back(cb_k, 2);
+#endif
     for (uint32_t d = 0; d < 2; ++d) {
         noc_async_read(s_v.get_noc_addr(2 * r + d), v_out + d * tile, tile);
     }
@@ -78,9 +97,14 @@ void kernel_main() {
     for (uint32_t z = 0; z < tile; z += MEM_ZEROS_SIZE) {
         noc_async_read(zeros, scl + z, MEM_ZEROS_SIZE);
     }
-    cb_reserve_back(cb_g, 4);
+#ifdef PREP_JOINT
+    constexpr uint32_t n_g = 2;  // per-row weights [q_norm rows | k_norm rows] as two full tiles
+#else
+    constexpr uint32_t n_g = 4;
+#endif
+    cb_reserve_back(cb_g, n_g);
     cb_reserve_back(cb_t, 1);
-    for (uint32_t i = 0; i < 4; ++i) {
+    for (uint32_t i = 0; i < n_g; ++i) {
         noc_async_read(s_g.get_noc_addr(i), get_write_ptr(cb_g) + i * tile, tile);
     }
     noc_async_read(s_t.get_noc_addr(0), get_write_ptr(cb_t), tile);
@@ -112,6 +136,6 @@ void kernel_main() {
         }
     }
     cb_push_back(cb_cs, 4);
-    cb_push_back(cb_g, 4);
+    cb_push_back(cb_g, n_g);
     cb_push_back(cb_t, 1);
 }

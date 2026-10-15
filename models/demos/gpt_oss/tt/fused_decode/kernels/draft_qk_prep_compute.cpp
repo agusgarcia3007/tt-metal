@@ -37,10 +37,15 @@ void kernel_main() {
     constexpr uint32_t inv_n = get_compile_time_arg_val(13);  // float bits of 1 / 64
     constexpr uint32_t eps = get_compile_time_arg_val(14);
 
+#ifdef PREP_JOINT
+    constexpr uint32_t n_x = 1;  // q and k in one tile (reader), per-row weights (full tiles)
+#else
+    constexpr uint32_t n_x = 2;
+#endif
     // A. 1 / rms per head row, q then k
     cb_wait_front(cb_scl, 1);
-    cb_reserve_back(cb_rs, 2);
-    for (uint32_t x = 0; x < 2; ++x) {
+    cb_reserve_back(cb_rs, n_x);
+    for (uint32_t x = 0; x < n_x; ++x) {
         const uint32_t cb_x = x == 0 ? cb_q : cb_k;
         cb_wait_front(cb_x, 2);
         compute_kernel_hw_startup(cb_x, cb_x, cb_sq);
@@ -75,14 +80,14 @@ void kernel_main() {
         tile_regs_release();
         cb_pop_front(cb_sq, 1);
     }
-    cb_push_back(cb_rs, 2);
+    cb_push_back(cb_rs, n_x);
 
     // B. per tensor and 32-column tile: xn = (x * rs) * g; y = xn * cos + (xn . T) * sin
-    cb_wait_front(cb_rs, 2);
-    cb_wait_front(cb_g, 4);
+    cb_wait_front(cb_rs, n_x);
+    cb_wait_front(cb_g, n_x == 1 ? 2 : 4);
     cb_wait_front(cb_cs, 4);
     cb_wait_front(cb_t, 1);
-    for (uint32_t x = 0; x < 2; ++x) {
+    for (uint32_t x = 0; x < n_x; ++x) {
         const uint32_t cb_x = x == 0 ? cb_q : cb_k;
         const uint32_t cb_o = x == 0 ? cb_qo : cb_ko;
         cb_reserve_back(cb_o, 2);
@@ -102,8 +107,13 @@ void kernel_main() {
             cb_wait_front(cb_t1, 1);
             compute_kernel_hw_startup(cb_t1, cb_g, cb_xn);
             tile_regs_acquire();
+#ifdef PREP_JOINT
+            mul_init(cb_t1, cb_g);
+            mul_tiles(cb_t1, cb_g, 0, d, 0);  // per-row weights (q rows, then k rows)
+#else
             mul_bcast_rows_init(cb_t1, cb_g);
             mul_tiles_bcast_rows(cb_t1, cb_g, 0, 2 * x + d, 0);
+#endif
             tile_regs_commit();
             cb_reserve_back(cb_xn, 1);
             tile_regs_wait();

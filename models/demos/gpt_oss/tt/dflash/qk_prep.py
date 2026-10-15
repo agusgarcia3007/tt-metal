@@ -11,6 +11,7 @@ get_rot_mats (2 embeddings, 2 transposes, 2 interleaved_to_sharded):
   head-sharded Q / K outputs; V tiles copied into its shard of the V output.
 """
 
+import os
 import struct
 
 import torch
@@ -35,6 +36,10 @@ class DraftQKPrep:
         assert head_dim == 2 * TILE and nq <= TILE and nkv <= TILE
         self.mesh, self.M, self.nq, self.nkv, self.hd, self.eps = mesh_device, rows, nq, nkv, head_dim, eps
         self.head_mc, self.cos, self.sin = head_mc, cos_cache, sin_cache
+        # DFLASH_PREP_JOINT=1: q's and k's heads in one tile (k rows nq .. nq + nkv - 1), normalized and rotated at
+        # once with per-row weights (half the compute phases)
+        self.joint = os.environ.get("DFLASH_PREP_JOINT", "1") == "1" and nq + nkv <= 16
+        self.defines = [("PREP_JOINT", "1"), ("NQ", str(nq)), ("NKV", str(nkv))] if self.joint else []
         self.core_list = [ttnn.CoreCoord(r % head_grid_x, r // head_grid_x) for r in range(rows)]
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in self.core_list])
         rep = ttnn.ReplicateTensorToMesh(mesh_device)
@@ -48,7 +53,20 @@ class DraftQKPrep:
         )
 
     def gamma(self, q_norm, k_norm):
-        """[q_norm | k_norm] (head_dim each) as full tiles (every row = the weight): 4 tiles in DRAM."""
+        """[q_norm | k_norm] (head_dim each) as full tiles (every row = the weight): 4 tiles in DRAM; joint: 2 tiles,
+        rows 0 .. nq - 1 = q_norm, rows nq .. nq + nkv - 1 = k_norm."""
+        if self.joint:
+            g = torch.zeros(1, 1, TILE, self.hd)
+            g[0, 0, : self.nq] = q_norm.float().reshape(-1)
+            g[0, 0, self.nq : self.nq + self.nkv] = k_norm.float().reshape(-1)
+            return ttnn.from_torch(
+                g,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.mesh,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            )
         w = torch.cat([q_norm.float().reshape(-1), k_norm.float().reshape(-1)])
         assert w.numel() == 2 * self.hd
         return ttnn.from_torch(
@@ -136,7 +154,7 @@ class DraftQKPrep:
             ] + notify
             writer_rt[c.x][c.y] = [qo.buffer_address(), ko.buffer_address()] + notify
         dm = ttnn.DataMovementConfigDescriptor
-        defs = [("PREP_NOTIFY", "1")] if kv is not None else []
+        defs = ([("PREP_NOTIFY", "1")] if kv is not None else []) + self.defines
         kernels = [
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / "draft_qk_prep_reader.cpp"),
@@ -159,6 +177,7 @@ class DraftQKPrep:
                 core_ranges=self.cores,
                 compile_time_args=compute_ct,
                 runtime_args=[],
+                defines=self.defines,
                 config=ttnn.ComputeConfigDescriptor(
                     math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, math_approx_mode=False
                 ),
