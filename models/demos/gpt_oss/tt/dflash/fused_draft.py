@@ -115,9 +115,12 @@ class FusedDraft:
             from .lm_head import padded_lm_head
 
             readers = int(os.environ.get("DFLASH_DRAFT_LM_READERS", "3"))
-            self.lm_w, n = padded_lm_head(
-                mesh, draft.target.decode_terminal, readers, os.environ.get("TT_CACHE_PATH"), dtype=ttnn.bfloat4_b
-            )
+            if getattr(verify, "prescreen", 0) and len(verify.lm_head.assignments) == readers * banks:
+                self.lm_w, n = verify.lm_weights, verify.lm_n4  # the verify's BFP4 prescreen head (same layout)
+            else:
+                self.lm_w, n = padded_lm_head(
+                    mesh, draft.target.decode_terminal, readers, os.environ.get("TT_CACHE_PATH"), dtype=ttnn.bfloat4_b
+                )
             self.lm = LinearStream(
                 mesh,
                 H // TILE,

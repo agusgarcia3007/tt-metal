@@ -453,6 +453,19 @@ void kernel_main() {
     DeviceTimestampedData("MOE_T", 102);
 #endif
 
+#ifdef LM_TOPK
+    // out_mode 6 with LM_TOPK = K (DFlash two-stage LM head, dflash/lm_rescore.py): each row's K largest outputs,
+    // sorted descending (ties: the lower index first); the list is rows x K [key, index] entries
+    constexpr uint32_t KT = LM_TOPK;
+    int32_t tk[rows][KT];
+    uint32_t ti[rows][KT];
+    for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t k = 0; k < KT; ++k) {
+            tk[r][k] = INT32_MIN;
+            ti[r][k] = 0xFFFFFFFFu;
+        }
+    }
+#endif
     uint32_t best_key[rows];
     uint32_t best_idx[rows];
     if constexpr (out_mode == 6) {
@@ -521,9 +534,22 @@ void kernel_main() {
                 // value, as signed ints). Word loads (two values), values in index order (strict > keeps the lowest).
                 invalidate_l1_cache();
                 const uint32_t* words = reinterpret_cast<const uint32_t*>(src);
+#ifdef LM_TOPK
                 for (uint32_t r = 0; r < rows; ++r) {
-                    int32_t bk = static_cast<int32_t>(best_key[r]);
-                    uint32_t bi = best_idx[r];
+                    int32_t* k_ = tk[r];
+                    uint32_t* i_ = ti[r];
+                    int32_t thr = k_[KT - 1];
+                    auto ins = [&](int32_t key, uint32_t idx) __attribute__((always_inline)) {
+                        uint32_t p = KT - 1;
+                        while (p > 0 && key > k_[p - 1]) {
+                            k_[p] = k_[p - 1];
+                            i_[p] = i_[p - 1];
+                            --p;
+                        }
+                        k_[p] = key;
+                        i_[p] = idx;
+                        thr = k_[KT - 1];
+                    };
                     for (uint32_t f = 0; f < 2; ++f) {
                         const uint32_t* w = words + (f * row_face + r * half_row) / 4;
                         const uint32_t base = n * 32 + f * 16;
@@ -533,19 +559,42 @@ void kernel_main() {
                             int32_t hi = static_cast<int32_t>(v) >> 16;
                             lo ^= (lo >> 31) & 0x7FFF;
                             hi ^= (hi >> 31) & 0x7FFF;
-                            if (lo > bk) {
-                                bk = lo;
-                                bi = base + 2 * i;
+                            if (lo > thr) {
+                                ins(lo, base + 2 * i);
                             }
-                            if (hi > bk) {
-                                bk = hi;
-                                bi = base + 2 * i + 1;
+                            if (hi > thr) {
+                                ins(hi, base + 2 * i + 1);
                             }
                         }
                     }
-                    best_key[r] = static_cast<uint32_t>(bk);
-                    best_idx[r] = bi;
                 }
+                if (false)
+#endif
+                    for (uint32_t r = 0; r < rows; ++r) {
+                        int32_t bk = static_cast<int32_t>(best_key[r]);
+                        uint32_t bi = best_idx[r];
+                        for (uint32_t f = 0; f < 2; ++f) {
+                            const uint32_t* w = words + (f * row_face + r * half_row) / 4;
+                            const uint32_t base = n * 32 + f * 16;
+                            for (uint32_t i = 0; i < 8; ++i) {
+                                const uint32_t v = w[i];
+                                int32_t lo = static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFF));
+                                int32_t hi = static_cast<int32_t>(v) >> 16;
+                                lo ^= (lo >> 31) & 0x7FFF;
+                                hi ^= (hi >> 31) & 0x7FFF;
+                                if (lo > bk) {
+                                    bk = lo;
+                                    bi = base + 2 * i;
+                                }
+                                if (hi > bk) {
+                                    bk = hi;
+                                    bi = base + 2 * i + 1;
+                                }
+                            }
+                        }
+                        best_key[r] = static_cast<uint32_t>(bk);
+                        best_idx[r] = bi;
+                    }
             } else if constexpr (out_mode == 5) {
                 noc_async_write(src, s_out.get_noc_addr(n * tiny_bytes / 2048, (n * tiny_bytes) % 2048), tiny_bytes);
             }
@@ -614,12 +663,25 @@ void kernel_main() {
     if constexpr (out_mode == 6) {
         // Through the (now drained) activation staging of cb_x.
         volatile tt_l1_ptr uint32_t* list = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(x_l1);
+        const uint32_t list_idx = get_arg_val<uint32_t>(5);
+#ifdef LM_TOPK
+        for (uint32_t r = 0; r < rows; ++r) {
+            for (uint32_t k = 0; k < KT; ++k) {
+                list[2 * (r * KT + k)] = static_cast<uint32_t>(tk[r][k]);
+                list[2 * (r * KT + k) + 1] = ti[r][k];
+            }
+        }
+        // one page (out_page_bytes = 8 K) per (core, row): page list_idx * rows + r (spread over the banks)
+        for (uint32_t r = 0; r < rows; ++r) {
+            noc_async_write(x_l1 + r * KT * 8, s_out.get_noc_addr(list_idx * rows + r), 8 * KT);
+        }
+#else
         for (uint32_t r = 0; r < rows; ++r) {
             list[2 * r] = best_key[r];
             list[2 * r + 1] = best_idx[r];
         }
-        const uint32_t list_idx = get_arg_val<uint32_t>(5);
         noc_async_write(x_l1, s_out.get_noc_addr(0, list_idx * 8 * rows), 8 * rows);
+#endif
     }
     if constexpr (topk) {
         // The list goes out through the (now drained) weight-gather staging of cb_x: K keys then K indices.

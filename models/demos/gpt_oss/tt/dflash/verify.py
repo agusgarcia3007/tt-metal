@@ -175,6 +175,31 @@ class FusedVerify:
             prefetch_cols=LM_HEAD_STREAM_PREFETCH,
             rows=M,
         )
+        # DFLASH_LM_PRESCREEN=K (> 0): two-stage LM head (dflash/lm_rescore.py): the BFP4 head keeps each row's K
+        # best columns per core, then the device's K best per row are rescored with the BF8 weights
+        self.prescreen = int(os.environ.get("DFLASH_LM_PRESCREEN", "0"))
+        if self.prescreen:
+            from .lm_head import padded_lm_head
+            from .lm_rescore import LMRescore
+
+            r4 = int(os.environ.get("DFLASH_LM_PRESCREEN_READERS", "3"))
+            self.lm_w8 = self.lm_weights
+            self.lm_weights, n4 = padded_lm_head(mesh, term, r4, os.environ.get("TT_CACHE_PATH"), dtype=ttnn.bfloat4_b)
+            # both streams keep the vocab's column order (only the padding past vd differs): same column indices
+            assert n4 >= self.vd and lm_n >= self.vd
+            self.lm_n4 = n4
+            self.lm_head = LinearStream(
+                mesh,
+                H // TILE,
+                n4,
+                ttnn.bfloat4_b,
+                readers=r4,
+                out_mode=6,
+                prefetch_cols=LM_HEAD_STREAM_PREFETCH,
+                rows=M,
+                out_page_bytes=8 * self.prescreen,  # the top-K lists: one page per (core, row)
+            )
+            self.rescore = LMRescore(mesh, M, self.prescreen, len(self.lm_head.assignments), H, lm_n)
 
         rep = ttnn.ReplicateTensorToMesh(mesh)
         dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
@@ -198,7 +223,16 @@ class FusedVerify:
         )
         self.union, self.weights = union_buffers(mesh, M)
         self.act = act_buffer(mesh, inter_pad, M)
-        n_lists = len(self.lm_head.assignments)
+        n_lists = self.prescreen or len(self.lm_head.assignments)
+        if self.prescreen:  # the BFP4 stage's per-core top-K lists
+            self.lists1 = ttnn.from_torch(
+                torch.zeros(len(self.lm_head.assignments) * M, self.prescreen * 2, dtype=torch.int32),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=mesh,
+                memory_config=l1,
+                mesh_mapper=rep,
+            )
         self.lists = ttnn.from_torch(
             torch.zeros(1, n_lists * M * 2, dtype=torch.int32),
             dtype=ttnn.uint32,
@@ -241,7 +275,8 @@ class FusedVerify:
         [1, 2 M], read by read_result)."""
         from .argmax import ArgmaxGather
 
-        self.argmax_gather = ArgmaxGather(self.mesh, self.M, len(self.lm_head.assignments), self.vd, kind=1)
+        n_lists = self.prescreen or len(self.lm_head.assignments)
+        self.argmax_gather = ArgmaxGather(self.mesh, self.M, n_lists, self.vd, kind=1)
         self.result = ttnn.from_torch(
             torch.zeros(1, 2 * self.M, dtype=torch.int32),
             dtype=ttnn.uint32,
@@ -347,7 +382,11 @@ class FusedVerify:
             last = i + 1 == len(self.layers)
             gamma = self.gamma_final if last else self.gamma_in[i + 1]
             pending = PendingBoundary(b, res, gamma, self.partial, "moe", sent=True)
-        self.lm_head(pending, self.lm_weights, self.lists)
+        if self.prescreen:
+            self.lm_head(pending, self.lm_weights, self.lists1, extra_defines=[("LM_TOPK", str(self.prescreen))])
+            self.rescore(self.lists1, pending.x, self.lm_w8, self.lists)
+        else:
+            self.lm_head(pending, self.lm_weights, self.lists)
         if getattr(self, "argmax_gather", None) is not None:
             self.argmax_gather(self.lists, self.tokens, self.result, accept=self.accept, rows_cap=self.active_rows)
         pending.x.deallocate(True)
