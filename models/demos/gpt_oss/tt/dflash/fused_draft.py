@@ -168,6 +168,8 @@ class FusedDraft:
                 mesh, M, nq, nkv, hd, draft.eps, draft.head_mc, draft.rope.cos_matrix, draft.rope.sin_matrix
             )
             host = lambda t: ttnn.to_torch(ttnn.get_device_tensors(t)[0]).float().reshape(-1)[:hd]
+            # DFLASH_DRAFT_PREP_KV=1: the K / V cache write in the same program
+            self.prep_kv = os.environ.get("DFLASH_DRAFT_PREP_KV", "1") == "1"
             self.prep_gamma = [self.prep.gamma(host(L["q_norm"]), host(L["k_norm"])) for L in draft.L]
 
     def _argmax_gather(self):
@@ -391,14 +393,16 @@ class FusedDraft:
             res = pending.residual_out
             pending.x.deallocate(True)
             pending.residual.deallocate(True)
+            kc, vc = d.caches[i]
             if self.prep is not None:
-                qr, kr, vs = self.prep(self.q, self.k, self.vv, self.prep_gamma[i], d.t_rot)
+                kv = (d.kv_write, kc, vc, d.t_pos, d.page_table) if self.prep_kv else None
+                qr, kr, vs = self.prep(self.q, self.k, self.vv, self.prep_gamma[i], d.t_rot, kv=kv)
             else:
                 qr = self._norm_rope(self.q, L["q_norm"], rot)
                 kr = self._norm_rope(self.k, L["k_norm"], rot)
                 vs = ttnn.to_memory_config(self.vv, d.head_mc)
-            kc, vc = d.caches[i]
-            d.kv_write(kr, vs, kc, vc, d.t_pos, d.page_table)
+            if self.prep is None or not self.prep_kv:
+                d.kv_write(kr, vs, kc, vc, d.t_pos, d.page_table)
             kr.deallocate(True)
             vs.deallocate(True)
             attn = ttnn.transformer.paged_scaled_dot_product_attention_decode(

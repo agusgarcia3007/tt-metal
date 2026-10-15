@@ -29,11 +29,19 @@ class DraftKVWrite:
     def __call__(self, k, v, k_cache, v_cache, pos, page_table, head_offset=0):
         """k, v: [1, 32, kv_heads, head_dim] BF16 height-sharded (one user row per core); pos: INT32 [32] (row r's
         position, < 0 skipped; the valid rows' positions are consecutive); page_table: INT32 [*, blocks] (row 0)."""
-        ct = [0, self.rows, self.kv_heads, self.head_tiles, self.block, page_table.shape[-1] * 4, head_offset]
+        kernels, cbs = self.parts(k, v, k_cache, v_cache, pos, page_table, head_offset)
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        ttnn.generic_op([k, v, pos, page_table, k_cache, v_cache], program)
+
+    def parts(self, k, v, k_cache, v_cache, pos, page_table, head_offset=0, core=CORE, cb_id=0, wait=None):
+        """(kernels, cbs) of the write on `core`; wait = (first semaphore id, count): the K / V kernel first waits for
+        `count` increments of semaphore id / id + 1 (fused after the producer of k / v, dflash/qk_prep.py)."""
+        cores = ttnn.CoreRangeSet([ttnn.CoreRange(core, core)])
+        ct = [cb_id, self.rows, self.kv_heads, self.head_tiles, self.block, page_table.shape[-1] * 4, head_offset]
         for t in (k_cache, v_cache, pos, page_table):
             ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         rt = ttnn.RuntimeArgs()
-        rt[CORE.x][CORE.y] = [
+        rt[core.x][core.y] = [
             k.buffer_address(),
             v.buffer_address(),
             k_cache.buffer_address(),
@@ -41,27 +49,27 @@ class DraftKVWrite:
             pos.buffer_address(),
             page_table.buffer_address(),
         ] + self.coords
+        extra = [] if wait is None else [("KV_WAIT_SEM", str(wait[0])), ("KV_WAIT_N", str(wait[1]))]
         # K on BRISC / NOC0 and V on NCRISC / NOC1 of the same core, in parallel
         kernels = [
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / "draft_kv_write.cpp"),
-                core_ranges=self.cores,
+                core_ranges=cores,
                 compile_time_args=ct,
                 runtime_args=rt,
                 config=ttnn.DataMovementConfigDescriptor(
                     processor=(ttnn.DataMovementProcessor.RISCV_0, ttnn.DataMovementProcessor.RISCV_1)[sel],
                     noc=(ttnn.NOC.NOC_0, ttnn.NOC.NOC_1)[sel],
                 ),
-                defines=[("KV_SEL", str(sel))],
+                defines=[("KV_SEL", str(sel))] + extra,
             )
             for sel in (0, 1)
         ]
         cb = ttnn.CBDescriptor(
             total_size=self.scratch,
-            core_ranges=self.cores,
+            core_ranges=cores,
             format_descriptors=[
-                ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.bfloat16, page_size=self.scratch)
+                ttnn.CBFormatDescriptor(buffer_index=cb_id, data_format=ttnn.bfloat16, page_size=self.scratch)
             ],
         )
-        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=[cb])
-        ttnn.generic_op([k, v, pos, page_table, k_cache, v_cache], program)
+        return kernels, [cb]

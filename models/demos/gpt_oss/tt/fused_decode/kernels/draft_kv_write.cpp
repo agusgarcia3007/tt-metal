@@ -14,6 +14,9 @@
 // head_offset: the cache's kv head h is head row head_offset + h of the source tiles (several layers' K / V heads in
 // one tensor).
 //
+// KV_WAIT_SEM (with KV_SEL): wait for KV_WAIT_N increments of semaphore KV_WAIT_SEM + KV_SEL (the source shards'
+// writers in the same program) before reading the source rows.
+//
 // KV_SEL = 0 / 1 (defined): this kernel writes only K / V (two kernels on BRISC and NCRISC of the same core, each with
 // its own scratch header); else both.
 //
@@ -84,22 +87,6 @@ void kernel_main() {
     noc_async_read(s_pt.get_noc_addr(0) + ((bi1 * 4) & ~63u), scr + 192, 64);
     noc_async_read_barrier();
     invalidate_l1_cache();
-    // Source rows (each valid row's K / V tiles from its user core), issued with the cache tile reads below (one
-    // barrier for both).
-    for (uint32_t r = first; r <= last; ++r) {
-        if (pos[r] < 0) {
-            continue;
-        }
-        const uint32_t x = get_arg_val<uint32_t>(6 + 2 * r), y = get_arg_val<uint32_t>(7 + 2 * r);
-        for (uint32_t t = 0; t < head_tiles; ++t) {
-            if (kv_lo == 0) {
-                noc_async_read(get_noc_addr(x, y, k_src + t * tile), src + (r * head_tiles + t) * tile, tile);
-            }
-            if (kv_hi == 2) {
-                noc_async_read(get_noc_addr(x, y, v_src + t * tile), src + ((rows + r) * head_tiles + t) * tile, tile);
-            }
-        }
-    }
     const uint32_t blk0 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128)[bi0 & 15];
     const uint32_t blk1 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 192)[bi1 & 15];
     const uint32_t tr0 = (p0 % block) / 32, tr1 = (p1 % block) / 32;
@@ -120,6 +107,30 @@ void kernel_main() {
                 if (kv_hi == 2) {
                     noc_async_read(s_vc.get_noc_addr(cache_tile(g, h, t)), dst_l1(1, g, h, t), tile);
                 }
+            }
+        }
+    }
+#ifdef KV_WAIT_SEM
+    // fused after dflash/qk_prep.py: each prep core bumps semaphore KV_WAIT_SEM + kv once its K / V shard is written
+    {
+        volatile tt_l1_ptr uint32_t* sem =
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(KV_WAIT_SEM + kv_lo));
+        noc_semaphore_wait(sem, KV_WAIT_N);
+        noc_semaphore_set(sem, 0);
+    }
+#endif
+    // Source rows (each valid row's K / V tiles from its user core), one barrier with the cache tile reads above.
+    for (uint32_t r = first; r <= last; ++r) {
+        if (pos[r] < 0) {
+            continue;
+        }
+        const uint32_t x = get_arg_val<uint32_t>(6 + 2 * r), y = get_arg_val<uint32_t>(7 + 2 * r);
+        for (uint32_t t = 0; t < head_tiles; ++t) {
+            if (kv_lo == 0) {
+                noc_async_read(get_noc_addr(x, y, k_src + t * tile), src + (r * head_tiles + t) * tile, tile);
+            }
+            if (kv_hi == 2) {
+                noc_async_read(get_noc_addr(x, y, v_src + t * tile), src + ((rows + r) * head_tiles + t) * tile, tile);
             }
         }
     }

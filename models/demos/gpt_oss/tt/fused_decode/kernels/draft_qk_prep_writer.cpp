@@ -4,7 +4,7 @@
 // DFlash drafter q / k prep, writer (BRISC) (dflash/qk_prep.py): this core's normed + rotated Q and K tiles -> its
 // shards of the head-sharded Q / K outputs (same core, same L1 address on every core).
 //
-// runtime args: [q_out, k_out]
+// runtime args: [q_out, k_out (, kv write core noc x, y with PREP_NOTIFY)]
 
 #include <stdint.h>
 
@@ -21,6 +21,10 @@ void kernel_main() {
     cb_wait_front(cb_ko, 2);
     noc_async_write(get_read_ptr(cb_ko), get_noc_addr(k_out), 2 * tile);
     noc_async_write_barrier();
+#ifdef PREP_NOTIFY
+    // K shard written: tell the fused KV write (semaphore 0 on its core)
+    noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(2), get_arg_val<uint32_t>(3), get_semaphore(0)), 1);
+#endif
     cb_pop_front(cb_qo, 2);
     cb_pop_front(cb_ko, 2);
 }
