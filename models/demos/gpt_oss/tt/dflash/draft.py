@@ -588,18 +588,20 @@ class DFlashDraft:
         self.kv_write = DraftKVWrite(mesh, B, self.nkv, self.hd, self.block_size)
         term = self.target.decode_terminal
         self.vd = term.vd
+        verify = getattr(self, "_shared_lm", None)  # (weights, n, readers) of the verify pass's padded LM head
+        lm_w, lm_n, lm_r = verify if verify is not None else (term.weights, term.vd, 1)
         self.lm = LinearStream(
             mesh,
             self.hidden // TILE,
-            term.vd,
+            lm_n,
             LM_HEAD_DECODE_WEIGHT_DTYPE,
-            readers=1,
+            readers=lm_r,
             out_mode=6,
             prefetch_cols=LM_HEAD_STREAM_PREFETCH,
             rows=B,
             x_tile_rows=True,
         )
-        self.lm_weights = term.weights
+        self.lm_weights = lm_w
         self.lists = ttnn.from_torch(
             torch.zeros(1, len(self.lm.assignments) * B * 2, dtype=torch.int32),
             dtype=ttnn.uint32,

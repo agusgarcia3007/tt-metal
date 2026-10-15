@@ -175,6 +175,7 @@ class FastDFlashRunner:
         self.V = model.vocab_size
         kv = kv_cache[0] if isinstance(kv_cache[0][0], list) else kv_cache
         self.verify = FusedVerify(model, page_table, kv, rows=draft.block, capture_layers=draft.target_layer_ids)
+        draft._shared_lm = (self.verify.lm_weights, self.verify.lm_n, len(self.verify.lm_head.assignments) // 8)
         draft.enable_trace()
         self.verify.set_context_target(draft.t_ctx)
         self.verify.enable_device_argmax()

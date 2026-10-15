@@ -34,7 +34,6 @@ from ..fused_decode.config import (
     GATE_UP_STREAM_READERS,
     LM_HEAD_DECODE_WEIGHT_DTYPE,
     LM_HEAD_STREAM_PREFETCH,
-    LM_HEAD_STREAM_READERS,
     OPROJ_DECODE_WEIGHT_DTYPE,
     OPROJ_STREAM_READERS,
     QKV_DECODE_WEIGHT_DTYPE,
@@ -118,17 +117,24 @@ class FusedVerify:
         )
         term = model.decode_terminal
         self.vd = term.vd
+        lm_readers = int(os.environ.get("DFLASH_LM_READERS", "2"))
+        if lm_readers > 1:
+            from .lm_head import padded_lm_head
+
+            self.lm_weights, lm_n = padded_lm_head(mesh, term, lm_readers, os.environ.get("TT_CACHE_PATH"))
+        else:
+            self.lm_weights, lm_n = term.weights, term.vd
+        self.lm_n = lm_n
         self.lm_head = LinearStream(
             mesh,
             H // TILE,
-            term.vd,
+            lm_n,
             LM_HEAD_DECODE_WEIGHT_DTYPE,
-            readers=LM_HEAD_STREAM_READERS,
+            readers=lm_readers,
             out_mode=6,
             prefetch_cols=LM_HEAD_STREAM_PREFETCH,
             rows=M,
         )
-        self.lm_weights = term.weights
 
         rep = ttnn.ReplicateTensorToMesh(mesh)
         dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
