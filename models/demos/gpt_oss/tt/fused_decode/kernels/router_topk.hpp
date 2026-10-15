@@ -87,3 +87,38 @@ inline void topk_softmax(volatile tt_l1_ptr uint16_t* logits, volatile tt_l1_ptr
     }
 }
 }  // namespace router_topk
+
+namespace router_topk {
+// Local-array variant (no volatile L1 traffic): logits[n_logits] BF16 bits -> ids[topk], weights[topk] (BF16 bits).
+template <uint32_t topk, uint32_t n_logits>
+inline void topk_softmax_local(const uint16_t* logits, uint16_t* ids_out, uint16_t* w_out) {
+    uint32_t keys[n_logits];
+    for (uint32_t i = 0; i < n_logits; ++i) {
+        const uint32_t b = logits[i];
+        keys[i] = (b & 0x8000) ? (~b & 0xFFFF) : (b | 0x8000);
+    }
+    int32_t vals[topk];
+    for (uint32_t j = 0; j < topk; ++j) {
+        uint32_t best = 0;
+        uint32_t bk = keys[0];
+        for (uint32_t i = 1; i < n_logits; ++i) {
+            if (keys[i] > bk) {
+                bk = keys[i];
+                best = i;
+            }
+        }
+        ids_out[j] = static_cast<uint16_t>(best);
+        vals[j] = bf16_to_q16(logits[best]);
+        keys[best] = 0;
+    }
+    uint32_t e[topk];
+    uint32_t sum = 0;
+    for (uint32_t j = 0; j < topk; ++j) {
+        e[j] = exp_q16(vals[j] - vals[0]);
+        sum += e[j];
+    }
+    for (uint32_t j = 0; j < topk; ++j) {
+        w_out[j] = q16_to_bf16((e[j] << 15) / (sum >> 1));
+    }
+}
+}  // namespace router_topk

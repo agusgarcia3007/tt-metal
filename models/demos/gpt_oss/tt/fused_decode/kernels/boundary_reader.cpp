@@ -45,9 +45,17 @@ void kernel_main() {
     constexpr uint32_t page = 2048;
 
     if constexpr (do_norm) {
-        const auto s_gamma = TensorAccessor(gamma_args, gamma_addr, tiles * page);
         cb_reserve_back(cb_gamma, tiles);
-        noc_async_read(s_gamma.get_noc_addr(0), get_write_ptr(cb_gamma), tiles * page);
+        if constexpr (rows == 1) {
+            const auto s_gamma = TensorAccessor(gamma_args, gamma_addr, tiles * page);
+            noc_async_read(s_gamma.get_noc_addr(0), get_write_ptr(cb_gamma), tiles * page);
+        } else {
+            // Multi-row gamma: one 2 KB page per tile, interleaved over the DRAM banks (parallel reads).
+            const auto s_gamma = TensorAccessor(gamma_args, gamma_addr, page);
+            for (uint32_t t = 0; t < tiles; ++t) {
+                noc_async_read(s_gamma.get_noc_addr(t), get_write_ptr(cb_gamma) + t * page, page);
+            }
+        }
     }
 
     if constexpr (res_mode == 1) {
@@ -94,22 +102,24 @@ void kernel_main() {
         if constexpr (rows > 1) {
             // P[R][R'] = 1 iff R = R' (mod rows), BF16 32x32 tile (faces of 16x16, row-major).
             cb_reserve_back(cb_p, 1);
-            volatile tt_l1_ptr uint16_t* pm = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(cb_p));
+            volatile tt_l1_ptr uint32_t* pm = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_p));
             for (uint32_t R = 0; R < 32; ++R) {
-                for (uint32_t C = 0; C < 32; ++C) {
-                    pm[((R / 16) * 2 + C / 16) * 256 + (R % 16) * 16 + C % 16] = (R % rows == C % rows) ? 0x3F80 : 0;
+                for (uint32_t C = 0; C < 32; C += 2) {  // two BF16 values per word (C even, C + 1 odd)
+                    const uint32_t lo = (R % rows == C % rows) ? 0x3F80u : 0u;
+                    const uint32_t hi = (R % rows == (C + 1) % rows) ? 0x3F80u : 0u;
+                    pm[(((R / 16) * 2 + C / 16) * 256 + (R % 16) * 16 + C % 16) / 2] = lo | (hi << 16);
                 }
             }
             cb_push_back(cb_p, 1);
         }
     }
 
-    noc_async_read_barrier();
-    cb_push_back(cb_res, tiles);
-    if constexpr (do_norm) {
-        cb_push_back(cb_gamma, tiles);
+    // The residual and the receive slots go to compute first (the sum does not need gamma); gamma's reads complete
+    // while compute adds.
+    if constexpr (res_mode == 1) {
+        noc_async_read_barrier();  // the entry embedding rows (gamma may still be in flight: one more barrier below)
     }
-
+    cb_push_back(cb_res, tiles);
     if constexpr (slots > 0) {
         if constexpr (expected > 0) {
             DeviceZoneScopedN("BND_R_WAIT");
@@ -119,5 +129,9 @@ void kernel_main() {
         }
         cb_reserve_back(cb_recv, slots * tiles);
         cb_push_back(cb_recv, slots * tiles);
+    }
+    noc_async_read_barrier();
+    if constexpr (do_norm) {
+        cb_push_back(cb_gamma, tiles);
     }
 }

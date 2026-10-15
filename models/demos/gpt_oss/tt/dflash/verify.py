@@ -63,7 +63,9 @@ class FusedVerify:
         tp = mesh.shape[1]
         self.nq, self.nkv, self.hd = attn0.num_heads // tp, attn0.num_kv_heads // tp, attn0.head_dim
         q_cols, k_cols = self.nq * self.hd // TILE, self.nkv * self.hd // TILE
-        self.boundary = DecodeBoundary(mesh, H, cfg.rms_norm_eps, cluster_axis=1, rows=M)
+        self.boundary = DecodeBoundary(
+            mesh, H, cfg.rms_norm_eps, cluster_axis=1, rows=M, links=int(os.environ.get("DFLASH_BOUNDARY_LINKS", "1"))
+        )
         b = self.boundary
         self.gamma_in = [b.flat_gamma(L.input_layernorm) for L in self.layers]
         self.gamma_post = [b.flat_gamma(L.post_attention_layernorm) for L in self.layers]

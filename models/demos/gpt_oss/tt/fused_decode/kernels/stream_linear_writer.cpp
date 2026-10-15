@@ -417,24 +417,20 @@ void kernel_main() {
 
                 volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks);
                 volatile tt_l1_ptr uint16_t* wts = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks + 128);
-                volatile tt_l1_ptr uint16_t* lg =
-                    reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks + 128 + 64 * rows);
-                volatile tt_l1_ptr uint16_t* stage = lg + 32;
                 volatile tt_l1_ptr uint16_t* logit = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(src);
                 uint16_t row_ids[rows][8];
                 uint16_t row_w[rows][8];
                 uint32_t mask = 0;
                 invalidate_l1_cache();
                 for (uint32_t r = 0; r < rows; ++r) {
+                    uint16_t lg[32];
                     for (uint32_t i = 0; i < 16; ++i) {
                         lg[i] = logit[r * 16 + i];
                         lg[16 + i] = logit[rows * 16 + r * 16 + i];
                     }
-                    router_topk::topk_softmax<q_cols, k_cols>(lg, stage);
+                    router_topk::topk_softmax_local<q_cols, k_cols>(lg, row_ids[r], row_w[r]);
                     for (uint32_t j = 0; j < q_cols; ++j) {
-                        row_ids[r][j] = stage[j];
-                        row_w[r][j] = stage[8 + j];
-                        mask |= 1u << stage[j];
+                        mask |= 1u << row_ids[r][j];
                     }
                 }
                 uint32_t slot[32];

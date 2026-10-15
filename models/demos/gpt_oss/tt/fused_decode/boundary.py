@@ -143,11 +143,14 @@ class DecodeBoundary:
     shared by every layer: every boundary waits for every device's partial, so a device cannot write layer i+1's
     partial into a slot before every device has consumed layer i's (the two sites alternate)."""
 
-    def __init__(self, mesh_device, hidden, eps, cluster_axis, sites=("attn", "moe"), ccl=DECODE_BOUNDARY_CCL, rows=1):
+    def __init__(
+        self, mesh_device, hidden, eps, cluster_axis, sites=("attn", "moe"), ccl=DECODE_BOUNDARY_CCL, rows=1, links=None
+    ):
         """rows > 1: `rows` tokens per call (multi-row decode, e.g. the DFlash verify block): every flat buffer holds
         `rows` flat vectors back to back and the RMSNorm runs per vector."""
         assert ccl in ("fabric", "ttnn"), ccl
         self.rows = rows
+        self.links = links or DECODE_BOUNDARY_LINKS  # fabric links of the producer-fused send (sending_program)
         self.ccl = ccl
         self.mesh_device = mesh_device
         self.hidden = hidden
@@ -215,6 +218,8 @@ class DecodeBoundary:
         else:
             c = rows_to_rowtile(w[: self.hidden][None].repeat(self.rows, 1))  # [32, 32 * pages] container
             flat[0, 0, 0] = tile_rows_to_flat(c, self.all * TILE * TILE)
+        if self.rows > 1:  # one 2 KB page per tile, interleaved over the DRAM banks (parallel reads)
+            flat = flat.reshape(1, 1, self.all, TILE * TILE)
         return ttnn.from_torch(
             flat,
             dtype=ttnn.bfloat16,
@@ -309,7 +314,7 @@ class DecodeBoundary:
             program.semaphores = [
                 ttnn.SemaphoreDescriptor(0, ttnn.CoreType.WORKER, producer_cores.merge(self.cores), 0)
             ]
-            links = min(DECODE_BOUNDARY_LINKS, self.chunks)
+            links = min(self.links, self.chunks)
             for link in range(links):
                 sender = self._sender_kernel(coord, partial, site, producers=n, sem_id=0, link=link, links=links)
                 self._add_sender(coord, program, sender, link)
