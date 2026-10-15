@@ -52,6 +52,20 @@ class DraftQKPrep:
             mesh_mapper=rep,
         )
 
+    def gamma_rows(self, w):
+        """Joint mode, per-row weights: w [rows <= 16, head_dim] -> 2 full tiles (row h = w[h])."""
+        assert self.joint
+        g = torch.zeros(1, 1, TILE, self.hd)
+        g[0, 0, : w.shape[0]] = w.float()
+        return ttnn.from_torch(
+            g,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.mesh,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
     def gamma(self, q_norm, k_norm):
         """[q_norm | k_norm] (head_dim each) as full tiles (every row = the weight): 4 tiles in DRAM; joint: 2 tiles,
         rows 0 .. nq - 1 = q_norm, rows nq .. nq + nkv - 1 = k_norm."""
@@ -86,7 +100,7 @@ class DraftQKPrep:
         alloc = lambda h: ttnn.allocate_tensor_on_device(
             ttnn.Shape([1, TILE, h, self.hd]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.mesh, self.head_mc
         )
-        qo, ko, vo = alloc(self.nq), alloc(self.nkv), alloc(self.nkv)
+        qo, ko, vo = alloc(self.nq), alloc(max(self.nkv, 1)), alloc(self.nkv or self.nq)  # (nkv 0: V has nq heads)
         cb_q, cb_k, cb_g, cb_cs, cb_t, cb_scl, cb_scr, cb_sq, cb_rs, cb_t1, cb_xn, cb_t2, cb_qo, cb_ko = range(14)
         f32, bf16 = ttnn.float32, ttnn.bfloat16
 

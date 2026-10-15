@@ -277,6 +277,17 @@ class FusedDraft:
         if marker is not None:
             marker.touch()
         self.knorm = dram(knorm)
+        # DFLASH_CTX_PREP=1: the context K's per-head RMSNorm (k_norm of its layer) + RoPE + head sharding and V's head
+        # sharding as one DraftQKPrep program (joint mode: the L * nkv heads as rows, no second tensor)
+        self.ctx_prep = None
+        if os.environ.get("DFLASH_CTX_PREP", "1") == "1" and L * nkv <= 16:
+            from .qk_prep import DraftQKPrep
+
+            self.ctx_prep = DraftQKPrep(mesh, M, L * nkv, 0, hd, d.eps, d.head_mc, d.rope.cos_matrix, d.rope.sin_matrix)
+            if self.ctx_prep.joint:
+                self.ctx_gamma = self.ctx_prep.gamma_rows(knorm[0, 0])
+            else:
+                self.ctx_prep = None
 
     def context(self):
         """Context K / V of the rows d.t_cpos marks (features already in ctx_buf, captured by the verify pass)."""
@@ -286,6 +297,15 @@ class FusedDraft:
         self.kv(pending, self.w_kv, (self.Kc, self.Kc, self.Vc))
         pending.x.deallocate(True)
         pending.residual_out.deallocate(True)
+        if self.ctx_prep is not None:
+            kr, k_unused, vs = self.ctx_prep(self.Kc, self.Kc, self.Vc, self.ctx_gamma, d.t_crot)
+            k_unused.deallocate(True)
+            for l in range(d.layers):
+                kc, vc = d.caches[l]
+                d.kv_write(kr, vs, kc, vc, d.t_cpos, d.page_table, head_offset=l * d.nkv)
+            kr.deallocate(True)
+            vs.deallocate(True)
+            return
         rot = d.rope.get_rot_mats(d.t_crot)
         kn = ttnn.rms_norm(self.Kc, epsilon=d.eps, compute_kernel_config=d.ck)
         kw = ttnn.multiply(kn, self.knorm)
