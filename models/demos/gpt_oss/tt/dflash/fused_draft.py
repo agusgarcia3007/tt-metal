@@ -159,6 +159,16 @@ class FusedDraft:
         w = w.reshape(1, 32 * M)
         self.weights = dram(w, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, ttnn.L1_MEMORY_CONFIG)
         self._init_context(dtype, banks, dram)
+        # DFLASH_DRAFT_QK_PREP=1: q / k RMSNorm + RoPE + head sharding as one program per layer (dflash/qk_prep.py)
+        self.prep = None
+        if os.environ.get("DFLASH_DRAFT_QK_PREP", "1") == "1":
+            from .qk_prep import DraftQKPrep
+
+            self.prep = DraftQKPrep(
+                mesh, M, nq, nkv, hd, draft.eps, draft.head_mc, draft.rope.cos_matrix, draft.rope.sin_matrix
+            )
+            host = lambda t: ttnn.to_torch(ttnn.get_device_tensors(t)[0]).float().reshape(-1)[:hd]
+            self.prep_gamma = [self.prep.gamma(host(L["q_norm"]), host(L["k_norm"])) for L in draft.L]
 
     def _argmax_gather(self):
         return self._gather
@@ -370,7 +380,7 @@ class FusedDraft:
         emb = ttnn.reshape(emb, (1, 1, M, d.hidden))
         fab = b.ccl == "fabric"  # else: ttnn all-reduce + boundary as ops of their own
         pending = PendingBoundary(b, emb, self.g_ln1[0], entry=True)
-        rot = d.rope.get_rot_mats(d.t_rot)
+        rot = d.rope.get_rot_mats(d.t_rot) if self.prep is None else []
         for i in range(d.layers):
             L = d.L[i]
             if fab:
@@ -381,9 +391,12 @@ class FusedDraft:
             res = pending.residual_out
             pending.x.deallocate(True)
             pending.residual.deallocate(True)
-            qr = self._norm_rope(self.q, L["q_norm"], rot)
-            kr = self._norm_rope(self.k, L["k_norm"], rot)
-            vs = ttnn.to_memory_config(self.vv, d.head_mc)
+            if self.prep is not None:
+                qr, kr, vs = self.prep(self.q, self.k, self.vv, self.prep_gamma[i], d.t_rot)
+            else:
+                qr = self._norm_rope(self.q, L["q_norm"], rot)
+                kr = self._norm_rope(self.k, L["k_norm"], rot)
+                vs = ttnn.to_memory_config(self.vv, d.head_mc)
             kc, vc = d.caches[i]
             d.kv_write(kr, vs, kc, vc, d.t_pos, d.page_table)
             kr.deallocate(True)
