@@ -14,6 +14,9 @@
 // head_offset: the cache's kv head h is head row head_offset + h of the source tiles (several layers' K / V heads in
 // one tensor).
 //
+// KV_SEL = 0 / 1 (defined): this kernel writes only K / V (two kernels on BRISC and NCRISC of the same core, each with
+// its own scratch header); else both.
+//
 // runtime args: [k_src, v_src, k_cache, v_cache, pos, page_table, (noc_x, noc_y) x rows]
 
 #include <stdint.h>
@@ -49,8 +52,15 @@ void kernel_main() {
     const auto s_pt = TensorAccessor(pt_args, pt_addr, pt_row_bytes);
 
     cb_reserve_back(cb_scr, 1);
+#ifdef KV_SEL
+    constexpr uint32_t kv_lo = KV_SEL, kv_hi = KV_SEL + 1;
+    const uint32_t scr = get_write_ptr(cb_scr) + KV_SEL * 256;
+    const uint32_t src = get_write_ptr(cb_scr) + 512;
+#else
+    constexpr uint32_t kv_lo = 0, kv_hi = 2;
     const uint32_t scr = get_write_ptr(cb_scr);
-    const uint32_t src = scr + 256;
+    const uint32_t src = get_write_ptr(cb_scr) + 512;
+#endif
     const uint32_t dst = src + src_tiles * tile;
 
     noc_async_read(s_pos.get_noc_addr(0), scr, 128);
@@ -72,19 +82,24 @@ void kernel_main() {
     const uint32_t bi0 = p0 / block, bi1 = p1 / block;
     noc_async_read(s_pt.get_noc_addr(0) + ((bi0 * 4) & ~63u), scr + 128, 64);
     noc_async_read(s_pt.get_noc_addr(0) + ((bi1 * 4) & ~63u), scr + 192, 64);
-    // Source rows (each valid row's K and V tiles from its user core).
+    noc_async_read_barrier();
+    invalidate_l1_cache();
+    // Source rows (each valid row's K / V tiles from its user core), issued with the cache tile reads below (one
+    // barrier for both).
     for (uint32_t r = first; r <= last; ++r) {
         if (pos[r] < 0) {
             continue;
         }
         const uint32_t x = get_arg_val<uint32_t>(6 + 2 * r), y = get_arg_val<uint32_t>(7 + 2 * r);
         for (uint32_t t = 0; t < head_tiles; ++t) {
-            noc_async_read(get_noc_addr(x, y, k_src + t * tile), src + (r * head_tiles + t) * tile, tile);
-            noc_async_read(get_noc_addr(x, y, v_src + t * tile), src + ((rows + r) * head_tiles + t) * tile, tile);
+            if (kv_lo == 0) {
+                noc_async_read(get_noc_addr(x, y, k_src + t * tile), src + (r * head_tiles + t) * tile, tile);
+            }
+            if (kv_hi == 2) {
+                noc_async_read(get_noc_addr(x, y, v_src + t * tile), src + ((rows + r) * head_tiles + t) * tile, tile);
+            }
         }
     }
-    noc_async_read_barrier();
-    invalidate_l1_cache();
     const uint32_t blk0 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128)[bi0 & 15];
     const uint32_t blk1 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 192)[bi1 & 15];
     const uint32_t tr0 = (p0 % block) / 32, tr1 = (p1 % block) / 32;
@@ -99,8 +114,12 @@ void kernel_main() {
     for (uint32_t g = 0; g < groups; ++g) {
         for (uint32_t h = 0; h < kv_heads; ++h) {
             for (uint32_t t = 0; t < head_tiles; ++t) {
-                noc_async_read(s_kc.get_noc_addr(cache_tile(g, h, t)), dst_l1(0, g, h, t), tile);
-                noc_async_read(s_vc.get_noc_addr(cache_tile(g, h, t)), dst_l1(1, g, h, t), tile);
+                if (kv_lo == 0) {
+                    noc_async_read(s_kc.get_noc_addr(cache_tile(g, h, t)), dst_l1(0, g, h, t), tile);
+                }
+                if (kv_hi == 2) {
+                    noc_async_read(s_vc.get_noc_addr(cache_tile(g, h, t)), dst_l1(1, g, h, t), tile);
+                }
             }
         }
     }
@@ -115,7 +134,7 @@ void kernel_main() {
         const uint32_t g = (p / block == bi0 && (p % block) / 32 == tr0) ? 0 : 1;
         const uint32_t rr = p % 32;
         const uint32_t dst_off = (rr < 16 ? 0 : 1024) + (rr % 16) * 32;
-        for (uint32_t kv = 0; kv < 2; ++kv) {
+        for (uint32_t kv = kv_lo; kv < kv_hi; ++kv) {
             for (uint32_t h = 0; h < kv_heads; ++h) {
                 const uint32_t hs = head_offset + h;
                 const uint32_t src_off = (hs < 16 ? 0 : 1024) + (hs % 16) * 32;
@@ -136,8 +155,12 @@ void kernel_main() {
     for (uint32_t g = 0; g < groups; ++g) {
         for (uint32_t h = 0; h < kv_heads; ++h) {
             for (uint32_t t = 0; t < head_tiles; ++t) {
-                noc_async_write(dst_l1(0, g, h, t), s_kc.get_noc_addr(cache_tile(g, h, t)), tile);
-                noc_async_write(dst_l1(1, g, h, t), s_vc.get_noc_addr(cache_tile(g, h, t)), tile);
+                if (kv_lo == 0) {
+                    noc_async_write(dst_l1(0, g, h, t), s_kc.get_noc_addr(cache_tile(g, h, t)), tile);
+                }
+                if (kv_hi == 2) {
+                    noc_async_write(dst_l1(1, g, h, t), s_vc.get_noc_addr(cache_tile(g, h, t)), tile);
+                }
             }
         }
     }
