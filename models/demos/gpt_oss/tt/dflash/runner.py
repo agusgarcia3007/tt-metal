@@ -12,6 +12,8 @@ import time
 
 import torch
 
+import ttnn
+
 from .capture import TargetCapture
 
 
@@ -156,3 +158,79 @@ class BatchedDFlashRunner(DFlashRunner):
                 self.draft.add_context(torch.cat(feats[u]), range(starts[u], starts[u] + k + 1), user=u)
                 accept[u].append(k + 1)
         return [ids[u][lens[u] :] for u in range(Bu)], accept
+
+
+class FastDFlashRunner:
+    """Greedy batch-1 DFlash with the 8-row fused verify pass (dflash/verify.py) and the traced drafter
+    (DFlashDraft.enable_trace). Per round: draft (trace) -> the 7 drafts to the host -> verify (trace) -> the 8 target
+    argmaxes and the accepted rows' layer features to the host -> drafter context update (trace)."""
+
+    def __init__(self, generator, model, page_table, kv_cache, draft, eos_ids=(200002, 200012)):
+        from .verify import FusedVerify
+
+        self.generator, self.model, self.page_table, self.kv_cache = generator, model, page_table, kv_cache
+        self.draft = draft
+        self.capture = TargetCapture(model, draft.target_layer_ids)
+        self.eos_ids = set(eos_ids)
+        self.V = model.vocab_size
+        kv = kv_cache[0] if isinstance(kv_cache[0][0], list) else kv_cache
+        self.verify = FusedVerify(model, page_table, kv, rows=draft.block, capture_layers=draft.target_layer_ids)
+        draft.enable_trace()
+        self.verify_trace = None
+
+    def _verify(self, block, start):
+        self.verify.set_inputs(block, start)
+        if self.verify_trace is None:
+            self.verify.forward()
+        else:
+            ttnn.execute_trace(self.model.mesh_device, self.verify_trace, cq_id=0, blocking=False)
+        return self.verify.argmax()
+
+    def capture_traces(self):
+        mesh = self.model.mesh_device
+        self.verify_trace = ttnn.begin_trace_capture(mesh, cq_id=0)
+        self.verify.forward()
+        ttnn.end_trace_capture(mesh, self.verify_trace, cq_id=0)
+        self.draft.capture_traces()
+
+    def prefill(self, prompt_ids):
+        L = len(prompt_ids)
+        logits = self.generator.prefill_forward_text(
+            torch.tensor([prompt_ids]),
+            page_table=self.page_table,
+            kv_cache=self.kv_cache,
+            prompt_lens=[L],
+            enable_trace=False,
+            warmup_prefill=False,
+        )
+        # 256-row chunks: the verify pass's persistent L1 buffers leave less room for the matmul's circular buffers.
+        self.draft.add_prompt_context(self.capture.prefill_features(L), chunk=256)
+        return int(logits.reshape(-1)[: self.V].float().argmax())
+
+    def generate(self, prompt_ids, max_new_tokens, first=None):
+        """Returns (new tokens, per-round accepted counts, timings). first: the prefill's next token (prefill done)."""
+        L = len(prompt_ids)
+        t0 = time.perf_counter()
+        if first is None:
+            first = self.prefill(prompt_ids)
+        ids = list(prompt_ids) + [first]
+        t_prefill = time.perf_counter() - t0
+        accept, rounds = [], []
+        B = self.draft.block
+        while len(ids) - L < max_new_tokens and not (set(ids[L:]) & self.eos_ids):
+            t = time.perf_counter()
+            start = len(ids) - 1
+            d = self.draft.draft_traced(ids[-1], start)
+            t1 = time.perf_counter()
+            post = self._verify([ids[-1]] + d, start)
+            t2 = time.perf_counter()
+            k = 0
+            while k < B - 1 and d[k] == post[k]:
+                k += 1
+            ids += d[:k] + [post[k]]
+            feats = self.verify.host_features(k + 1)
+            self.draft.add_context_traced(feats, range(start, start + k + 1))
+            t3 = time.perf_counter()
+            accept.append(k + 1)
+            rounds.append((t1 - t, t2 - t1, t3 - t2))
+        return ids[L:], accept, dict(prefill=t_prefill, rounds=rounds)

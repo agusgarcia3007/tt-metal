@@ -441,6 +441,7 @@ class LinearStream(_BankStreamOp):
         head_tiles=2,
         prefetch_cols=None,
         rows=1,
+        x_tile_rows=False,
     ):
         n_tiles = -(-n // TILE)
         banks = mesh_device.dram_grid_size().x
@@ -459,6 +460,9 @@ class LinearStream(_BankStreamOp):
         self.head_tiles = head_tiles
         self.prefetch_cols = prefetch_cols
         self.rows = rows
+        # x_tile_rows: x is a [32, 32 k_tiles] BF16 tile tensor whose rows 0 .. rows - 1 are the token rows
+        self.x_tile_rows = x_tile_rows
+        assert not x_tile_rows or (x_pages is None and rows > 1)
         assert rows in (1, 2, 4, 8), "custom_mm in0 tiles are [1, 2, 4 or 8] x 32"
         assert out_mode != 6 or rows > 1, "out_mode 6 (per-row argmax) is the multi-row LM head"
         self.weight_dtype = weight_dtype
@@ -498,7 +502,11 @@ class LinearStream(_BankStreamOp):
             outs = (out,) * 3
         cb_x, cb_w, cb_scr, cb_stage, cb_out = 0, 1, 3, 4, 16
         M = self.rows
-        stage = self.x_pages * M if x.memory_config().buffer_type == ttnn.BufferType.DRAM else 0
+        stage = (
+            (self.kx if self.x_tile_rows else self.x_pages * M)
+            if x.memory_config().buffer_type == ttnn.BufferType.DRAM
+            else 0
+        )
         # A fused boundary's consumer can buffer all its weight columns: the readers stream them while the boundary
         # runs (fused_decode.config.DECODE_BOUNDARY_PREFETCH_ALL).
         w_cols = max(3, self.cols) if pending is not None and DECODE_BOUNDARY_PREFETCH_ALL else 3
@@ -564,6 +572,8 @@ class LinearStream(_BankStreamOp):
             defines = [("QKV_ROPE_KV", "1")]
         if M > 1:
             defines = (defines or []) + [("ROWS", str(M))]
+        if self.x_tile_rows:
+            defines = defines + [("X_TILE_ROWS", "1")]
 
         def build():
             program = self._program(

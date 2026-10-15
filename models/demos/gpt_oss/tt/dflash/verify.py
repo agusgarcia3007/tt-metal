@@ -20,7 +20,14 @@ import torch
 
 import ttnn
 
-from ..fused_decode.boundary import DecodeBoundary, flat_memory_config, flat_shape, rowtile_pages, rowtile_to_rows
+from ..fused_decode.boundary import (
+    DecodeBoundary,
+    PendingBoundary,
+    flat_memory_config,
+    flat_shape,
+    rowtile_pages,
+    rowtile_to_rows,
+)
 from ..fused_decode.config import (
     DOWN_STREAM_READERS,
     GATE_UP_STREAM_READERS,
@@ -165,6 +172,7 @@ class FusedVerify:
         self.rot = rope_rotation_tiles(mesh)
         self.cos_table, self.sin_table = model.rope_setup.cos_matrix, model.rope_setup.sin_matrix
         self.features = {}
+        self.fused = True
         self.debug = None  # list: (tag, host [M, hidden]) after every boundary (debugging)
 
     def set_inputs(self, tokens, start):
@@ -179,7 +187,73 @@ class FusedVerify:
 
     def forward(self):
         """The verify pass on the current inputs; leaves the argmax lists in self.lists and the captured layer outputs
-        (row-tile residuals) in self.features."""
+        (row-tile residuals) in self.features. fused (default): every boundary's all-reduce is sent by its producer
+        (o_proj / down) and the boundary runs inside the op consuming its normed output (QKV, router, LM head), as in
+        the one-token fused decode layer (fused_decode/boundary.py); else each boundary is an op of its own."""
+        if not self.fused:
+            return self._forward_unfused()
+        M, b = self.M, self.boundary
+        emb = ttnn.embedding(
+            self.tokens, self.model.embedding_weight, layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG
+        )
+        emb = ttnn.reshape(emb, (1, 1, M, self.H))
+        pending = PendingBoundary(b, emb, self.gamma_in[0], entry=True)
+        for i, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            k_cache, v_cache = self.kv_cache[i]
+            rk = QKVRopeCache.rows(
+                self.rot, self.cos_table, self.sin_table, self.pos, self.page_table, k_cache, v_cache
+            )
+            self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk)
+            res = pending.residual_out
+            pending.x.deallocate(True)
+            pending.residual.deallocate(True)
+            if i - 1 in self.capture_layers:  # layer i - 1's output = this layer's input residual
+                self._capture(i - 1, res)
+            sdpa = self._sdpa(i)
+            self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial, send=(b, "attn"))
+            sdpa.deallocate(True)
+            pending = PendingBoundary(b, res, self.gamma_post[i], self.partial, "attn", sent=True)
+            mlp = layer.mlp
+            self.router(pending, mlp.router.weight_stream, (self.union, self.weights))
+            res, x = pending.residual_out, pending.x
+            pending.residual.deallocate(True)
+            dw = mlp.experts.decode_weights
+            self.gate_up(x, self.union, self.weights, dw.gate_up_stream, self.act)
+            x.deallocate(True)
+            self.down(self.act, self.union, self.weights, dw.down_stream, self.partial, send=(b, "moe"))
+            last = i + 1 == len(self.layers)
+            gamma = self.gamma_final if last else self.gamma_in[i + 1]
+            pending = PendingBoundary(b, res, gamma, self.partial, "moe", sent=True)
+        self.lm_head(pending, self.lm_weights, self.lists)
+        pending.x.deallocate(True)
+        pending.residual.deallocate(True)
+        pending.residual_out.deallocate(True)
+
+    def _capture(self, L, res):
+        old = self.features.get(L)
+        if old is not None:
+            old.deallocate(True)
+        self.features[L] = ttnn.sharded_to_interleaved(res, ttnn.DRAM_MEMORY_CONFIG)
+
+    def _sdpa(self, i):
+        attn = self.layers[i].self_attn
+        k_cache, v_cache = self.kv_cache[i]
+        return ttnn.transformer.paged_scaled_dot_product_attention_decode(
+            self.q,
+            k_cache,
+            v_cache,
+            cur_pos_tensor=self.pos,
+            sliding_window_size=attn.config.sliding_window,
+            attention_sink=attn.weights.decode_sinks,
+            page_table_tensor=self.page_table,
+            scale=attn.config.scaling,
+            program_config=sdpa_decode_program_config(attn.config.sliding_window),
+            compute_kernel_config=attn.program_config.get_compute_kernel_config(),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def _forward_unfused(self):
         M, b = self.M, self.boundary
         emb = ttnn.embedding(
             self.tokens, self.model.embedding_weight, layout=ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG
@@ -196,19 +270,7 @@ class FusedVerify:
             )
             self.qkv(x, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk)
             x.deallocate(True)
-            sdpa = ttnn.transformer.paged_scaled_dot_product_attention_decode(
-                self.q,
-                k_cache,
-                v_cache,
-                cur_pos_tensor=self.pos,
-                sliding_window_size=attn.config.sliding_window,
-                attention_sink=attn.weights.decode_sinks,
-                page_table_tensor=self.page_table,
-                scale=attn.config.scaling,
-                program_config=sdpa_decode_program_config(attn.config.sliding_window),
-                compute_kernel_config=attn.program_config.get_compute_kernel_config(),
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+            sdpa = self._sdpa(i)
             if self.debug is not None and i == 0:
                 d0 = lambda t: ttnn.to_torch(ttnn.get_device_tensors(t)[0]).float()
                 self.debug.append(("sdpa0", d0(self.q), d0(sdpa)))
@@ -230,10 +292,7 @@ class FusedVerify:
             res = res2
             self._dbg(f"moe{i}", res, x)
             if i in self.capture_layers:
-                old = self.features.get(i)
-                if old is not None:
-                    old.deallocate(True)
-                self.features[i] = ttnn.sharded_to_interleaved(res, ttnn.DRAM_MEMORY_CONFIG)
+                self._capture(i, res)
         res.deallocate(True)
         self.lm_head(x, self.lm_weights, self.lists)
         x.deallocate(True)

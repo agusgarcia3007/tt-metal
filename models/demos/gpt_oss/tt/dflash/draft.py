@@ -129,7 +129,9 @@ class DFlashDraft:
         self.fc = put(w["fc.weight"].T, rows)  # [14400, hidden], rows split (decode rounds: all-reduced)
         self.fc_full = put(w["fc.weight"].T)  # replicated (prompt context: no all-reduce over thousands of rows)
         self.hidden_norm = norm_w(w["hidden_norm.weight"])
+        self.hidden_norm_row = put(w["hidden_norm.weight"].float().reshape(1, 1, 1, -1), dtype=ttnn.float32)
         self.norm = norm_w(w["norm.weight"])
+        self.norm_row = put(w["norm.weight"].float().reshape(1, 1, 1, -1), dtype=ttnn.float32)
         self.L = []
         for i in range(self.layers):
             p = f"layers.{i}."
@@ -187,6 +189,10 @@ class DFlashDraft:
                     kv_b=put(kvb.reshape(1, -1), cols, dtype=ttnn.bfloat16),
                     ln1=norm_w(w[p + "input_layernorm.weight"]),
                     ln2=norm_w(w[p + "post_attention_layernorm.weight"]),
+                    ln1_row=put(w[p + "input_layernorm.weight"].float().reshape(1, 1, 1, -1), dtype=ttnn.float32),
+                    ln2_row=put(
+                        w[p + "post_attention_layernorm.weight"].float().reshape(1, 1, 1, -1), dtype=ttnn.float32
+                    ),
                     qkv=put(qkv.T, cols),
                     qkv_b=put(qkvb.reshape(1, -1), cols, dtype=ttnn.bfloat16),
                     q_norm=norm_w(reverse_permute_1d(w[a + "q_norm.weight"])),
@@ -318,6 +324,29 @@ class DFlashDraft:
             ttnn.experimental.paged_update_cache(vc, v, update_idxs_tensor=tt, page_table=page_table)
             tt.deallocate(True)
 
+    def _rms_norm_keep(self, h, w_row):
+        """RMSNorm of the FP32 residual h (kept) -> BF16, as elementwise / reduce ops (see _rms_norm_small)."""
+        ms = ttnn.mean(ttnn.multiply(h, h), dim=-1, keepdim=True)
+        r = ttnn.rsqrt(ttnn.add(ms, self.eps))
+        ms.deallocate(True)
+        y = ttnn.multiply(ttnn.multiply(h, r), w_row, dtype=ttnn.bfloat16)
+        r.deallocate(True)
+        return y
+
+    def _rms_norm_small(self, x, w_row):
+        """RMSNorm of [1, 1, rows, hidden] as elementwise / reduce ops (FP32): small circular buffers, unlike
+        ttnn.rms_norm's full-width ones, which do not fit next to the verify pass's persistent L1 buffers (prompt
+        context only, once per prompt)."""
+        xf = ttnn.typecast(x, ttnn.float32)
+        x.deallocate(True)
+        ms = ttnn.mean(ttnn.multiply(xf, xf), dim=-1, keepdim=True)
+        r = ttnn.rsqrt(ttnn.add(ms, self.eps))
+        ms.deallocate(True)
+        y = ttnn.multiply(ttnn.multiply(xf, r), w_row, dtype=ttnn.bfloat16)
+        xf.deallocate(True)
+        r.deallocate(True)
+        return y
+
     # -- the two calls of a round --------------------------------------------------------------------------------
     def add_prompt_context(self, features, chunk=2048, user=0):
         """Context of prompt positions 0 .. n - 1 (prefill-style: [1, heads, rows, head_dim] K / V, paged_fill_cache of
@@ -339,7 +368,7 @@ class DFlashDraft:
             )
             ctx = ttnn.linear(tx, self.fc_full, dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
             tx.deallocate(True)
-            ctx = ttnn.rms_norm(ctx, epsilon=self.eps, weight=self.hidden_norm, compute_kernel_config=self.ck)
+            ctx = self._rms_norm_small(ctx, self.hidden_norm_row)
             cos = self.rope.cos_matrix_prefill[:, :, s0 : s0 + rows, :]
             sin = self.rope.sin_matrix_prefill[:, :, s0 : s0 + rows, :]
             trans = self.rope.get_both_trans_mats()["prefill"]
@@ -476,3 +505,209 @@ class DFlashDraft:
         V = self.target.vocab_size
         ids = full[:, :V].argmax(-1)
         return [ids[j * B + 1 : (j + 1) * B].tolist() for j in range(n)]
+
+    # -- traced batch-1 path ---------------------------------------------------------------------------------------
+    def enable_trace(self):
+        """Batch-1 traced drafting: persistent device inputs (written by the host each round), one op for each
+        layer's K / V rows (dflash/kv_write.py), and the LM head as the streamed per-row argmax of the fused decode
+        terminal (LinearStream out_mode 6 over the BFP8 LM-head stream); draft_traced / add_context_traced."""
+        from ..fused_decode.config import LM_HEAD_DECODE_WEIGHT_DTYPE, LM_HEAD_STREAM_PREFETCH
+        from ..fused_decode.stream import LinearStream
+        from .kv_write import DraftKVWrite
+
+        mesh = self.mesh_device
+        rep = ttnn.ReplicateTensorToMesh(mesh)
+        B = self.block
+
+        def dev(t, dtype, layout=ttnn.ROW_MAJOR_LAYOUT, mapper=rep):
+            return ttnn.from_torch(
+                t, dtype=dtype, layout=layout, device=mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG, mesh_mapper=mapper
+            )
+
+        self.t_toks = dev(torch.full((1, ROWS), self.mask_token_id, dtype=torch.int32), ttnn.uint32)
+        self.t_pos = dev(torch.full((ROWS,), -1, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        self.t_rot = dev(torch.zeros(1, ROWS, dtype=torch.int32), ttnn.uint32)
+        self.t_bound = dev(torch.full((ROWS,), -1, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        self.t_cpos = dev(torch.full((ROWS,), -1, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        self.t_crot = dev(torch.zeros(1, ROWS, dtype=torch.int32), ttnn.uint32)
+        self.t_ctx = dev(
+            torch.zeros(1, 1, ROWS, self.ctx_in),
+            ttnn.bfloat16,
+            ttnn.TILE_LAYOUT,
+            ttnn.ShardTensorToMesh(mesh, dim=-1),
+        )
+        self.kv_write = DraftKVWrite(mesh, B, self.nkv, self.hd, self.block_size)
+        term = self.target.decode_terminal
+        self.vd = term.vd
+        self.lm = LinearStream(
+            mesh,
+            self.hidden // TILE,
+            term.vd,
+            LM_HEAD_DECODE_WEIGHT_DTYPE,
+            readers=1,
+            out_mode=6,
+            prefetch_cols=LM_HEAD_STREAM_PREFETCH,
+            rows=B,
+            x_tile_rows=True,
+        )
+        self.lm_weights = term.weights
+        self.lists = ttnn.from_torch(
+            torch.zeros(1, len(self.lm.assignments) * B * 2, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            mesh_mapper=rep,
+        )
+        self.trace_draft = self.trace_ctx = None
+
+    def _host_rows(self, values, dtype, shape=None):
+        t = torch.tensor(values, dtype=torch.int32)
+        return ttnn.from_torch(
+            t.reshape(shape) if shape else t,
+            dtype=dtype,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+        )
+
+    def set_draft_inputs(self, last_token, start):
+        B = self.block
+        toks = [last_token] + [self.mask_token_id] * (ROWS - 1)
+        pos = [start + i for i in range(B)] + [-1] * (ROWS - B)
+        rot = [start + i for i in range(B)] + [0] * (ROWS - B)
+        bound = [start + B - 1] * B + [-1] * (ROWS - B)
+        ttnn.copy_host_to_device_tensor(self._host_rows(toks, ttnn.uint32, (1, ROWS)), self.t_toks)
+        ttnn.copy_host_to_device_tensor(self._host_rows(pos, ttnn.int32), self.t_pos)
+        ttnn.copy_host_to_device_tensor(self._host_rows(rot, ttnn.uint32, (1, ROWS)), self.t_rot)
+        ttnn.copy_host_to_device_tensor(self._host_rows(bound, ttnn.int32), self.t_bound)
+
+    def set_context_inputs(self, features, positions):
+        """features: host [n <= 8, 5 * hidden]; positions: their n consecutive positions."""
+        n = features.shape[0]
+        assert n <= self.block
+        x = torch.zeros(1, 1, ROWS, self.ctx_in)
+        x[0, 0, :n] = features.float()
+        hx = ttnn.from_torch(
+            x,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=-1),
+        )
+        ttnn.copy_host_to_device_tensor(hx, self.t_ctx)
+        pos = list(positions) + [-1] * (ROWS - n)
+        rot = list(positions) + [0] * (ROWS - n)
+        ttnn.copy_host_to_device_tensor(self._host_rows(pos, ttnn.int32), self.t_cpos)
+        ttnn.copy_host_to_device_tensor(self._host_rows(rot, ttnn.uint32, (1, ROWS)), self.t_crot)
+
+    def _context_device(self):
+        partial = ttnn.linear(self.t_ctx, self.fc, dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
+        summed = self.all_reduce(partial)
+        ctx = self._rms_norm_small(summed, self.hidden_norm_row)
+        rot = self.rope.get_rot_mats(self.t_crot)
+        for i in range(self.layers):
+            q, k, v = self._heads(ctx, i)
+            q.deallocate(True)
+            k = self._norm_rope(k, self.L[i]["k_norm"], rot)
+            kc, vc = self.caches[i]
+            self.kv_write(k, v, kc, vc, self.t_cpos, self.page_table)
+            k.deallocate(True)
+            v.deallocate(True)
+        ctx.deallocate(True)
+        for t in rot:
+            t.deallocate(True)
+
+    def _draft_device(self):
+        emb = ttnn.embedding(self.t_toks, self.target.embedding_weight, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        h = ttnn.typecast(ttnn.reshape(emb, [1, 1, ROWS, self.hidden]), ttnn.float32)
+        rot = self.rope.get_rot_mats(self.t_rot)
+        for i in range(self.layers):
+            L = self.L[i]
+            x = self._rms_norm_keep(h, L["ln1_row"])
+            q, k, v = self._heads(x, i)
+            x.deallocate(True)
+            q = self._norm_rope(q, L["q_norm"], rot)
+            k = self._norm_rope(k, L["k_norm"], rot)
+            kc, vc = self.caches[i]
+            self.kv_write(k, v, kc, vc, self.t_pos, self.page_table)
+            k.deallocate(True)
+            v.deallocate(True)
+            attn = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                q,
+                kc,
+                vc,
+                cur_pos_tensor=self.t_bound,
+                page_table_tensor=self.page_table,
+                scale=self.hd**-0.5,
+                program_config=self.sdpa_pc,
+                compute_kernel_config=self.ck,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            q.deallocate(True)
+            attn_s = ttnn.to_memory_config(attn, self.head_mc)
+            attn.deallocate(True)
+            heads = ttnn.experimental.nlp_concat_heads_decode(attn_s, num_heads=self.nq)
+            attn_s.deallocate(True)
+            partial = ttnn.linear(heads, L["o"], dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
+            heads.deallocate(True)
+            o = self.all_reduce(partial)
+            o = ttnn.add(o, L["o_b"], output_tensor=o)
+            h2 = ttnn.add(h, o, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)
+            h.deallocate(True)
+            o.deallocate(True)
+            h = h2
+            x = self._rms_norm_keep(h, L["ln2_row"])
+            gu = ttnn.linear(x, L["gu"], dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
+            x.deallocate(True)
+            I = self.inter
+            g = ttnn.slice(gu, (0, 0, 0, 0), (1, 1, ROWS, I))
+            u = ttnn.slice(gu, (0, 0, 0, I), (1, 1, ROWS, 2 * I))
+            gu.deallocate(True)
+            act = ttnn.multiply(g, u, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+            g.deallocate(True)
+            u.deallocate(True)
+            partial = ttnn.linear(act, L["down"], dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
+            act.deallocate(True)
+            mlp = self.all_reduce(partial)
+            h2 = ttnn.add(h, mlp, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)
+            h.deallocate(True)
+            mlp.deallocate(True)
+            h = h2
+        xb = self._rms_norm_keep(h, self.norm_row)
+        h.deallocate(True)
+        self.lm(xb, self.lm_weights, self.lists)
+        xb.deallocate(True)
+        for t in rot:
+            t.deallocate(True)
+
+    def _drafts_from_lists(self):
+        from ..fused_decode.stream import merge_argmax
+
+        lists = [ttnn.to_torch(t).reshape(-1).long() & 0xFFFFFFFF for t in ttnn.get_device_tensors(self.lists)]
+        return merge_argmax(lists, self.block, self.vd)[1:]
+
+    def capture_traces(self):
+        """Capture the context and draft traces (call once eager-compiled: after one eager add_context_traced /
+        draft_traced with trace=False)."""
+        mesh = self.mesh_device
+        self.trace_ctx = ttnn.begin_trace_capture(mesh, cq_id=0)
+        self._context_device()
+        ttnn.end_trace_capture(mesh, self.trace_ctx, cq_id=0)
+        self.trace_draft = ttnn.begin_trace_capture(mesh, cq_id=0)
+        self._draft_device()
+        ttnn.end_trace_capture(mesh, self.trace_draft, cq_id=0)
+
+    def add_context_traced(self, features, positions):
+        self.set_context_inputs(features, positions)
+        if self.trace_ctx is None:
+            self._context_device()
+        else:
+            ttnn.execute_trace(self.mesh_device, self.trace_ctx, cq_id=0, blocking=False)
+
+    def draft_traced(self, last_token, start):
+        """The 7 draft tokens (host) after `last_token` at position `start`."""
+        self.set_draft_inputs(last_token, start)
+        if self.trace_draft is None:
+            self._draft_device()
+        else:
+            ttnn.execute_trace(self.mesh_device, self.trace_draft, cq_id=0, blocking=False)
+        return self._drafts_from_lists()

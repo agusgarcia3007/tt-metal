@@ -348,9 +348,22 @@ void kernel_main() {
         noc_async_read_barrier();
     }
     constexpr uint32_t gather_pages = x_pages > 0 ? x_pages : 1;
+#if !defined(X_TILE_ROWS)
     if constexpr (x_pages == 0) {
         noc_async_read(s_x.get_noc_addr(0), x_l1, kx * tiny_bytes);
     }
+#endif
+#if defined(X_TILE_ROWS)
+    // x: a [32, 32 kx] BF16 tile tensor; token row r of activation tile j = row r of tile page j (staged when in DRAM).
+    for (uint32_t j = 0; j < kx; ++j) {
+        const uint64_t src = x_stage_pages > 0 ? get_noc_addr(x_stage + j * 2048) : s_x.get_noc_addr(j);
+        for (uint32_t r = 0; r < rows; ++r) {
+            const uint32_t off = r < 16 ? r * half_row : 2 * face_bytes + (r - 16) * half_row;
+            noc_async_read(src + off, x_l1 + j * tiny_bytes + r * half_row, half_row);
+            noc_async_read(src + off + face_bytes, x_l1 + j * tiny_bytes + row_face + r * half_row, half_row);
+        }
+    }
+#endif
     for (uint32_t j = 0; x_pages > 0 && j < kx; ++j) {
         const uint32_t row = j / gather_pages;
         const uint32_t off = row < 16 ? row * half_row : 2 * face_bytes + (row - 16) * half_row;  // faces 0/1, 2/3
