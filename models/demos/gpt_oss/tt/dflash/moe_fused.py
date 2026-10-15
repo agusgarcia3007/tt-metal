@@ -26,6 +26,11 @@ import ttnn
 from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion
 
 MOE = [("MOE_FUSED", "1")]
+# DFLASH_MOE_STEAL=1: gate|up work stealing within a bank (kernels/stream_gate_up_union_reader.cpp), per-(slot, pair)
+# done flags instead of per-slot counters
+STEAL = os.environ.get("DFLASH_MOE_STEAL", "0") == "1"
+if STEAL:
+    MOE += [("MOE_STEAL", "1")]
 # DFLASH_VERIFY_ROWS=R (< block): only the first R block rows are verified (route to experts; the accept count is
 # capped at R): the union of experts, and with it the MoE's weight traffic, covers R rows (0: all rows)
 VERIFY_ROWS = int(os.environ.get("DFLASH_VERIFY_ROWS", "0"))
@@ -111,10 +116,11 @@ class MoEFused:
         )
         self.G, self.D = self.gate_up.cores, self.down.cores
         self.router_noc = mesh_device.worker_core_from_logical_core(rc)
-        # Per-slot counters: 32 x 16 B in the router core's L1 (one shard).
-        shard = ttnn.ShardSpec(self.R, [32, 4], ttnn.ShardOrientation.ROW_MAJOR)
+        # Per-slot counters: 32 x 16 B in the router core's L1 (one shard); stealing: 32 x 32 per-pair done flags.
+        cw = 32 if STEAL else 4
+        shard = ttnn.ShardSpec(self.R, [32, cw], ttnn.ShardOrientation.ROW_MAJOR)
         self.counters = ttnn.from_torch(
-            torch.zeros(32, 4, dtype=torch.int32),
+            torch.zeros(32, cw, dtype=torch.int32),
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=mesh_device,
@@ -129,7 +135,11 @@ class MoEFused:
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=mesh_device,
-            memory_config=ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard),
+            memory_config=ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.BufferType.L1,
+                ttnn.ShardSpec(self.R, [32, 4], ttnn.ShardOrientation.ROW_MAJOR),
+            ),
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
         )
         print(
@@ -177,6 +187,11 @@ class MoEFused:
             sems.append(ttnn.SemaphoreDescriptor(3, ttnn.CoreType.WORKER, self.R, 0))
         if P:
             sems.append(ttnn.SemaphoreDescriptor(4, ttnn.CoreType.WORKER, self.R, 0))
+        if STEAL:  # gate|up progress (7) and per-mate claims (8 + reader index)
+            sems += [
+                ttnn.SemaphoreDescriptor(i, ttnn.CoreType.WORKER, self.G_all, 0)
+                for i in range(7, 8 + self.gate_up.readers)
+            ]
         mesh_program = ttnn.MeshProgramDescriptor()
         for coord in b.coords:
             gu, dn = self._part(coord)
@@ -263,7 +278,8 @@ class DenseMLPFused:
             exclude=taken,
         )
         self.G, self.D = self.gate_up.cores, self.down.cores
-        self.defines = MOE + [("MOE_NO_ROUTER", "1"), ("MOE_CTR_SEM", str(self.CTR_SEM))]
+        moe = [d for d in MOE if d[0] != "MOE_STEAL"]  # (stealing needs the router's done flags)
+        self.defines = moe + [("MOE_NO_ROUTER", "1"), ("MOE_CTR_SEM", str(self.CTR_SEM))]
 
     def __call__(self, pending, union, weights, gate_up_ws, act, down_ws, partial):
         b = self.boundary

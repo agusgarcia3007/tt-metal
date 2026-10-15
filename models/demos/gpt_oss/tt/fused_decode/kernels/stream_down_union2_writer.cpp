@@ -128,6 +128,22 @@ void kernel_main() {
         }
         // Slot e is complete once all gate|up cores counted it; push each slot as it arrives (compute waits per slot).
         volatile tt_l1_ptr uint32_t* poll = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128 + 64 * rows);
+#ifdef MOE_STEAL
+        // work stealing: one done flag per gate|up column pair (word 32 slot + pair of the flags at runtime arg 5)
+        while (true) {
+            noc_async_read(
+                get_noc_addr(hub_x, hub_y, get_arg_val<uint32_t>(5) + 128 * order[e]), scr + 128 + 64 * rows, 128);
+            noc_async_read_barrier();
+            invalidate_l1_cache();
+            uint32_t all = 1;
+            for (uint32_t q = 0; q < producers; ++q) {
+                all &= poll[q] != 0 ? 1 : 0;
+            }
+            if (all) {
+                break;
+            }
+        }
+#else
         do {
 #ifdef MOE_CTR_SEM
             const uint32_t ctr_e = get_semaphore(MOE_CTR_SEM + order[e]);
@@ -138,6 +154,7 @@ void kernel_main() {
             noc_async_read_barrier();
             invalidate_l1_cache();
         } while (poll[0] < producers);
+#endif
         DeviceTimestampedData("MOE_T", 310 + e);
 #else
         const uint32_t slot = in0 + e * seg_tiles * tiny_bytes;

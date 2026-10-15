@@ -336,6 +336,16 @@ void kernel_main() {
     cb_push_back(cb_cs, 2 * head_tiles);
 #endif
 
+#if defined(MOE_FUSED) && defined(MOE_STEAL)
+    // fused MoE router with gate|up work stealing: zero the per-(slot, pair) done flags (32 x 32 words, runtime arg 5)
+    // while x is not there yet (the gate|up cores write them only after this core's union release)
+    {
+        volatile tt_l1_ptr uint32_t* f = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_val<uint32_t>(5));
+        for (uint32_t i = 0; i < 32 * 32; ++i) {
+            f[i] = 0;
+        }
+    }
+#endif
     cb_reserve_back(cb_x, kx + 1);
     const uint32_t x_l1 = get_write_ptr(cb_x);
     if constexpr (wait_x) {
@@ -632,10 +642,12 @@ void kernel_main() {
     // their count, 7..: noc x, y). The union / weights writes above are complete (barrier).
     {
         DeviceTimestampedData("MOE_T", 106);
+#ifndef MOE_STEAL
         volatile tt_l1_ptr uint32_t* ctr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_val<uint32_t>(5));
         for (uint32_t i = 0; i < 32 * 4; ++i) {
             ctr[i] = 0;
         }
+#endif
         DeviceTimestampedData("MOE_T", 107);
         const uint32_t n = get_arg_val<uint32_t>(6);
         const uint32_t sem = get_semaphore(1);

@@ -144,10 +144,25 @@ void kernel_main() {
     }
     custom_mm_block_init_short<transpose, split_acc, dense_packing>(cb_x, cb_w, cb_act);
 #endif
+#ifdef MOE_STEAL
+    // work stealing: the DRAM-streamed tasks' processing indices from the writer (mailbox) until 0xFFFF
+    while (true) {
+        uint32_t idx = 0;
+        UNPACK(idx = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+        MATH(idx = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+        PACK(idx = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+        if (idx == 0xFFFF) {
+            break;
+        }
+        cb_wait_front(cb_sc, num_sel);
+        expert(idx, cb_w);
+    }
+#else
     for (; e < num_sel; ++e) {
         cb_wait_front(cb_sc, e + 1);  // the writer pushes the scale tiles one by one
         expert(e, cb_w);
     }
+#endif
     cb_pop_front(cb_x, kt);
     cb_pop_front(cb_sc, num_sel);
     cb_pop_front(cb_id, 1);

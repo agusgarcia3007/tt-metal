@@ -125,11 +125,12 @@ void kernel_main() {
     volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr);
     const uint32_t num_sel = uni[0];
     uint32_t order[32];
+    uint32_t kept = 0;
 #ifdef MOE_PRED
     uint32_t hits = 0;
     {
         uint32_t kept_pred[P];
-        const uint32_t kept = moe_order::make_order<P>(pred, uni, order, kept_pred);
+        kept = moe_order::make_order<P>(pred, uni, order, kept_pred);
         for (uint32_t j = 0; j < kept; ++j) {
             hits |= 1u << kept_pred[j];
         }
@@ -164,6 +165,55 @@ void kernel_main() {
         }
         cb_push_back(cb_sc, 1);
     };
+#ifdef MOE_STEAL
+    // work stealing (kernels/stream_gate_up_union_reader.cpp): any processing index may come up, so every scale
+    // tile first; the predicted (kept) experts are this core's own, then the reader's tasks [index, owner] (cb 8)
+    // until 0xFFFF; each task's index goes to compute; its tile goes to the owner's column pair of the slot and sets
+    // the owner pair's done flag (slot s, pair q: word 32 s + q of the flags at runtime arg 6 on the router core).
+    for (uint32_t i = 0; i < num_sel; ++i) {
+        scale_tile(i);
+    }
+    DeviceTimestampedData("MOE_T", 203);
+    const uint32_t my_r = get_arg_val<uint32_t>(G_STEAL_ARG);
+    const uint32_t pair_base = act_tile0 - my_r * pairs;  // the bank's first pair
+    const uint32_t flags = get_arg_val<uint32_t>(6);
+    const uint32_t hub_x = get_arg_val<uint32_t>(7), hub_y = get_arg_val<uint32_t>(8);
+    auto task_out = [&](uint32_t idx, uint32_t owner) __attribute__((always_inline)) {
+        for (uint32_t p = 0; p < pairs; ++p) {
+            cb_wait_front(cb_act, 1);
+            const uint32_t q = pair_base + owner * pairs + p;
+            noc_async_write(get_read_ptr(cb_act), s_act.get_noc_addr(order[idx] * slot_tiles + q), tiny_bytes);
+            noc_async_writes_flushed();
+            cb_pop_front(cb_act, 1);
+        }
+        noc_async_write_barrier();
+        for (uint32_t p = 0; p < pairs; ++p) {
+            const uint32_t q = pair_base + owner * pairs + p;
+            noc_inline_dw_write(get_noc_addr(hub_x, hub_y, flags + 4 * (32 * order[idx] + q)), 1);
+        }
+    };
+    for (uint32_t e = 0; e < kept; ++e) {
+        task_out(e, my_r);
+        DeviceTimestampedData("MOE_T", 210 + e);
+    }
+    constexpr uint32_t cb_task = 8;
+    for (uint32_t i = 0;; ++i) {
+        cb_wait_front(cb_task, 1);
+        volatile tt_l1_ptr uint32_t* d = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_task));
+        const uint32_t idx = d[0], owner = d[1];
+        cb_pop_front(cb_task, 1);
+        ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, idx);
+        ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, idx);
+        ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, idx);
+        if (idx == 0xFFFF) {
+            break;
+        }
+        task_out(idx, owner);
+        DeviceTimestampedData("MOE_T", 210 + kept + i);
+    }
+    noc_async_write_barrier();
+    return;
+#endif
     if (num_sel > 0) {
         scale_tile(0);
     }

@@ -178,6 +178,10 @@ class ExpertGateUpUnion(_BankStreamOp):
         ]
         if pred_p:
             cbs.append(self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * 2 * self.pairs * self.kt))
+        steal = any(d[0] == "MOE_STEAL" for d in (extra_defines or []))
+        if steal:  # work stealing (kernels/stream_gate_up_union_reader.cpp): the reader's task queue (cb 8)
+            assert pred_p and act.shape[-1] == TILE * M, "stealing assumes MOE_PRED and the spread act layout"
+            cbs.append(self._cb(8, ttnn.uint32, 32, 2 * MAX_EXPERTS + 4))
         ident = bfp4_identity(self.mesh_device, self.weight_dtype)
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for core, bank, r, vc in self.assignments:
@@ -196,6 +200,16 @@ class ExpertGateUpUnion(_BankStreamOp):
                 union.buffer_address(),
                 ident.buffer_address(),
             ] + list(extra_writer_rt or [])
+            if steal:  # [my reader index, mates, (noc x, noc y, reader index) per bank-mate]
+                mates = [(c, r2) for c, b2, r2, _ in self.assignments if b2 == bank and r2 != r]
+                if os.environ.get("DFLASH_STEAL_MATES", "1") == "0":  # debugging: the task / flag path, no steals
+                    mates = []
+                rt = [r, len(mates)]
+                for c, r2 in mates:
+                    p = self.mesh_device.worker_core_from_logical_core(c)
+                    rt += [p.x, p.y, r2]
+                reader_rt[core.x][core.y] = list(reader_rt[core.x][core.y]) + rt
+                writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [r]
         reader_ct = [cb_w, cb_idx, self.kt, 2 * self.pairs, self.expert_stride, self.tile_bytes, self.page_bytes]
         reader_ct += ttnn.TensorAccessorArgs(union).get_compile_time_args()
         act_page = self.inter_pad // TILE * tiny
@@ -216,6 +230,11 @@ class ExpertGateUpUnion(_BankStreamOp):
             "gate_up_union",
             defines=[("ROWS", str(M))]
             + ([("ACT_SPREAD", "1")] if act.shape[-1] == TILE * M else [])
+            + (
+                [("G_READERS", str(self.readers)), ("G_STEAL_ARG", str(6 + len(extra_writer_rt or [])))]
+                if steal
+                else []
+            )
             + (
                 [("G_BUFS", str(self.g_bufs)), ("G_INFLIGHT", str(self.g_inflight))]
                 if (self.g_bufs, self.g_inflight) != (3, 1)
@@ -309,7 +328,7 @@ class ExpertDownUnion(_BankStreamOp):
             self._cb(cb_in0, ttnn.bfloat16, tiny, in0_slots * self.seg_tiles, tiny=True, rows=M),
             self._cb(cb_w, self.weight_dtype, self.tile_bytes, self.num_buffers * block),
             self._cb(cb_idx, ttnn.uint16, 256, 1),
-            self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 64, 1),
+            self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 128, 1),  # (+ the stealing poll's 128 B of done flags)
             self._cb(cb_out, ttnn.bfloat16, tiny, 4, tiny=True, rows=M),
         ]
         if pred_p:  # MOE_PRED: the predicted experts' prefetched blocks (CB 6)
