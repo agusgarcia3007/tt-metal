@@ -440,6 +440,7 @@ class FusedDraft:
                 kc,
                 vc,
                 cur_pos_tensor=d.t_bound,
+                sliding_window_size=d.window,
                 page_table_tensor=d.page_table,
                 scale=d.hd**-0.5,
                 program_config=d.sdpa_pc,

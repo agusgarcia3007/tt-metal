@@ -20,6 +20,8 @@ Two calls per round (DFlashDraft):
       the final norm and the target's LM head; returns the 7 draft tokens (rows 1..7).
 """
 
+import os
+
 import torch
 
 import ttnn
@@ -250,6 +252,9 @@ class DFlashDraft:
             )
         # Paged draft KV cache, one page table row per "user" row (all identical: the rows are one sequence).
         self.block_size = block_size
+        # DFLASH_DRAFT_WINDOW=W: the draft pass attends to the last W positions only (as SGLang's
+        # --speculative-dflash-draft-window-size; the checkpoint itself is full attention)
+        self.window = int(os.environ.get("DFLASH_DRAFT_WINDOW", "0")) or None
         self.num_blocks = -(-(max_positions + self.block) // block_size)  # per user
         self.users = users
         self.user_tables = torch.arange(users * self.num_blocks, dtype=torch.int32).reshape(users, self.num_blocks)
@@ -762,6 +767,7 @@ class DFlashDraft:
                 kc,
                 vc,
                 cur_pos_tensor=self.t_bound,
+                sliding_window_size=self.window,
                 page_table_tensor=self.page_table,
                 scale=self.hd**-0.5,
                 program_config=self.sdpa_pc,
