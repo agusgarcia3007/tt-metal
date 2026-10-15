@@ -161,7 +161,9 @@ class ExpertDownUnion(_BankStreamOp):
     """(act, union, weights, down_stream, out) -> out: the row-tile partial sum (M rows) of
     sum_i w[r][i] * (act_i @ Wd_i + bd_i) over the union experts (the ExpertDownStream weight layout)."""
 
-    def __init__(self, mesh_device, hidden, inter_pad, readers, rows, chunk=2):
+    def __init__(self, mesh_device, hidden, inter_pad, readers, rows, chunk=2, expert_outer=False):
+        """expert_outer: kernels/stream_down_union2_*: each core reads its columns of one expert as one contiguous
+        block and accumulates its (<= 4) output tiles across the experts in DST (larger DRAM reads)."""
         super().__init__(mesh_device, readers)
         self.rows = rows
         self.hidden = hidden
@@ -174,13 +176,15 @@ class ExpertDownUnion(_BankStreamOp):
         assert self.seg_bytes <= MAX_PACKET_BYTES, "one expert column segment must fit one NOC packet"
         self.expert_stride = self.C * self.seg_bytes
         self.chunk = chunk
+        self.expert_outer = expert_outer
+        assert not expert_outer or self.cols <= 4, "expert-outer down keeps a core's output tiles in DST"
 
     def __call__(self, act, union, weights, w_stream, out, send=None):
         """send = (boundary, site): fuse the boundary all-reduce's fabric send (DecodeBoundary.sending_program)."""
         M = self.rows
         cb_in0, cb_w, cb_idx, cb_scr, cb_out = 0, 1, 2, 3, 16
         tiny = TINY_BYTES * M
-        block = self.chunk * self.seg_tiles
+        block = (self.cols if self.expert_outer else self.chunk) * self.seg_tiles
         cbs = [
             self._cb(cb_in0, ttnn.bfloat16, tiny, MAX_EXPERTS * self.seg_tiles, tiny=True, rows=M),
             self._cb(cb_w, ttnn.bfloat4_b, BFP4_TILE_BYTES, 3 * block),
@@ -204,19 +208,23 @@ class ExpertDownUnion(_BankStreamOp):
                 bank * self.C + r * self.cols,
                 union.buffer_address(),
             ]
-        reader_ct = [cb_w, cb_idx, self.seg_tiles, self.cols, self.chunk, self.expert_stride, BFP4_TILE_BYTES]
+        if self.expert_outer:
+            reader_ct = [cb_w, cb_idx, self.seg_tiles, self.cols, self.expert_stride, BFP4_TILE_BYTES]
+        else:
+            reader_ct = [cb_w, cb_idx, self.seg_tiles, self.cols, self.chunk, self.expert_stride, BFP4_TILE_BYTES]
         reader_ct += ttnn.TensorAccessorArgs(union).get_compile_time_args()
         act_page = self.inter_pad // TILE * tiny
         writer_ct = [cb_in0, cb_out, cb_scr, self.seg_tiles, M, NBIAS, self.cols, self.hidden // TILE, act_page]
         for t in (act, weights, out, union):
             writer_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         writer_ct += send[0].notify_args() if send else [0, 0, 0, 0]
-        compute_ct = [cb_in0, cb_w, cb_out, self.seg_tiles, self.cols, self.chunk]
+        compute_ct = [cb_in0, cb_w, cb_out, self.seg_tiles, self.cols]
+        if not self.expert_outer:
+            compute_ct.append(self.chunk)
+        name = "down_union2" if self.expert_outer else "down_union"
 
         def build():
-            return self._program(
-                "down_union", cbs, reader_ct, reader_rt, writer_ct, writer_rt, compute_ct, "down_union"
-            )
+            return self._program(name, cbs, reader_ct, reader_rt, writer_ct, writer_rt, compute_ct, name)
 
         program = send[0].sending_program(build, out, send[1], self.cores) if send else build()
         return ttnn.generic_op([w_stream, act, union, weights, out], program)

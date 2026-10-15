@@ -16,6 +16,8 @@ accepted length and are overwritten by the next block (attention reads positions
 1, 6, 11, 16, 21 (the drafter's context) are kept in row-tile form per round.
 """
 
+import os
+
 import torch
 
 import ttnn
@@ -29,7 +31,6 @@ from ..fused_decode.boundary import (
     rowtile_to_rows,
 )
 from ..fused_decode.config import (
-    DOWN_STREAM_READERS,
     GATE_UP_STREAM_READERS,
     LM_HEAD_DECODE_WEIGHT_DTYPE,
     LM_HEAD_STREAM_PREFETCH,
@@ -107,7 +108,14 @@ class FusedVerify:
         self.gate_up = ExpertGateUpUnion(
             mesh, H, inter_pad, ex.config.swiglu_limit, ex.config.alpha, readers=GATE_UP_STREAM_READERS, rows=M
         )
-        self.down = ExpertDownUnion(mesh, H, inter_pad, readers=DOWN_STREAM_READERS, rows=M)
+        self.down = ExpertDownUnion(
+            mesh,
+            H,
+            inter_pad,
+            readers=int(os.environ.get("DFLASH_DOWN_READERS", "3")),
+            rows=M,
+            expert_outer=os.environ.get("DFLASH_DOWN_EO", "1") == "1",
+        )
         term = model.decode_terminal
         self.vd = term.vd
         self.lm_head = LinearStream(
