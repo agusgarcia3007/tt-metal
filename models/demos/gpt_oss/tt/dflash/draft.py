@@ -59,7 +59,8 @@ class _AllReduce:
         ]
         self.i = 0
 
-    def __call__(self, partial):
+    def __call__(self, partial, sharded=False):
+        """sharded: return the sum in the width-sharded residual layout (else DRAM interleaved)."""
         moved = ttnn.to_memory_config(partial, self.memory_config, dtype=ttnn.bfloat16)
         partial.deallocate(True)
         scratch, sem = self.slots[self.i]
@@ -76,6 +77,8 @@ class _AllReduce:
             num_links=1,
         )
         moved.deallocate(True)
+        if sharded:
+            return out
         flat = ttnn.to_memory_config(out, ttnn.DRAM_MEMORY_CONFIG)
         out.deallocate(True)
         return flat
@@ -433,7 +436,8 @@ class DFlashDraft:
         tt_toks = ttnn.from_torch(toks, dtype=ttnn.uint32, device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
         emb = ttnn.embedding(tt_toks, self.target.embedding_weight, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
         # FP32 residual: the drafter's residual reaches ~5e3 with outlier channels, where BF16 sums lose the rest.
-        h = ttnn.typecast(ttnn.reshape(emb, [1, 1, ROWS, self.hidden]), ttnn.float32)
+        res_dt = ttnn.bfloat16 if __import__("os").environ.get("DRAFT_BF16_RES") else ttnn.float32
+        h = ttnn.typecast(ttnn.reshape(emb, [1, 1, ROWS, self.hidden]), res_dt)
         positions = [s0 + i for s0 in starts for i in range(B)]
         pos, rot = self._pos(positions)
         table = self._page_table([u for u in users for _ in range(B)])
@@ -473,7 +477,7 @@ class DFlashDraft:
             heads.deallocate(True)
             o = self.all_reduce(partial)
             o = ttnn.add(o, L["o_b"], output_tensor=o)
-            h2 = ttnn.add(h, o, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)
+            h2 = ttnn.add(h, o, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=res_dt)
             h.deallocate(True)
             o.deallocate(True)
             h = h2
@@ -490,7 +494,7 @@ class DFlashDraft:
             partial = ttnn.linear(act, L["down"], dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
             act.deallocate(True)
             mlp = self.all_reduce(partial)
-            h2 = ttnn.add(h, mlp, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)
+            h2 = ttnn.add(h, mlp, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=res_dt)
             h.deallocate(True)
             mlp.deallocate(True)
             h = h2
@@ -562,6 +566,22 @@ class DFlashDraft:
             memory_config=ttnn.L1_MEMORY_CONFIG,
             mesh_mapper=rep,
         )
+        # Residual stream of the traced draft: FP32, width-sharded on RESIDUAL_CORES (the all-reduce output layout),
+        # normed by the sharded multi-core RMSNorm; o_proj biases as replicated [32, hidden] rows in that layout.
+        from ..batched_decode import sharded_norm_program_config
+
+        self.res_mc = residual_memory_config(mesh, self.hidden)
+        self.norm_pc = sharded_norm_program_config(self.res_mc)
+        for L in self.L:
+            ob = ttnn.to_torch(ttnn.get_device_tensors(L["o_b"])[0]).float().reshape(1, 1, 1, -1)
+            L["o_b_rows"] = ttnn.from_torch(
+                ob.repeat(1, 1, ROWS, 1),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh,
+                memory_config=self.res_mc,
+                mesh_mapper=rep,
+            )
         self.trace_draft = self.trace_ctx = None
 
     def _host_rows(self, values, dtype, shape=None):
@@ -612,8 +632,9 @@ class DFlashDraft:
 
     def _context_device(self):
         partial = ttnn.linear(self.t_ctx, self.fc, dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
-        summed = self.all_reduce(partial)
-        ctx = self._rms_norm_small(summed, self.hidden_norm_row)
+        summed = self.all_reduce(partial, sharded=True)
+        ctx = self._norm(summed, self.hidden_norm)
+        summed.deallocate(True)
         rot = self.rope.get_rot_mats(self.t_crot)
         for i in range(self.layers):
             q, k, v = self._heads(ctx, i)
@@ -627,13 +648,28 @@ class DFlashDraft:
         for t in rot:
             t.deallocate(True)
 
+    def _norm(self, h, w):
+        """Sharded RMSNorm of the width-sharded residual -> BF16 DRAM interleaved rows (the matmul input)."""
+        x = ttnn.rms_norm(
+            h,
+            weight=w,
+            epsilon=self.eps,
+            program_config=self.norm_pc,
+            memory_config=self.res_mc,
+            compute_kernel_config=self.ck,
+        )
+        xd = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16)
+        x.deallocate(True)
+        return xd
+
     def _draft_device(self):
         emb = ttnn.embedding(self.t_toks, self.target.embedding_weight, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
-        h = ttnn.typecast(ttnn.reshape(emb, [1, 1, ROWS, self.hidden]), ttnn.float32)
+        h0 = ttnn.reshape(emb, [1, 1, ROWS, self.hidden])
+        h = ttnn.to_memory_config(h0, self.res_mc, dtype=ttnn.float32)
         rot = self.rope.get_rot_mats(self.t_rot)
         for i in range(self.layers):
             L = self.L[i]
-            x = self._rms_norm_keep(h, L["ln1_row"])
+            x = self._norm(h, L["ln1"])
             q, k, v = self._heads(x, i)
             x.deallocate(True)
             q = self._norm_rope(q, L["q_norm"], rot)
@@ -660,13 +696,13 @@ class DFlashDraft:
             attn_s.deallocate(True)
             partial = ttnn.linear(heads, L["o"], dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
             heads.deallocate(True)
-            o = self.all_reduce(partial)
-            o = ttnn.add(o, L["o_b"], output_tensor=o)
-            h2 = ttnn.add(h, o, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)
-            h.deallocate(True)
+            o = self.all_reduce(partial, sharded=True)
+            h2 = ttnn.add(h, o, memory_config=self.res_mc, dtype=ttnn.float32)
             o.deallocate(True)
-            h = h2
-            x = self._rms_norm_keep(h, L["ln2_row"])
+            h.deallocate(True)
+            h = ttnn.add(h2, L["o_b_rows"], memory_config=self.res_mc, dtype=ttnn.float32)
+            h2.deallocate(True)
+            x = self._norm(h, L["ln2"])
             gu = ttnn.linear(x, L["gu"], dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
             x.deallocate(True)
             I = self.inter
@@ -678,12 +714,12 @@ class DFlashDraft:
             u.deallocate(True)
             partial = ttnn.linear(act, L["down"], dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
             act.deallocate(True)
-            mlp = self.all_reduce(partial)
-            h2 = ttnn.add(h, mlp, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)
+            mlp = self.all_reduce(partial, sharded=True)
+            h2 = ttnn.add(h, mlp, memory_config=self.res_mc, dtype=ttnn.float32)
             h.deallocate(True)
             mlp.deallocate(True)
             h = h2
-        xb = self._rms_norm_keep(h, self.norm_row)
+        xb = self._norm(h, self.norm)
         h.deallocate(True)
         self.lm(xb, self.lm_weights, self.lists)
         xb.deallocate(True)

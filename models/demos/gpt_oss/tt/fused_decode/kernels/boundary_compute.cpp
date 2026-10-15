@@ -74,8 +74,12 @@ ALWI void rows_norm(
     uint32_t inv_n,
     uint32_t eps) {
     constexpr uint32_t step = 4;  // FP32 DST tiles per acquire
-    cb_wait_front(cb_res_out, pages);
-    cb_wait_front(cb_gamma, pages);
+    {
+        DeviceZoneScopedN("BND_R_WAIT");
+        cb_wait_front(cb_res_out, pages);
+        cb_wait_front(cb_gamma, pages);
+    }
+    DeviceZoneScopedN("BND_R_ALL");
     cb_reserve_back(cb_y, pages);
     for (uint32_t p0 = 0; p0 < pages; p0 += step) {
         const uint32_t n = pages - p0 < step ? pages - p0 : step;
@@ -214,28 +218,44 @@ void kernel_main() {
         cb_wait_front(cb_recv, slots * tiles);
     }
     cb_reserve_back(cb_res_out, tiles);
-    for (uint32_t t = 0; t < tiles; ++t) {
+    // Blocks of up to 4 tiles (the FP32 DST capacity): each op is initialized once per block; per tile the sum order
+    // is unchanged ((slot 0 + slot 1) + slot 2 ...) + residual.
+    constexpr uint32_t blk = 4;
+    for (uint32_t t0 = 0; t0 < tiles; t0 += blk) {
         DeviceZoneScopedN("BND_C1_SUM");
+        const uint32_t n = tiles - t0 < blk ? tiles - t0 : blk;
         tile_regs_acquire();
         if constexpr (slots > 1) {
             add_init(cb_recv, cb_recv);
-            add_tiles(cb_recv, cb_recv, t, tiles + t, 0);
+            for (uint32_t i = 0; i < n; ++i) {
+                add_tiles(cb_recv, cb_recv, t0 + i, tiles + t0 + i, i);
+            }
             add_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_recv);
             for (uint32_t s = 2; s < slots; ++s) {
-                add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_recv, s * tiles + t, 0);
+                for (uint32_t i = 0; i < n; ++i) {
+                    add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_recv, s * tiles + t0 + i, i);
+                }
             }
             add_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_res);
-            add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_res, t, 0);
+            for (uint32_t i = 0; i < n; ++i) {
+                add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_res, t0 + i, i);
+            }
         } else if constexpr (slots == 1) {
             add_init(cb_recv, cb_res);
-            add_tiles(cb_recv, cb_res, t, t, 0);
+            for (uint32_t i = 0; i < n; ++i) {
+                add_tiles(cb_recv, cb_res, t0 + i, t0 + i, i);
+            }
         } else {
             copy_init(cb_res);
-            copy_tile(cb_res, t, 0);
+            for (uint32_t i = 0; i < n; ++i) {
+                copy_tile(cb_res, t0 + i, i);
+            }
         }
         tile_regs_commit();
         tile_regs_wait();
-        pack_tile(0, cb_res_out);
+        for (uint32_t i = 0; i < n; ++i) {
+            pack_tile(i, cb_res_out);
+        }
         tile_regs_release();
     }
     cb_push_back(cb_res_out, tiles);

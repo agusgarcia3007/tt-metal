@@ -247,6 +247,8 @@ class FusedVerify:
             res, x = pending.residual_out, pending.x
             pending.residual.deallocate(True)
             dw = mlp.experts.decode_weights
+            if getattr(self, "union_log", None) is not None:  # debugging: union size per layer (host read, eager)
+                self.union_log.append(int(ttnn.to_torch(ttnn.get_device_tensors(self.union)[0]).reshape(-1)[0]))
             self.gate_up(x, self.union, self.weights, dw.gate_up_stream, self.act)
             x.deallocate(True)
             self.down(self.act, self.union, self.weights, dw.down_stream, self.partial, send=(b, "moe"))
