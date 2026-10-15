@@ -197,20 +197,18 @@ class FusedDraft:
                 None,
                 self.inter_mc,
                 window=draft.window or 0,
+                uniform=True,
             )
             self.shared.prepare([c for kv in draft.caches for c in kv], [])
 
     def shared_ok(self):
-        """Use the shared-KV attention for long contexts: no drafter window, or one of at least
-        DFLASH_DRAFT_SKV_MIN_WINDOW positions (a short window's per-row reads are cheaper than the shared op)."""
-        w = self.d.window
-        return self.shared is not None and (not w or w >= int(os.environ.get("DFLASH_DRAFT_SKV_MIN_WINDOW", "2048")))
+        return self.shared is not None
 
     def set_window(self, w):
         # the shared-KV attention for drafter window w (0: none); call with no traces captured
         from .shared_kv_attention import SharedKVAttention
 
-        d, old = self.d, self.shared
+        d = self.d
         self.shared = SharedKVAttention(
             self.mesh,
             self.M,
@@ -222,8 +220,9 @@ class FusedDraft:
             None,
             self.inter_mc,
             window=w or 0,
+            uniform=True,
         )
-        self.shared.views = old.views  # the same caches
+        self.shared.prepare([c for kv in d.caches for c in kv], [])
 
     def _argmax_gather(self):
         return self._gather

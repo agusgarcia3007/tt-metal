@@ -14,6 +14,9 @@ spec_rows_per_candidate = 8 it packs 4 candidates per 32-row Q tile (8 query hea
   - the sink tile of (h, j) holds kv head h's 8 sinks in every 8-row group;
   - fused_decode/kernels/spec_attn_copy.cpp writes the bounds (once per pass), packs Q, and unpacks the output into
     the [1, M, heads, 64] layout the o_proj streams read.
+uniform=True (the drafter: every row attends the same positions [0, pos[M - 1]], not causal inside the block): the
+same packed layout with spec_rows_per_candidate = 32 (the op masks each 32-row tile with its one bound, so every row
+gets it) and every tile's bound = pos[M - 1]; no sinks.
 A window W > 0 (spec mode has no sliding window): each pass the page table starts at the block holding position
 pos[M - 1] + 1 - W (the cached K are rotated: only the causal bounds depend on positions), so the rows attend the
 last W .. W + block - 1 positions, read once.
@@ -33,13 +36,24 @@ CORE = ttnn.CoreCoord(0, 0)
 
 class SharedKVAttention:
     def __init__(
-        self, mesh_device, rows, n_heads, n_kv, head_dim, page_table, block_size, program_config, out_mc, window=0
+        self,
+        mesh_device,
+        rows,
+        n_heads,
+        n_kv,
+        head_dim,
+        page_table,
+        block_size,
+        program_config,
+        out_mc,
+        window=0,
+        uniform=False,
     ):
         """page_table: the sequence's host [1, blocks] INT32 page table; out_mc: the output's memory config."""
         assert head_dim == 64 and n_heads // n_kv == 8 and n_kv * 8 <= 16, "kv head h's query heads in rows 8h..8h+7"
+        assert rows % 4 == 0
         self.mesh, self.M, self.nq, self.nkv, self.hd = mesh_device, rows, n_heads, n_kv, head_dim
-        # spec mode holds every candidate's Q / score tiles per core: small K chunks over the whole grid (the 8 x 8
-        # batched-decode config's 256-position chunks overflow L1 next to the verify pass's persistent L1 buffers)
+        # spec mode holds every candidate's Q / score tiles per core: K chunks over the whole grid
         self.pc = program_config or ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(
                 *[int(v) for v in os.environ.get("SKV_GRID", "11,10").split(",")]
@@ -49,8 +63,7 @@ class SharedKVAttention:
             exp_approx_mode=False,
             max_cores_per_head_batch=int(os.environ.get("SKV_CORES", "55")),
         )
-        self.block, self.window = block_size, window
-        assert rows % 4 == 0
+        self.block, self.window, self.uniform = block_size, window, uniform
         self.Tt = rows // 4  # packed Q row-tiles per kv head
         rep = ttnn.ReplicateTensorToMesh(mesh_device)
         dram = ttnn.DRAM_MEMORY_CONFIG
@@ -88,8 +101,8 @@ class SharedKVAttention:
 
     def prepare(self, caches, sinks):
         """Before any trace capture (persistent tensors): the [blocks * nkv, 1, block, 64] views of the layers' K / V
-        caches and, per sink tensor (the heads' [heads, 32] tile of sink logits / scale per device), the M-tile copy
-        that spec mode reads (one sink tile per candidate)."""
+        caches and, per sink tensor (the heads' [heads, 32] tile of sink logits / scale per device), the per-(kv head,
+        row-tile) sink tiles that spec mode reads."""
         for c in caches:
             s = c.shape
             self.views[c.buffer_address()] = ttnn.reshape(c, [s[0] * s[1], 1, s[2], s[3]])
@@ -126,7 +139,7 @@ class SharedKVAttention:
             compile_time_args=ct,
             runtime_args=rta,
             config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0),
-            defines=[(mode, "1")],
+            defines=[(mode, "1")] + ([("SPEC_UNIFORM", "1")] if self.uniform and mode == "SPEC_POS" else []),
         )
         cb = ttnn.CBDescriptor(
             total_size=scr,
@@ -136,8 +149,9 @@ class SharedKVAttention:
         ttnn.generic_op(list(io), ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[cb]))
 
     def begin(self, pos, base_page_table):
-        """Once per pass, before the layers: pos INT32 [>= M] (row r attends [0, pos[r]], non-decreasing; with a window
-        the last W .. W + block - 1 positions); base_page_table: the sequence's device page table (row 0 used)."""
+        """Once per pass, before the layers: pos INT32 [>= M] (row r attends [0, pos[r]], non-decreasing; uniform:
+        every row [0, pos[M - 1]]; with a window the last W .. W + block - 1 positions); base_page_table: the
+        sequence's device page table (row 0 used)."""
         ct = [self.window, self.block, self.pt_n, self.pt_bytes, pos.shape[-1] * 4]
         self._copy("SPEC_POS", (pos, self.pos, base_page_table, self.page_table), ct)
 
@@ -157,7 +171,7 @@ class SharedKVAttention:
             compute_kernel_config=compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             spec_multi_pos_tiles=self.Tt,
-            spec_rows_per_candidate=8,
+            spec_rows_per_candidate=32 if self.uniform else 8,
         )
         self._copy("SPEC_OUT", (o, self.out))
         o.deallocate(True)

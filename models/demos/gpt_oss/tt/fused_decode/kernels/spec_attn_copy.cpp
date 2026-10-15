@@ -87,7 +87,12 @@ void kernel_main() {
     volatile tt_l1_ptr int32_t* q = reinterpret_cast<volatile tt_l1_ptr int32_t*>(pscr + 128);
     for (uint32_t h = 0; h < nkv; ++h) {
         for (uint32_t j = 0; j < Tt; ++j) {
+#ifdef SPEC_UNIFORM
+            // every row attends up to the last row's bound (the drafter: not causal inside the block)
+            q[h * Tt + j] = p[M - 1] - shift * static_cast<int32_t>(block);
+#else
             q[h * Tt + j] = p[4 * j + 3] - shift * static_cast<int32_t>(block);
+#endif
         }
     }
     noc_async_write(pscr + 128, s_ps.get_noc_addr(0), nkv * Tt * 4);

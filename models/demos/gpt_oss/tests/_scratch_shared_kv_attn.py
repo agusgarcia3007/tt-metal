@@ -66,6 +66,14 @@ def test_shared_kv_attn(mesh_device, device_params):
     win = SharedKVAttention(mesh_device, v.M, v.nq, v.nkv, v.hd, page_table, 64, None, ttnn.L1_MEMORY_CONFIG, window=W)
     for s_ in (shared, win):
         s_.prepare([k_cache, v_cache], [attn.weights.decode_sinks])
+    uni = SharedKVAttention(
+        mesh_device, v.M, v.nq, v.nkv, v.hd, page_table, 64, None, ttnn.L1_MEMORY_CONFIG, uniform=True
+    )
+    uni.prepare([k_cache, v_cache], [])
+    uni_w = SharedKVAttention(
+        mesh_device, v.M, v.nq, v.nkv, v.hd, page_table, 64, None, ttnn.L1_MEMORY_CONFIG, window=W, uniform=True
+    )
+    uni_w.prepare([k_cache, v_cache], [])
     v.row_attn = None  # _sdpa: the ttnn per-row path
     sinks, scale, ck = attn.weights.decode_sinks, attn.config.scaling, attn.program_config.get_compute_kernel_config()
 
@@ -122,6 +130,35 @@ def test_shared_kv_attn(mesh_device, device_params):
             o = per_row(p + r - shift * 64 + 1)
             wp.append(_pcc(dev0(o)[0, r, :16], rw[0, r, :16]))
             o.deallocate(True)
+        # the drafter's case: every row attends [0, p + 7] (uniform bound), no sinks, with / without a window
+        pu = ttnn.from_torch(
+            torch.full((v.M,), p + v.M - 1, dtype=torch.int32),
+            dtype=ttnn.int32,
+            device=mesh_device,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+        )
+        upcc = {}
+        for wu, s_ in ((None, uni), (p + v.M - 1 - shift * 64 + 1, uni_w)):  # the window: [shift * 64, p + 7]
+            o = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                v.q,
+                k_cache,
+                v_cache,
+                cur_pos_tensor=pu,
+                sliding_window_size=wu,
+                page_table_tensor=v.page_table,
+                scale=scale,
+                program_config=v._sdpa_pc(None),
+                compute_kernel_config=ck,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            ref = dev0(o).clone()
+            o.deallocate(True)
+            s_.begin(pu, v.page_table)
+            got = dev0(s_(v.q, k_cache, v_cache, None, scale, ck)).clone()
+            upcc[wu is not None] = min(_pcc(ref[0, r, :16], got[0, r, :16]) for r in range(v.M))
+        print(
+            f"SKV pos={p}: drafter-style uniform PCC min {upcc[False]:.5f} (window {W}: {upcc[True]:.5f})", flush=True
+        )
         t_row, t_one, t_win = timed(per_row), timed(one_read), timed(lambda: one_read(win))
         print(
             f"SKV pos={p}: per-row {t_row:.3f} ms, one-read {t_one:.3f} ms, one-read window {W} {t_win:.3f} ms "

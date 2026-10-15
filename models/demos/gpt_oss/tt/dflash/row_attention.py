@@ -122,9 +122,9 @@ class RowAttention:
                 core_ranges=self.cores,
                 compile_time_args=writer_ct,
                 runtime_args=writer_rt,
-                defines=[]
-                if notify is None
-                else [("RA_NOTIFY_N", str(len(notify[0]))), ("RA_NOTIFY_SEM", str(notify[1]))],
+                defines=(
+                    [] if notify is None else [("RA_NOTIFY_N", str(len(notify[0]))), ("RA_NOTIFY_SEM", str(notify[1]))]
+                ),
                 config=dm(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_1),
             ),
             ttnn.KernelDescriptor(
