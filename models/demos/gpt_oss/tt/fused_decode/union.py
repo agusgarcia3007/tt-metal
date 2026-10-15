@@ -161,7 +161,7 @@ class ExpertDownUnion(_BankStreamOp):
     """(act, union, weights, down_stream, out) -> out: the row-tile partial sum (M rows) of
     sum_i w[r][i] * (act_i @ Wd_i + bd_i) over the union experts (the ExpertDownStream weight layout)."""
 
-    def __init__(self, mesh_device, hidden, inter_pad, readers, rows, chunk=8):
+    def __init__(self, mesh_device, hidden, inter_pad, readers, rows, chunk=2):
         super().__init__(mesh_device, readers)
         self.rows = rows
         self.hidden = hidden
