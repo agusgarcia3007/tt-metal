@@ -97,6 +97,7 @@ void kernel_main() {
     if constexpr (producers > 0) {
         noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_id)), producers);
     }
+    DeviceTimestampedData("BND_T", 1);  // producers done: the send starts
     if constexpr (local) {
         noc_async_write(partial_addr, get_noc_addr(slot_addr), payload);
     }
@@ -128,6 +129,7 @@ void kernel_main() {
         noc_async_write_barrier();
         noc_semaphore_inc(get_noc_addr(sem_addr), 1);
     }
+    DeviceTimestampedData("BND_T", 2);  // every packet handed to the fabric
     fabric.close();
     noc_async_atomic_barrier();
 }

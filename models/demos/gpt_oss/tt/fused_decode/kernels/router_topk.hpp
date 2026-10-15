@@ -180,6 +180,7 @@ inline void rows_union(const uint32_t* words, volatile tt_l1_ptr uint32_t* uni_w
             mask |= 1u << bi[j];
         }
     }
+
     uint32_t slot[32];
     uint32_t u = 0;
     uint16_t list[64];
@@ -203,6 +204,104 @@ inline void rows_union(const uint32_t* words, volatile tt_l1_ptr uint32_t* uni_w
         }
         for (uint32_t j = 0; j < topk; ++j) {
             wt[slot[ids[r][j]]] = q16_to_bf16(wq[r][j]);
+        }
+        for (uint32_t i = 0; i < 16; ++i) {
+            wts_w[16 * r + i] = wt[2 * i] | (static_cast<uint32_t>(wt[2 * i + 1]) << 16);
+        }
+    }
+}
+}  // namespace router_topk
+
+namespace router_topk {
+// rows_union in two parts, so two RISCs can split the rows: rows_topk writes rows [r0, r1)'s top-k ids and Q16
+// weights to ids[r * topk + j] / wq[r * topk + j]; rows_finish builds the union and the weight matrix from all rows.
+template <uint32_t topk, uint32_t rows>
+inline void rows_topk(
+    const uint32_t* words,
+    uint32_t r0,
+    uint32_t r1,
+    volatile tt_l1_ptr uint32_t* ids,
+    volatile tt_l1_ptr uint32_t* wq) {
+    for (uint32_t r = r0; r < r1; ++r) {
+        uint32_t bk[topk];
+        uint32_t bi[topk];
+        for (uint32_t j = 0; j < topk; ++j) {
+            bk[j] = 0;
+            bi[j] = 0;
+        }
+        for (uint32_t f = 0; f < 2; ++f) {
+            const uint32_t* w = words + 8 * (f * rows + r);
+            for (uint32_t q = 0; q < 8; ++q) {
+                const uint32_t v = w[q];
+                for (uint32_t h = 0; h < 2; ++h) {
+                    const uint32_t b = h ? (v >> 16) : (v & 0xFFFF);
+                    const uint32_t key = (b & 0x8000) ? (~b & 0xFFFF) : (b | 0x8000);
+                    if (key > bk[topk - 1]) {
+                        uint32_t p = topk - 1;
+                        while (p > 0 && key > bk[p - 1]) {
+                            bk[p] = bk[p - 1];
+                            bi[p] = bi[p - 1];
+                            --p;
+                        }
+                        bk[p] = key;
+                        bi[p] = f * 16 + 2 * q + h;
+                    }
+                }
+            }
+        }
+        int32_t v0 = 0;
+        uint32_t e[topk];
+        uint32_t sum = 0;
+        for (uint32_t j = 0; j < topk; ++j) {
+            const uint32_t k = bk[j];
+            const uint16_t b = (k & 0x8000) ? static_cast<uint16_t>(k & 0x7FFF) : static_cast<uint16_t>(~k & 0xFFFF);
+            const int32_t v = bf16_to_q16(b);
+            if (j == 0) {
+                v0 = v;
+            }
+            e[j] = exp_q16(v - v0);
+            sum += e[j];
+        }
+        for (uint32_t j = 0; j < topk; ++j) {
+            ids[r * topk + j] = bi[j];
+            wq[r * topk + j] = (e[j] << 15) / (sum >> 1);
+        }
+    }
+}
+
+template <uint32_t topk, uint32_t rows>
+inline void rows_finish(
+    volatile tt_l1_ptr uint32_t* ids,
+    volatile tt_l1_ptr uint32_t* wq,
+    volatile tt_l1_ptr uint32_t* uni_w,
+    volatile tt_l1_ptr uint32_t* wts_w) {
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < rows * topk; ++i) {
+        mask |= 1u << ids[i];
+    }
+    uint32_t slot[32];
+    uint32_t u = 0;
+    uint16_t list[64];
+    for (uint32_t i = 0; i < 64; ++i) {
+        list[i] = 0;
+    }
+    for (uint32_t m = mask; m; m &= m - 1) {
+        const uint32_t id = __builtin_ctz(m);
+        slot[id] = u;
+        list[1 + u] = id;
+        ++u;
+    }
+    list[0] = u;
+    for (uint32_t i = 0; i < 32; ++i) {
+        uni_w[i] = list[2 * i] | (static_cast<uint32_t>(list[2 * i + 1]) << 16);
+    }
+    uint16_t wt[32];
+    for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t i = 0; i < 32; ++i) {
+            wt[i] = 0;
+        }
+        for (uint32_t j = 0; j < topk; ++j) {
+            wt[slot[ids[r * topk + j]]] = q16_to_bf16(wq[r * topk + j]);
         }
         for (uint32_t i = 0; i < 16; ++i) {
             wts_w[16 * r + i] = wt[2 * i] | (static_cast<uint32_t>(wt[2 * i + 1]) << 16);

@@ -544,7 +544,7 @@ class LinearStream(_BankStreamOp):
             self._cb(cb_x, ttnn.bfloat16, TINY_BYTES * M, self.kt, tiny=True, rows=M),
             self._cb(cb_w, self.weight_dtype, self.tile_bytes, w_cols * self.kt),
             # router scratch (multi-row: union ids, [M, 32] weights, one logit row, top-k stage)
-            self._cb(cb_scr, ttnn.bfloat16, 64 if M == 1 else 128 + 64 * M + 128, 1),
+            self._cb(cb_scr, ttnn.bfloat16, 64 if M == 1 else 128 + 64 * M + 128 + 64 * M, 1),
         ]
         if stage:
             cbs.append(self._cb(cb_stage, ttnn.bfloat16, 2048, stage))

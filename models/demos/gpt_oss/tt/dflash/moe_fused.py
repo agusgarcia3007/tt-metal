@@ -17,6 +17,8 @@ and down starts on union slot i while gate|up is still computing the later slots
 
 Separate ops would serialize router -> gate|up -> down, each with its own launch and DRAM pipeline ramp."""
 
+import os
+
 import torch
 
 import ttnn
@@ -58,6 +60,18 @@ class MoEFused:
             mesh_device, hidden, inter_pad, readers=down_readers, rows=rows, expert_outer=True, exclude=taken
         )
         self.R = router.cores
+        # the router's per-row top-k split over BRISC and NCRISC (kernels/stream_linear_{writer,reader}.cpp)
+        self.split_defines = (
+            [
+                ("MOE_SPLIT_ROWS", "1"),
+                ("MOE_SPLIT_SEM", "3"),
+                ("MOE_SPLIT_CB_OUT", "16"),
+                ("MOE_SPLIT_CB_SCR", "3"),
+                ("MOE_SPLIT_TOPK", str(router.heads[0])),
+            ]
+            if os.environ.get("DFLASH_ROUTER_SPLIT", "1") == "1"
+            else []
+        )
         self.G, self.D = self.gate_up.cores, self.down.cores
         self.router_noc = mesh_device.worker_core_from_logical_core(rc)
         # Per-slot counters: 32 x 16 B in the router core's L1 (one shard).
@@ -90,7 +104,7 @@ class MoEFused:
             (union, weights),
             build_only=True,
             consumer_cores=self.R.merge(self.G),
-            extra_defines=MOE,
+            extra_defines=MOE + self.split_defines,
             extra_writer_rt=router_rt,
         )
         x = pending.x
@@ -114,6 +128,8 @@ class MoEFused:
             ttnn.SemaphoreDescriptor(1, ttnn.CoreType.WORKER, self.G.merge(self.D), 0),
             ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, self.D.merge(b.cores), 0),
         ]
+        if self.split_defines:
+            sems.append(ttnn.SemaphoreDescriptor(3, ttnn.CoreType.WORKER, self.R, 0))
         mesh_program = ttnn.MeshProgramDescriptor()
         n_d = self.D.num_cores()
         for coord in b.coords:

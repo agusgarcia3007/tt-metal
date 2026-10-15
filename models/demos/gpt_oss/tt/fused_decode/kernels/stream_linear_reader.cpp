@@ -11,6 +11,9 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
+#ifdef MOE_SPLIT_ROWS
+#include "router_topk.hpp"
+#endif
 
 void kernel_main() {
     const uint32_t w_addr = get_arg_val<uint32_t>(0);
@@ -68,4 +71,22 @@ void kernel_main() {
         cb_push_back(cb_w, kt);
         trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
     }
+#ifdef MOE_SPLIT_ROWS
+    // Router of the fused MoE (dflash/moe_fused.py): the second half of the rows' top-k (stream_linear_writer.cpp
+    // runs the first half and the union), from the logits tile in cb_out (the writer pops it after the union).
+    {
+        constexpr uint32_t rows = ROWS;
+        constexpr uint32_t topk = MOE_SPLIT_TOPK;
+        cb_wait_front(MOE_SPLIT_CB_OUT, 1);
+        invalidate_l1_cache();
+        const uint32_t src = get_read_ptr(MOE_SPLIT_CB_OUT);
+        const uint32_t scr = get_write_ptr(MOE_SPLIT_CB_SCR);
+        volatile tt_l1_ptr uint32_t* ids = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128 + 64 * rows + 128);
+        volatile tt_l1_ptr uint32_t* wq = ids + rows * topk;
+        router_topk::rows_topk<topk, rows>(reinterpret_cast<const uint32_t*>(src), rows / 2, rows, ids, wq);
+        asm volatile("fence" ::: "memory");
+        noc_semaphore_inc(get_noc_addr(get_semaphore(MOE_SPLIT_SEM)), 1);
+        noc_async_atomic_barrier();
+    }
+#endif
 }

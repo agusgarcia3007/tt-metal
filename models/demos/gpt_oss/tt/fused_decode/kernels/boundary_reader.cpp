@@ -126,6 +126,7 @@ void kernel_main() {
             DeviceZoneScopedN("BND_R_WAIT");
             volatile tt_l1_ptr uint32_t* sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_addr);
             noc_semaphore_wait_min(sem, expected);
+            DeviceTimestampedData("BND_T", 3);  // every device's partial is here
             noc_semaphore_set(sem, 0);
         }
         cb_reserve_back(cb_recv, slots * tiles);

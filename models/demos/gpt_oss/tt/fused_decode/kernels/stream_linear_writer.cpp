@@ -467,10 +467,27 @@ void kernel_main() {
                 // entry i = row r's softmax weight of union expert i (0 when row r did not route to it).
 
                 invalidate_l1_cache();
+#ifdef MOE_SPLIT_ROWS
+                // rows [rows / 2, rows) run on NCRISC (stream_linear_reader.cpp), which signals MOE_SPLIT_SEM
+                {
+                    volatile tt_l1_ptr uint32_t* ids =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks + 128 + 64 * rows + 128);
+                    volatile tt_l1_ptr uint32_t* wq = ids + rows * q_cols;
+                    router_topk::rows_topk<q_cols, rows>(reinterpret_cast<const uint32_t*>(src), 0, rows / 2, ids, wq);
+                    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(MOE_SPLIT_SEM)), 1);
+                    invalidate_l1_cache();
+                    router_topk::rows_finish<q_cols, rows>(
+                        ids,
+                        wq,
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks),
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks + 128));
+                }
+#else
                 router_topk::rows_union<q_cols, rows>(
                     reinterpret_cast<const uint32_t*>(src),
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks),
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks + 128));
+#endif
 #ifdef MOE_FUSED
                 DeviceTimestampedData("MOE_T", 104);
 #endif
