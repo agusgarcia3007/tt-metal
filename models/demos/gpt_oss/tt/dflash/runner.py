@@ -8,6 +8,7 @@ draft it disagrees with, so the target's KV cache and outputs are exactly those 
 equals the target's greedy output); each step's captured hidden states become the drafter's context.
 """
 
+import os
 import time
 
 import torch
@@ -180,6 +181,10 @@ class FastDFlashRunner:
         self.verify.set_context_target(draft.t_ctx)
         self.verify.enable_device_argmax()
         draft.feed_verify(self.verify.tokens)
+        if os.environ.get("DFLASH_FUSED_DRAFT", "1") == "1":
+            from .fused_draft import FusedDraft
+
+            draft.fused = FusedDraft(draft, self.verify)
         self.verify_trace = None
 
     def _verify(self, block, start):

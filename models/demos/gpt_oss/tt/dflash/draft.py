@@ -738,6 +738,8 @@ class DFlashDraft:
         return q, k, v
 
     def _draft_device(self):
+        if getattr(self, "fused", None) is not None:  # the fused-decode draft pass (dflash/fused_draft.py)
+            return self.fused.forward()
         emb = ttnn.embedding(self.t_toks, self.target.embedding_weight, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
         h0 = ttnn.reshape(emb, [1, 1, ROWS, self.hidden])
         h = ttnn.to_memory_config(h0, self.res_mc, dtype=ttnn.float32)

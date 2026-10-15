@@ -93,6 +93,11 @@ void kernel_main() {
             custom_mm_block_init_short<transpose, split_acc, dense_packing>(cb_sc, cb_id, cb_act);
             custom_mm_block<true>(cb_sc, cb_id, e, 0, 2, 1);  // row weights
 
+#ifdef DENSE_SILU
+            // Plain SwiGLU (dense MLP, e.g. the DFlash drafter): silu(g) * u.
+            silu_tile_init();
+            silu_rows(0);
+#else
             clamp_tile_init();
             clamp_rows(0, neg_big, limit);
             clamp_rows(1, neg_limit, limit);
@@ -103,6 +108,7 @@ void kernel_main() {
             silu_rows(0);
             binop_with_scalar_tile_init();
             scalar_rows<MUL_UNARY>(0, inv_alpha);
+#endif
             mul_binary_tile_init();
             mul_rows(0, 1, 0);
             mul_rows(0, 2, 0);
