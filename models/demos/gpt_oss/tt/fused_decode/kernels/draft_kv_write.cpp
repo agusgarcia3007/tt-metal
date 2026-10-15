@@ -11,6 +11,9 @@
 // patched, and written back (whole tiles: DRAM accesses are 64-byte aligned, and one core avoids read-modify-write
 // races between rows sharing a tile, which ttnn's paged_update_cache has).
 //
+// head_offset: the cache's kv head h is head row head_offset + h of the source tiles (several layers' K / V heads in
+// one tensor).
+//
 // runtime args: [k_src, v_src, k_cache, v_cache, pos, page_table, (noc_x, noc_y) x rows]
 
 #include <stdint.h>
@@ -31,7 +34,8 @@ void kernel_main() {
     constexpr uint32_t head_tiles = get_compile_time_arg_val(3);
     constexpr uint32_t block = get_compile_time_arg_val(4);
     constexpr uint32_t pt_row_bytes = get_compile_time_arg_val(5);
-    constexpr auto kc_args = TensorAccessorArgs<6>();
+    constexpr uint32_t head_offset = get_compile_time_arg_val(6);
+    constexpr auto kc_args = TensorAccessorArgs<7>();
     constexpr auto vc_args = TensorAccessorArgs<kc_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<vc_args.next_compile_time_args_offset()>();
     constexpr auto pt_args = TensorAccessorArgs<pos_args.next_compile_time_args_offset()>();
@@ -113,7 +117,8 @@ void kernel_main() {
         const uint32_t dst_off = (rr < 16 ? 0 : 1024) + (rr % 16) * 32;
         for (uint32_t kv = 0; kv < 2; ++kv) {
             for (uint32_t h = 0; h < kv_heads; ++h) {
-                const uint32_t src_off = (h < 16 ? 0 : 1024) + (h % 16) * 32;
+                const uint32_t hs = head_offset + h;
+                const uint32_t src_off = (hs < 16 ? 0 : 1024) + (hs % 16) * 32;
                 for (uint32_t t = 0; t < head_tiles; ++t) {
                     const uint32_t s = src + ((kv * rows + r) * head_tiles + t) * tile + src_off;
                     const uint32_t d = dst_l1(kv, g, h, t) + dst_off;

@@ -33,7 +33,7 @@ def _hf_lm_head():
         return f.get_tensor(name)
 
 
-def padded_lm_head(mesh_device, terminal, readers, cache_dir=None):
+def padded_lm_head(mesh_device, terminal, readers, cache_dir=None, dtype=LM_HEAD_DECODE_WEIGHT_DTYPE):
     """-> (weights, n): the per-device [hidden, n] LM-head stream (n = vd padded to banks * readers columns)."""
     banks = mesh_device.dram_grid_size().x
     vd, hidden, tp, vocab = terminal.vd, terminal.hidden, terminal.tp, terminal.vocab_size
@@ -41,7 +41,7 @@ def padded_lm_head(mesh_device, terminal, readers, cache_dir=None):
     n_tiles = -(-(vd // TILE) // step) * step
     n = n_tiles * TILE
     rows = linear_stream_rows(mesh_device, hidden, n)
-    dt = {ttnn.bfloat8_b: "bfp8", ttnn.bfloat4_b: "bfp4"}[LM_HEAD_DECODE_WEIGHT_DTYPE]
+    dt = {ttnn.bfloat8_b: "bfp8", ttnn.bfloat4_b: "bfp4"}[dtype]
     cache = None if cache_dir is None else f"{cache_dir}/dflash_lm_head_{dt}_vd{vd}_n{n}_b{banks}"
     layouts = None
     marker = None if cache is None else Path(cache + ".built")  # as_tensor's cache file name carries extra suffixes
@@ -56,7 +56,7 @@ def padded_lm_head(mesh_device, terminal, readers, cache_dir=None):
             bias[hi - lo :] = MASK
             layouts.append(stream_linear_layout(wd, bias, banks))
         assert layouts[0].shape[0] == rows
-    t = as_stream_tensor(mesh_device, layouts, rows, LM_HEAD_DECODE_WEIGHT_DTYPE, cache)
+    t = as_stream_tensor(mesh_device, layouts, rows, dtype, cache)
     if marker is not None:
         marker.touch()
     return t, n

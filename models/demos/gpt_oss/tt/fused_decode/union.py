@@ -54,14 +54,14 @@ def union_buffers(mesh_device, rows):
     return uni, w
 
 
-def act_buffer(mesh_device, inter_pad, rows, slots=MAX_EXPERTS):
+def act_buffer(mesh_device, inter_pad, rows, slots=MAX_EXPERTS, memory_config=ttnn.L1_MEMORY_CONFIG):
     """[slots, I_pad / 32 [rows, 32] tiles] BF16 activation buffer (one row-major page per slot), L1 interleaved."""
     return ttnn.from_torch(
         torch.zeros(slots, inter_pad * rows),
         dtype=ttnn.bfloat16,
         layout=ttnn.ROW_MAJOR_LAYOUT,
         device=mesh_device,
-        memory_config=ttnn.L1_MEMORY_CONFIG,
+        memory_config=memory_config,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
     )
 

@@ -26,10 +26,10 @@ class DraftKVWrite:
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(CORE, CORE)])
         self.scratch = 256 + (2 * rows * self.head_tiles + 4 * kv_heads * self.head_tiles) * 2048
 
-    def __call__(self, k, v, k_cache, v_cache, pos, page_table):
+    def __call__(self, k, v, k_cache, v_cache, pos, page_table, head_offset=0):
         """k, v: [1, 32, kv_heads, head_dim] BF16 height-sharded (one user row per core); pos: INT32 [32] (row r's
         position, < 0 skipped; the valid rows' positions are consecutive); page_table: INT32 [*, blocks] (row 0)."""
-        ct = [0, self.rows, self.kv_heads, self.head_tiles, self.block, page_table.shape[-1] * 4]
+        ct = [0, self.rows, self.kv_heads, self.head_tiles, self.block, page_table.shape[-1] * 4, head_offset]
         for t in (k_cache, v_cache, pos, page_table):
             ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         rt = ttnn.RuntimeArgs()

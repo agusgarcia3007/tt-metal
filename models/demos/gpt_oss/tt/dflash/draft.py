@@ -688,6 +688,8 @@ class DFlashDraft:
         ttnn.copy_host_to_device_tensor(self._host_rows(rot, ttnn.uint32, (1, ROWS)), self.t_crot)
 
     def _context_device(self):
+        if getattr(self, "fused", None) is not None and getattr(self.fused, "ctx_buf", None) is not None:
+            return self.fused.context()
         partial = ttnn.linear(self.t_ctx, self.fc, dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
         summed = self.all_reduce(partial, sharded=True)
         ctx = self._norm(summed, self.hidden_norm, sharded=True)

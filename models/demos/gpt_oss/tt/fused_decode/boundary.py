@@ -329,7 +329,12 @@ class DecodeBoundary:
         return [1, self.noc_xy[0], self.noc_xy[1], 0]
 
     def _parts(self, residual, gamma, partial, site, entry, norm, sent):
-        """The boundary-core part of a boundary: (per-device kernel list builder, CBs, io tensors, residual', x)."""
+        """The boundary-core part of a boundary: (per-device kernel list builder, CBs, io tensors, residual', x).
+        entry: False, True (residual = the embedding rows) or "zero" (no residual: residual' = the reduced partial;
+        `residual` is ignored)."""
+        res_mode = 2 if entry == "zero" else (1 if entry else 0)
+        if res_mode == 2:
+            residual = gamma  # accessor placeholder, never read
         reduced = None
         if partial is not None and self.ccl == "ttnn":
             scratch, ar_sem = self.ar_sites[site]
@@ -358,7 +363,7 @@ class DecodeBoundary:
         cb_p, cb_rsum = 29, 30  # multi-row RMSNorm: row-sum matrix, per-row sums
         T, A = self.tiles, self.all
         cbs = [
-            self._cb(cb_res, A * PAGE, tensor=None if entry else residual),
+            self._cb(cb_res, A * PAGE, tensor=None if res_mode else residual),
             self._cb(cb_res_out, A * PAGE, tensor=out_res),
         ]
         if slots:
@@ -376,7 +381,7 @@ class DecodeBoundary:
                 cbs += [self._cb(cb_p, PAGE), self._cb(cb_rsum, 4096, ttnn.float32)]
         gamma_t = gamma if norm else out_res
         reader_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, A, slots, expected]
-        reader_ct += [1 if entry else 0, self.hidden * 2, 1 if norm else 0, self.rows, cb_p]
+        reader_ct += [res_mode, self.hidden * 2, 1 if norm else 0, self.rows, cb_p]
         reader_ct += ttnn.TensorAccessorArgs(gamma_t).get_compile_time_args()
         reader_ct += ttnn.TensorAccessorArgs(residual).get_compile_time_args()
         compute_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, A, slots]

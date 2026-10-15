@@ -58,7 +58,7 @@ void kernel_main() {
         }
     }
 
-    if constexpr (res_mode == 1) {
+    if constexpr (res_mode >= 1) {  // 1: entry embedding rows; 2: zero residual (zero-filled only)
         const auto s_res = TensorAccessor(res_args, res_src_addr, row_bytes);
         cb_reserve_back(cb_res, tiles);
         const uint32_t dst = get_write_ptr(cb_res);
@@ -68,7 +68,8 @@ void kernel_main() {
             noc_async_read(zeros, dst + z, n);
         }
         noc_async_read_barrier();
-        if constexpr (rows == 1) {
+        if constexpr (res_mode == 2) {
+        } else if constexpr (rows == 1) {
             noc_async_read(s_res.get_noc_addr(0), dst, row_bytes);
         } else {
             // Embedding row r (page r of the [1, 1, rows, hidden] row-major input): its values 32 j .. 32 j + 31 go to
@@ -116,7 +117,7 @@ void kernel_main() {
 
     // The residual and the receive slots go to compute first (the sum does not need gamma); gamma's reads complete
     // while compute adds.
-    if constexpr (res_mode == 1) {
+    if constexpr (res_mode >= 1) {
         noc_async_read_barrier();  // the entry embedding rows (gamma may still be in flight: one more barrier below)
     }
     cb_push_back(cb_res, tiles);

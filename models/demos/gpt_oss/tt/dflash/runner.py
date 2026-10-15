@@ -185,6 +185,7 @@ class FastDFlashRunner:
             from .fused_draft import FusedDraft
 
             draft.fused = FusedDraft(draft, self.verify)
+            self.verify.set_context_target_rowtile(draft.fused.ctx_buf, draft.fused.ctx_split)
         self.verify_trace = None
 
     def _verify(self, block, start):

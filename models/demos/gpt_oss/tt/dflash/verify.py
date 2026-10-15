@@ -82,7 +82,7 @@ class FusedVerify:
             H // TILE,
             (self.nq + 2 * self.nkv) * self.hd,
             QKV_DECODE_WEIGHT_DTYPE,
-            readers=QKV_STREAM_READERS,
+            readers=int(os.environ.get("DFLASH_QKV_READERS", QKV_STREAM_READERS)),
             out_mode=3,
             heads=(q_cols, k_cols),
             rows=M,
@@ -92,7 +92,7 @@ class FusedVerify:
             self.nq * self.hd // TILE,
             H,
             OPROJ_DECODE_WEIGHT_DTYPE,
-            readers=OPROJ_STREAM_READERS,
+            readers=int(os.environ.get("DFLASH_OPROJ_READERS", OPROJ_STREAM_READERS)),
             x_pages=self.hd // TILE,
             out_mode=5,
             rows=M,
@@ -317,7 +317,47 @@ class FusedVerify:
             )
         ttnn.generic_op([res, self.ctx_input], mesh_program)
 
+    def set_context_target_rowtile(self, buf, split):
+        """Capture into a per-device row-tile buffer: device d receives global context tiles split[d] = [s, e) of the
+        layer-major 5 x hidden features (whole [M, 32] tiles, one L1 copy per layer and device)."""
+        self.ctx_rowtile = (buf, split)
+
+    def _capture_rowtile(self, L, res):
+        from ..fused_decode.boundary import KERNEL_DIR
+
+        buf, split = self.ctx_rowtile
+        slot = self.capture_layers.index(L)
+        b, kt = self.boundary, self.H // TILE
+        tb = self.M * 64
+        lo, hi = slot * kt, (slot + 1) * kt
+        mesh_program = ttnn.MeshProgramDescriptor()
+        for coord in b.coords:
+            s_, e = split[coord[1]]
+            a, z = max(lo, s_), min(hi, e)
+            n = max(0, z - a)
+            rt = ttnn.RuntimeArgs()
+            rt[b.core.x][b.core.y] = [
+                res.buffer_address() + (a - lo) * tb if n else 0,
+                buf.buffer_address() + (a - s_) * tb if n else 0,
+                n * tb,
+            ]
+            kernel = ttnn.KernelDescriptor(
+                kernel_source=str(KERNEL_DIR / "l1_copy.cpp"),
+                core_ranges=b.cores,
+                compile_time_args=[1 if buf.memory_config().buffer_type == ttnn.BufferType.DRAM else 0],
+                runtime_args=rt,
+                config=ttnn.DataMovementConfigDescriptor(
+                    processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0
+                ),
+            )
+            mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = ttnn.ProgramDescriptor(
+                kernels=[kernel], semaphores=[], cbs=[]
+            )
+        ttnn.generic_op([res, buf], mesh_program)
+
     def _capture(self, L, res):
+        if getattr(self, "ctx_rowtile", None) is not None:
+            return self._capture_rowtile(L, res)
         if getattr(self, "ctx_input", None) is not None:
             return self._capture_to_ctx(L, res)
         old = self.features.get(L)

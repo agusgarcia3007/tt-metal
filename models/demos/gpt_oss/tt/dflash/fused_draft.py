@@ -22,9 +22,9 @@ from pathlib import Path
 import torch
 
 import ttnn
-from models.tt_transformers.tt.load_checkpoints import reverse_permute
+from models.tt_transformers.tt.load_checkpoints import reverse_permute, reverse_permute_1d
 
-from ..fused_decode.boundary import PendingBoundary
+from ..fused_decode.boundary import PendingBoundary, flat_shape
 from ..fused_decode.stream import (
     LinearStream,
     as_stream_tensor,
@@ -76,6 +76,27 @@ class FusedDraft:
             mesh, H, I_pad, readers=4, rows=M, expert_outer=True, max_experts=1, weight_dtype=dtype, num_buffers=2
         )
         self._load_weights(dtype, banks)
+        # LM head: the verify pass's (BF8) by default; DFLASH_DRAFT_LM_BFP4=1: a BFP4 copy (drafts only need the argmax
+        # to agree with the target's often, the verify pass keeps its BF8 head).
+        self.lm, self.lm_w = verify.lm_head, verify.lm_weights
+        if os.environ.get("DFLASH_DRAFT_LM_BFP4", "1") == "1":
+            from ..fused_decode.config import LM_HEAD_STREAM_PREFETCH
+            from .lm_head import padded_lm_head
+
+            readers = len(verify.lm_head.assignments) // banks
+            self.lm_w, n = padded_lm_head(
+                mesh, draft.target.decode_terminal, readers, os.environ.get("TT_CACHE_PATH"), dtype=ttnn.bfloat4_b
+            )
+            self.lm = LinearStream(
+                mesh,
+                H // TILE,
+                n,
+                ttnn.bfloat4_b,
+                readers=readers,
+                out_mode=6,
+                prefetch_cols=LM_HEAD_STREAM_PREFETCH,
+                rows=M,
+            )
         rep = ttnn.ReplicateTensorToMesh(mesh)
 
         def dram(t, dt=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mc=ttnn.DRAM_MEMORY_CONFIG):
@@ -84,13 +105,135 @@ class FusedDraft:
         self.q = dram(torch.zeros(1, ROWS, nq, hd))
         self.k = dram(torch.zeros(1, ROWS, nkv, hd))
         self.vv = dram(torch.zeros(1, ROWS, nkv, hd))
-        self.act = act_buffer(mesh, I_pad, M, slots=1)
+        self.act = act_buffer(mesh, I_pad, M, slots=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         u = torch.zeros(1, 64, dtype=torch.int32)
         u[0, 0] = 1  # one "expert": the dense MLP, id 0
         self.union = dram(u, ttnn.uint16, ttnn.ROW_MAJOR_LAYOUT, ttnn.L1_MEMORY_CONFIG)
         w = torch.zeros(1, 32 * M)
         w[0, ::32] = 1.0  # every row's weight of expert 0
         self.weights = dram(w, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, ttnn.L1_MEMORY_CONFIG)
+        self._init_context(dtype, banks, dram)
+
+    # -- context pass ----------------------------------------------------------------------------------------------
+    def _init_context(self, dtype, banks, dram):
+        """Context pass on streamed ops: the verify pass copies each captured layer output (row tiles) into this
+        device's whole-tile slice of the 5 x hidden context features (ctx_buf, row-tile layout on the boundary core);
+        fc (row-parallel over the slices) -> boundary all-reduce + hidden_norm (zero residual) inside the K / V stream
+        of all 8 layers at once -> one k_norm / RoPE over the 16 K heads -> one K / V row write per layer."""
+        d, b, mesh, M, H = self.d, self.b, self.mesh, self.M, self.d.hidden
+        D = d.D
+        tot = d.ctx_in // TILE  # 450 tiles of 5 x hidden
+        # whole tiles per device, balanced (113 / 113 / 112 / 112)
+        self.ctx_split = []
+        base, extra = divmod(tot, D)
+        st = 0
+        for i in range(D):
+            n = base + (1 if i < extra else 0)
+            self.ctx_split.append((st, st + n))
+            st += n
+        self.ctx_kx = max(e - s_ for s_, e in self.ctx_split)
+        pages = -(-self.ctx_kx * M * 64 // 2048)
+        rep = ttnn.ReplicateTensorToMesh(mesh)
+        # DRAM, one bank's shard (contiguous: the fc stream reads it in one piece; L1 is short)
+        one_bank = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.DRAM,
+            ttnn.ShardSpec(
+                ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))}),
+                (TILE, pages * TILE),
+                ttnn.ShardOrientation.ROW_MAJOR,
+            ),
+        )
+        self.ctx_buf = ttnn.from_torch(
+            torch.zeros(flat_shape(H, pages)),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh,
+            memory_config=one_bank,
+            mesh_mapper=rep,
+        )
+        self.g_hidden = b.flat_gamma(_Norm(d.hidden_norm))
+        nkv, hd, L = d.nkv, d.hd, d.layers
+        self.fc = LinearStream(mesh, self.ctx_kx, H, dtype, readers=2, out_mode=5, rows=M)
+        self.kv = LinearStream(
+            mesh,
+            H // TILE,
+            L * 2 * nkv * hd,
+            dtype,
+            readers=1,
+            out_mode=3,
+            heads=(0, L * nkv * hd // TILE),
+            rows=M,
+            prefetch_cols=3,
+        )
+        self.Kc = dram(torch.zeros(1, ROWS, L * nkv, hd))
+        self.Vc = dram(torch.zeros(1, ROWS, L * nkv, hd))
+        cache_dir = os.environ.get("TT_CACHE_PATH")
+        dt = {ttnn.bfloat8_b: "bfp8", ttnn.bfloat4_b: "bfp4", ttnn.bfloat16: "bf16"}[dtype]
+        base_name = None if cache_dir is None else f"{cache_dir}/dflash_fused_ctx_{dt}_b{banks}_k{self.ctx_kx}"
+        marker = None if base_name is None else Path(base_name + ".built")
+        lay = {"fc": None, "kv": None}
+        knorm = torch.zeros(1, 1, L * nkv, hd)
+        from safetensors.torch import load_file
+
+        w = load_file(str(d.path / "model.safetensors"))
+        for l in range(L):
+            kn = reverse_permute_1d(w[f"layers.{l}.self_attn.k_norm.weight"]).float()
+            knorm[0, 0, l * nkv : (l + 1) * nkv] = kn
+        if marker is None or not marker.exists():
+            fcT = w["fc.weight"].float().T  # [5 hidden, hidden]
+            lay = {"fc": [], "kv": []}
+            kh = nkv * hd
+            for dv in range(D):
+                s_, e = self.ctx_split[dv]
+                wf = torch.zeros(self.ctx_kx * TILE, H)
+                wf[: (e - s_) * TILE] = fcT[s_ * TILE : e * TILE]
+                lay["fc"].append(stream_linear_layout(wf, torch.zeros(H), banks))
+                ks, vs, kbs, vbs = [], [], [], []
+                for l in range(L):
+                    a = f"layers.{l}.self_attn."
+                    k = reverse_permute(w[a + "k_proj.weight"], D * nkv, D * nkv * hd, H).float()
+                    kb = reverse_permute(w[a + "k_proj.bias"][:, None], D * nkv, D * nkv * hd, 1)[:, 0].float()
+                    ks.append(k[dv * kh : (dv + 1) * kh])
+                    kbs.append(kb[dv * kh : (dv + 1) * kh])
+                    vs.append(w[a + "v_proj.weight"].float()[dv * kh : (dv + 1) * kh])
+                    vbs.append(w[a + "v_proj.bias"].float()[dv * kh : (dv + 1) * kh])
+                wkv = torch.cat(ks + vs).T.contiguous()  # [H, L * 2 * kh]: K of every layer, then V
+                lay["kv"].append(stream_linear_layout(wkv, torch.cat(kbs + vbs), banks))
+        self.w_fc = as_stream_tensor(
+            mesh, lay["fc"], self.fc.weight_rows(), dtype, None if base_name is None else base_name + "_fc"
+        )
+        self.w_kv = as_stream_tensor(
+            mesh, lay["kv"], self.kv.weight_rows(), dtype, None if base_name is None else base_name + "_kv"
+        )
+        if marker is not None:
+            marker.touch()
+        self.knorm = dram(knorm)
+
+    def context(self):
+        """Context K / V of the rows d.t_cpos marks (features already in ctx_buf, captured by the verify pass)."""
+        d, v, b = self.d, self.v, self.b
+        self.fc(self.ctx_buf, self.w_fc, v.partial, send=(b, "moe"))
+        pending = PendingBoundary(b, None, self.g_hidden, v.partial, "moe", entry="zero", sent=True)
+        self.kv(pending, self.w_kv, (self.Kc, self.Kc, self.Vc))
+        pending.x.deallocate(True)
+        pending.residual_out.deallocate(True)
+        rot = d.rope.get_rot_mats(d.t_crot)
+        kn = ttnn.rms_norm(self.Kc, epsilon=d.eps, compute_kernel_config=d.ck)
+        kw = ttnn.multiply(kn, self.knorm)
+        kn.deallocate(True)
+        ks = ttnn.to_memory_config(kw, d.head_mc)
+        kw.deallocate(True)
+        kr = ttnn.experimental.rotary_embedding_llama(ks, rot[0], rot[1], d.trans_mat, is_decode_mode=True)
+        ks.deallocate(True)
+        vs = ttnn.to_memory_config(self.Vc, d.head_mc)
+        for l in range(d.layers):
+            kc, vc = d.caches[l]
+            d.kv_write(kr, vs, kc, vc, d.t_cpos, d.page_table, head_offset=l * d.nkv)
+        kr.deallocate(True)
+        vs.deallocate(True)
+        for t in rot:
+            t.deallocate(True)
 
     def _load_weights(self, dtype, banks):
         d = self.d
@@ -213,7 +356,7 @@ class FusedDraft:
             pending = PendingBoundary(b, res, gamma, v.partial, "moe", sent=fab)
         if not fab:
             pending.run()
-        v.lm_head(pending if fab else pending.x, v.lm_weights, d.lists)
+        self.lm(pending if fab else pending.x, self.lm_w, d.lists)
         pending.x.deallocate(True)
         pending.residual.deallocate(True)
         pending.residual_out.deallocate(True)
