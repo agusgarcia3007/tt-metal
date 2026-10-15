@@ -46,6 +46,10 @@ from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion, act_buffer,
 TILE = ttnn.TILE_SIZE
 
 
+def _noc_list(mesh_device, cores):
+    return [mesh_device.worker_core_from_logical_core(c) for c in ttnn.corerange_to_cores(cores, row_wise=True)]
+
+
 class FusedVerify:
     def __init__(self, model, page_table, kv_cache, rows=8, capture_layers=(1, 6, 11, 16, 21)):
         """model: the fused-decode gpt-oss Model (one user); page_table: its [1, blocks] INT32 page table (torch);
@@ -152,6 +156,23 @@ class FusedVerify:
             self.row_attn = RowAttention(
                 mesh, M, self.nq, self.nkv, self.hd, 64, max_chunks=ra_max // TILE, cores_start=start
             )
+            # DFLASH_RA_OPROJ=1 (with the fusion): o_proj and its boundary send in the same program too (its own cores,
+            # clear of QKV / row attention / boundary; weights prefetched while QKV and row attention run)
+            self.o_proj_f = None
+            if self.ra_fuse and os.environ.get("DFLASH_RA_OPROJ", "0") == "1":
+                taken |= {(c.x, c.y) for c in self.row_attn.core_list}
+                self.o_proj_f = LinearStream(
+                    mesh,
+                    self.nq * self.hd // TILE,
+                    H,
+                    OPROJ_DECODE_WEIGHT_DTYPE,
+                    readers=int(os.environ.get("DFLASH_OPROJ_READERS", "2")),
+                    x_pages=self.hd // TILE,
+                    out_mode=5,
+                    rows=M,
+                    gather_split=os.environ.get("DFLASH_OPROJ_SPLIT", "1") == "1",
+                    exclude=sorted(taken),
+                )
             self.row_attn_max = ra_max
             self.use_row_attn = True
         self.moe_fused = None
@@ -354,8 +375,10 @@ class FusedVerify:
             )
             fuse = None
             ra_here = self.row_attn is not None and (self.use_row_attn or attn.config.sliding_window)
+            o_f = self.o_proj_f if ra_here and getattr(self, "ra_fuse", False) else None
             if ra_here and getattr(self, "ra_fuse", False):
                 k_cache, v_cache = self.kv_cache[i]
+                o_noc = _noc_list(self.mesh, o_f.cores) if o_f is not None else None
                 kern, cbs, io = self.row_attn.parts(
                     self.q,
                     k_cache,
@@ -366,16 +389,57 @@ class FusedVerify:
                     attn.config.scaling,
                     window=attn.config.sliding_window or 0,
                     wait=(3, len(self.qkv.assignments)),
+                    notify=(o_noc, 7) if o_f is not None else None,
                 )
                 fuse = (kern, cbs, io, self.row_attn.noc_cores(), 3)
-            self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse)
+            if o_f is not None:
+                # QKV + row attention + o_proj + the attn-site boundary send: one program per device
+                qprog, qio = self.qkv(
+                    pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse, build_only=True
+                )
+                oprog, oio = o_f(
+                    self.row_attn.out,
+                    attn.weights.o_proj_stream,
+                    self.partial,
+                    build_only=True,
+                    x_wait=(7, len(self.row_attn.core_list)),
+                    notify=(b.noc_xy[0], b.noc_xy[1], 4),
+                )
+                n_o = o_f.cores.num_cores()
+                mesh_program = ttnn.MeshProgramDescriptor()
+                for coord in b.coords:
+                    program = ttnn.ProgramDescriptor(
+                        kernels=list(qprog.kernels) + list(oprog.kernels),
+                        semaphores=list(qprog.semaphores)
+                        + list(oprog.semaphores)
+                        + [
+                            ttnn.SemaphoreDescriptor(4, ttnn.CoreType.WORKER, o_f.cores.merge(b.cores), 0),
+                            ttnn.SemaphoreDescriptor(7, ttnn.CoreType.WORKER, o_f.cores, 0),
+                        ],
+                        cbs=list(qprog.cbs) + list(oprog.cbs),
+                    )
+                    links = min(b.links, b.chunks)
+                    for link in range(links):
+                        sender = b._sender_kernel(
+                            coord, self.partial, "attn", producers=n_o, sem_id=4, link=link, links=links
+                        )
+                        b._add_sender(coord, program, sender, link)
+                    mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
+                io = []
+                for t in [*qio, *oio]:
+                    if all(t is not u for u in io):
+                        io.append(t)
+                ttnn.generic_op(io, mesh_program)
+            else:
+                self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse)
             res = pending.residual_out
             pending.x.deallocate(True)
             pending.residual.deallocate(True)
             if i - 1 in self.capture_layers:  # layer i - 1's output = this layer's input residual
                 self._capture(i - 1, res)
             sdpa = self.row_attn.out if fuse is not None else self._sdpa(i)
-            self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial, send=(b, "attn"))
+            if o_f is None:
+                self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial, send=(b, "attn"))
             if self.row_attn is None or sdpa is not self.row_attn.out:
                 sdpa.deallocate(True)
             pending = PendingBoundary(b, res, self.gamma_post[i], self.partial, "attn", sent=True)

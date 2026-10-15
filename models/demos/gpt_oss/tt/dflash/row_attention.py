@@ -50,7 +50,7 @@ class RowAttention:
         ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
         return self.out
 
-    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, window=0, wait=None):
+    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, window=0, wait=None, notify=None):
         """(kernels, cbs, io) of the op; wait = (semaphore id, count): fused after the QKV op that writes q and the
         block's K / V rows (the reader reads the older chunks first, Q and the block's chunks after the count)."""
         NK = self.max_chunks
@@ -105,6 +105,8 @@ class RowAttention:
                 g,
             ]
             writer_rt[c.x][c.y] = [self.out.buffer_address(), pos.buffer_address(), r, g]
+            if notify is not None:  # (noc cores, semaphore id): the consumer of the output in the same program
+                writer_rt[c.x][c.y] = list(writer_rt[c.x][c.y]) + [v for p in notify[0] for v in (p.x, p.y)]
         dm = ttnn.DataMovementConfigDescriptor
         kernels = [
             ttnn.KernelDescriptor(
@@ -120,6 +122,9 @@ class RowAttention:
                 core_ranges=self.cores,
                 compile_time_args=writer_ct,
                 runtime_args=writer_rt,
+                defines=[]
+                if notify is None
+                else [("RA_NOTIFY_N", str(len(notify[0]))), ("RA_NOTIFY_SEM", str(notify[1]))],
                 config=dm(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_1),
             ),
             ttnn.KernelDescriptor(

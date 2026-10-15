@@ -315,6 +315,10 @@ void kernel_main() {
     if constexpr (wait_x) {
         noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), BND_WAIT_N);
     }
+#ifdef LIN_X_WAIT_SEM
+    // x is produced in the same program (o_proj after row attention, dflash/verify.py): LIN_X_WAIT_N increments first
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(LIN_X_WAIT_SEM)), LIN_X_WAIT_N);
+#endif
 #ifdef MOE_FUSED
     DeviceTimestampedData("MOE_T", 101);
 #endif

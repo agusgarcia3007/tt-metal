@@ -461,13 +461,15 @@ class LinearStream(_BankStreamOp):
         rows=1,
         x_tile_rows=False,
         gather_split=False,
+        exclude=(),
     ):
         """gather_split (x_pages > 0, rows > 1): each core gathers 1 / n of the activation tiles and copies them to the
-        other cores (kernels/stream_linear_writer.cpp X_GATHER_SPLIT) instead of every core gathering all of them."""
+        other cores (kernels/stream_linear_writer.cpp X_GATHER_SPLIT) instead of every core gathering all of them.
+        exclude: logical cores to leave free (a fused program's other kernels)."""
         n_tiles = -(-n // TILE)
         banks = mesh_device.dram_grid_size().x
         self.C = -(-n_tiles // banks)
-        super().__init__(mesh_device, readers, active_banks=-(-n_tiles // self.C))
+        super().__init__(mesh_device, readers, active_banks=-(-n_tiles // self.C), exclude=exclude)
         assert self.C % readers == 0, f"{self.C} columns per bank do not split over {readers} readers"
         self.cols = self.C // readers
         self.n_tiles = n_tiles
@@ -513,6 +515,8 @@ class LinearStream(_BankStreamOp):
         extra_defines=None,
         extra_writer_rt=None,
         fuse=None,
+        x_wait=None,
+        notify=None,
     ):
         """fuse = (kernels, cbs, io, noc_cores, sem_id): another op's parts on other cores added to this program; the
         writers increment program semaphore sem_id on noc_cores once all their outputs are written (QKV + row
@@ -552,7 +556,9 @@ class LinearStream(_BankStreamOp):
         )
         # A fused boundary's consumer can buffer all its weight columns: the readers stream them while the boundary
         # runs (fused_decode.config.DECODE_BOUNDARY_PREFETCH_ALL).
-        w_cols = max(3, self.cols) if pending is not None and DECODE_BOUNDARY_PREFETCH_ALL else 3
+        w_cols = (
+            max(3, self.cols) if (pending is not None or x_wait is not None) and DECODE_BOUNDARY_PREFETCH_ALL else 3
+        )
         if self.prefetch_cols is not None:
             # Large columns (the LM head's ~97 KB): cap the ring at what L1 holds.
             w_cols = min(w_cols, max(3, self.prefetch_cols))
@@ -612,7 +618,8 @@ class LinearStream(_BankStreamOp):
         writer_ct += [self.out_page_bytes, stage, cb_stage, self.heads[0], self.heads[1], self.head_tiles]
         for t in (x, *outs):
             writer_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
-        writer_ct += send[0].notify_args() if send else [0, 0, 0, 0]
+        # notify = (noc x, y, semaphore id): the writers' done notification (a fused program's boundary sender)
+        writer_ct += send[0].notify_args() if send else ([1, *notify] if notify is not None else [0, 0, 0, 0])
         writer_ct += [1 if pending is not None else 0]
         writer_ct += exchange.writer_compile_args() if exchange is not None else [0, 0, 0, 0]
         compute_ct = [cb_x, cb_w, cb_out, self.kt, self.cols]
@@ -638,6 +645,8 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("BND_WAIT_N", str(b_.H))]
         if extra_defines:
             defines = (defines or []) + list(extra_defines)
+        if x_wait is not None:  # (semaphore id, count): x is written in the same program
+            defines = (defines or []) + [("LIN_X_WAIT_SEM", str(x_wait[0])), ("LIN_X_WAIT_N", str(x_wait[1]))]
         if fuse is not None:
             defines = (defines or []) + [
                 ("QKV_NOTIFY_N", str(len(fuse[3]))),

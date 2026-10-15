@@ -57,4 +57,15 @@ void kernel_main() {
     }
     noc_async_write_barrier();
     cb_pop_front(cb_out, 2);
+#ifdef RA_NOTIFY_N
+    // fused with o_proj (dflash/verify.py): this core's output rows are written; increment program semaphore
+    // RA_NOTIFY_SEM on every o_proj core (runtime args 4..: their noc x, y)
+    for (uint32_t i = 0; i < RA_NOTIFY_N; ++i) {
+        noc_semaphore_inc(
+            get_noc_addr(
+                get_arg_val<uint32_t>(4 + 2 * i), get_arg_val<uint32_t>(5 + 2 * i), get_semaphore(RA_NOTIFY_SEM)),
+            1);
+    }
+    noc_async_atomic_barrier();
+#endif
 }
