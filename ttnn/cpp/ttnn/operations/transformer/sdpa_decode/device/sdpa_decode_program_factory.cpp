@@ -66,6 +66,15 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     // SdpaDecodeParams::spec_multi_pos_tiles.
     const uint32_t spec_multi_pos_tiles = operation_attributes.spec_multi_pos_tiles;
     const bool spec_multi_pos = spec_multi_pos_tiles > 0;
+    // Packed candidates (SdpaDecodeParams::spec_rows_per_candidate): 32 / R per Q row-tile, per-row-group causal
+    // bounds.
+    const uint32_t spec_rows_per_candidate = operation_attributes.spec_rows_per_candidate;
+    TT_FATAL(
+        spec_rows_per_candidate == 32 ||
+            (spec_multi_pos && (spec_rows_per_candidate == 8 || spec_rows_per_candidate == 16)),
+        "spec_rows_per_candidate must be 32, or 8 / 16 with spec_multi_pos_tiles, got {}",
+        spec_rows_per_candidate);
+    const bool spec_packed = spec_multi_pos && spec_rows_per_candidate < 32;
 
     // V tensor: use K if MLA (V is subset of K), otherwise require explicit V
     TT_FATAL(use_mla || tensor_args.v.has_value(), "V tensor must be provided when MLA is disabled.");
@@ -881,6 +890,9 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
         compute_defines["DYNAMIC_CHUNK_SIZE"] = "1";
     }
 
+    if (spec_packed) {
+        compute_defines["SPEC_ROWS_PER_CAND"] = std::to_string(spec_rows_per_candidate);
+    }
     KernelDescriptor::Defines compute_defines_vec;
     compute_defines_vec.reserve(compute_defines.size());
     for (auto& [k, v] : compute_defines) {
@@ -896,6 +908,9 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     reader_desc.core_ranges = core_grid;
     reader_desc.compile_time_args = std::move(reader_compile_time_args_common);
     reader_desc.config = ReaderConfigDescriptor{};
+    if (spec_packed) {
+        reader_desc.defines.emplace_back("SPEC_ROWS_PER_CAND", std::to_string(spec_rows_per_candidate));
+    }
 
     KernelDescriptor writer_desc;
     writer_desc.kernel_source = kernel_path + "dataflow/writer_decode_all.cpp";
@@ -903,6 +918,9 @@ ProgramDescriptor SdpaDecodeDeviceOperation::create_descriptor(
     writer_desc.core_ranges = core_grid;
     writer_desc.compile_time_args = std::move(writer_compile_time_args_common);
     writer_desc.config = WriterConfigDescriptor{};
+    if (spec_packed) {
+        writer_desc.defines.emplace_back("SPEC_ROWS_PER_CAND", std::to_string(spec_rows_per_candidate));
+    }
 
     KernelDescriptor compute_desc;
     compute_desc.kernel_source = kernel_path + "compute/sdpa_flash_decode.cpp";

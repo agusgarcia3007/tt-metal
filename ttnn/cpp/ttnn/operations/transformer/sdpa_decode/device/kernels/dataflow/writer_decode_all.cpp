@@ -243,7 +243,11 @@ void kernel_main() {
         // different cores. The compute kernel evaluates the identical predicate and pops one
         // block per masked chunk, so pushes and pops stay in lockstep through the
         // single-buffered mask CB.
+#ifdef SPEC_ROWS_PER_CAND
+        const uint32_t spec_pos_min = spec_pos[0] - (32 / SPEC_ROWS_PER_CAND - 1);  // the first packed candidate's
+#else
         const uint32_t spec_pos_min = spec_pos[0];
+#endif
         for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
             const uint32_t chunk_start_pos = k_chunk * k_chunk_size_dynamic;
             const uint32_t chunk_last_pos = chunk_start_pos + k_chunk_size_dynamic - 1;

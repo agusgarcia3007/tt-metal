@@ -121,7 +121,11 @@ void bind_sdpa_decode(nb::module_& mod) {
         // b*Tg+j attends to [0, cur_pos[b*Tg+j]] inclusive. Output is [1, B, Tg*32, DH] —
         // byte-identical to the legacy B*Tg-row output [1, B*Tg, 32, DH]. Requires causal +
         // paged + num_kv_heads==1, unsharded bf16 TILE Q, no sliding window, no MLA.
-        nb::arg("spec_multi_pos_tiles") = 0u);
+        nb::arg("spec_multi_pos_tiles") = 0u,
+        // spec_rows_per_candidate = R (32 = one candidate per Q row-tile) packs 32 / R consecutive-position
+        // candidates per row-tile (cur_pos entry j = the bound of row-tile j's last candidate; row group i attends up
+        // to it minus 32/R - 1 - i); attention sink page b * PNHt + j per batch b.
+        nb::arg("spec_rows_per_candidate") = 32u);
 
     ttnn::bind_function<"flash_multi_latent_attention_decode", "ttnn.transformer.">(
         mod,

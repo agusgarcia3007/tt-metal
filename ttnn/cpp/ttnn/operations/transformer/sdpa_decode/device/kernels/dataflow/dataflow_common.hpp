@@ -339,15 +339,38 @@ void generate_mask_spec_multi_pos(uint32_t Sk_chunk_t, uint32_t chunk_start_pos,
 
     for (uint32_t j = 0; j < PNHt; ++j) {
         const uint32_t bound = pos_vec[j];
+#ifdef SPEC_ROWS_PER_CAND
+        // 32 / R packed candidates per row-tile at consecutive positions: row group g (rows g R .. g R + R - 1)
+        // attends up to bound - (32 / R - 1 - g); bound is the tile's last (largest) candidate bound
+        constexpr uint32_t R = SPEC_ROWS_PER_CAND;
+        const uint32_t bound_lo = bound - (32 / R - 1);
+#else
+        const uint32_t bound_lo = bound;
+#endif
         for (uint32_t i = 0; i < Sk_chunk_t; ++i) {
             const uint32_t tile_id = j * Sk_chunk_t + i;
             const uint32_t tile_first_pos = chunk_start_pos + i * 32;
-            if (bound >= tile_first_pos + 31) {
+            if (bound_lo >= tile_first_pos + 31) {
                 fill_tile<tile_bytes>(cb_mask_in, tile_id, 0);
             } else if (bound < tile_first_pos) {
                 fill_tile<tile_bytes>(cb_mask_in, tile_id, NEG_INF);
             } else {
+#ifdef SPEC_ROWS_PER_CAND
+                CircularBuffer cb(cb_mask_in);
+                volatile tt_l1_ptr uint16_t* m =
+                    reinterpret_cast<volatile tt_l1_ptr uint16_t*>(cb.get_write_ptr() + tile_id * tile_bytes);
+                const uint16_t neg = NEG_INF >> 16;
+                for (uint32_t row = 0; row < 32; ++row) {
+                    const int32_t row_bound = static_cast<int32_t>(bound) - static_cast<int32_t>(32 / R - 1 - row / R);
+                    const int32_t keep = row_bound - static_cast<int32_t>(tile_first_pos);  // columns <= keep visible
+                    for (uint32_t col = 0; col < 32; ++col) {
+                        m[((row >> 4) * 2 + (col >> 4)) * 256 + (row & 15) * 16 + (col & 15)] =
+                            static_cast<int32_t>(col) <= keep ? 0 : neg;
+                    }
+                }
+#else
                 fill_tile_partial<tile_bytes>(cb_mask_in, tile_id, bound - tile_first_pos, NEG_INF);
+#endif
             }
         }
     }

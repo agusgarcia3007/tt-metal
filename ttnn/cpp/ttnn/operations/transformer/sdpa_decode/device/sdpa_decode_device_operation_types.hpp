@@ -51,6 +51,12 @@ struct SdpaDecodeParams {
     // Requires num_kv_heads==1, causal, paged, no sliding window, no MLA, unsharded bf16
     // TILE Q with Tg*32 padded rows per batch.
     uint32_t spec_multi_pos_tiles = 0;
+    // With spec_multi_pos_tiles: query rows per candidate inside each 32-row Q tile. 32 (default): one candidate per
+    // tile. R in {8, 16} packs 32 / R CONSECUTIVE-position candidates per tile (e.g. 8 rows = the 8 query heads of one
+    // kv head per candidate): row-tile j's cur_pos entry is the bound of its LAST candidate and row group i (rows
+    // i*R .. i*R + R - 1) attends [0, that bound - (32/R - 1 - i)]. The attention sink tile of batch b, row-tile j is
+    // page b * PNHt + j (per-batch sinks, e.g. one batch row per kv head).
+    uint32_t spec_rows_per_candidate = 32;
 };
 
 struct SdpaDecodeInputs {

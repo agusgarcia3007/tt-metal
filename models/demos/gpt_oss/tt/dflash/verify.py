@@ -175,6 +175,28 @@ class FusedVerify:
                 )
             self.row_attn_max = ra_max
             self.use_row_attn = True
+        # DFLASH_SHARED_KV=1: the full-attention layers past row attention's range read the K / V cache once for the
+        # M rows (dflash/shared_kv_attention.py: SDPA's spec_multi_pos_tiles mode) instead of once per row
+        self.shared_kv = None
+        self.use_shared = False  # set per traced variant (FastDFlashRunner: positions past DFLASH_SKV_MIN)
+        if os.environ.get("DFLASH_SHARED_KV", "1") == "1":
+            from .shared_kv_attention import SharedKVAttention
+
+            full = [i for i, L in enumerate(self.layers) if not L.self_attn.config.sliding_window]
+            self.shared_kv = SharedKVAttention(
+                mesh,
+                M,
+                self.nq,
+                self.nkv,
+                self.hd,
+                page_table,
+                kv_cache[full[0]][0].shape[2],
+                None,
+                ttnn.L1_MEMORY_CONFIG if os.environ.get("DFLASH_L1_INTER", "1") == "1" else ttnn.DRAM_MEMORY_CONFIG,
+            )
+            self.shared_kv.prepare(
+                [c for i in full for c in kv_cache[i]], [self.layers[i].self_attn.weights.decode_sinks for i in full]
+            )
         self.moe_fused = None
         if os.environ.get("DFLASH_MOE_FUSED", "1") == "1" and self.boundary.ccl == "fabric":
             from .moe_fused import MoEFused
@@ -367,6 +389,8 @@ class FusedVerify:
         )
         emb = ttnn.reshape(emb, (1, 1, M, self.H))
         pending = PendingBoundary(b, emb, self.gamma_in[0], entry=True)
+        if self.shared_kv is not None and self.use_shared:
+            self.shared_kv.begin(self.pos, self.page_table)
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
             k_cache, v_cache = self.kv_cache[i]
@@ -440,7 +464,7 @@ class FusedVerify:
             sdpa = self.row_attn.out if fuse is not None else self._sdpa(i)
             if o_f is None:
                 self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial, send=(b, "attn"))
-            if self.row_attn is None or sdpa is not self.row_attn.out:
+            if not self._persistent(sdpa):
                 sdpa.deallocate(True)
             pending = PendingBoundary(b, res, self.gamma_post[i], self.partial, "attn", sent=True)
             mlp = layer.mlp
@@ -599,9 +623,22 @@ class FusedVerify:
             exp_approx_mode=False,
         )
 
+    def _persistent(self, t):
+        # the row attention / shared-KV outputs are reused by every layer
+        return any(o is not None and t is o.out for o in (self.row_attn, self.shared_kv))
+
     def _sdpa(self, i):
         attn = self.layers[i].self_attn
         k_cache, v_cache = self.kv_cache[i]
+        if self.shared_kv is not None and self.use_shared and not attn.config.sliding_window:
+            return self.shared_kv(
+                self.q,
+                k_cache,
+                v_cache,
+                attn.weights.decode_sinks,
+                attn.config.scaling,
+                attn.program_config.get_compute_kernel_config(),
+            )
         if self.row_attn is not None and (self.use_row_attn or attn.config.sliding_window):
             # short-context row attention (dflash/row_attention.py); the output buffer is reused by every layer (o_proj
             # consumes it before the next layer's attention)
@@ -627,9 +664,9 @@ class FusedVerify:
             program_config=self._sdpa_pc(attn.config.sliding_window),
             compute_kernel_config=attn.program_config.get_compute_kernel_config(),
             # DFLASH_L1_INTER=1: the output in L1 (o_proj reads rows straight from it)
-            memory_config=ttnn.L1_MEMORY_CONFIG
-            if os.environ.get("DFLASH_L1_INTER", "1") == "1"
-            else ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=(
+                ttnn.L1_MEMORY_CONFIG if os.environ.get("DFLASH_L1_INTER", "1") == "1" else ttnn.DRAM_MEMORY_CONFIG
+            ),
         )
 
     def _forward_unfused(self):
@@ -654,7 +691,7 @@ class FusedVerify:
                 d0 = lambda t: ttnn.to_torch(ttnn.get_device_tensors(t)[0]).float()
                 self.debug.append(("sdpa0", d0(self.q), d0(sdpa)))
             self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial)
-            if self.row_attn is None or sdpa is not self.row_attn.out:
+            if not self._persistent(sdpa):
                 sdpa.deallocate(True)
             res2, x = b(res, self.gamma_post[i], partial=self.partial, site="attn")
             res.deallocate(True)

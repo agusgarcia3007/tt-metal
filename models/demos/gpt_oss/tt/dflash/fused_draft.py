@@ -179,6 +179,52 @@ class FusedDraft:
             self.prep_kv = os.environ.get("DFLASH_DRAFT_PREP_KV", "1") == "1"
             self.prep_gamma = [self.prep.gamma(host(L["q_norm"]), host(L["k_norm"])) for L in draft.L]
 
+        # DFLASH_SHARED_KV=1: the draft pass's attention reads each layer's K / V cache once for the M rows
+        # (dflash/shared_kv_attention.py; with a drafter window: the last W .. W + 63 positions) instead of once per row
+        self.shared = None
+        self.use_shared = False  # set per traced variant (FastDFlashRunner: positions past DFLASH_SKV_MIN)
+        if os.environ.get("DFLASH_SHARED_KV", "1") == "1":
+            from .shared_kv_attention import SharedKVAttention
+
+            self.shared = SharedKVAttention(
+                mesh,
+                M,
+                nq,
+                nkv,
+                hd,
+                draft.user_tables[0][None],
+                draft.block_size,
+                None,
+                self.inter_mc,
+                window=draft.window or 0,
+            )
+            self.shared.prepare([c for kv in draft.caches for c in kv], [])
+
+    def shared_ok(self):
+        """Use the shared-KV attention for long contexts: no drafter window, or one of at least
+        DFLASH_DRAFT_SKV_MIN_WINDOW positions (a short window's per-row reads are cheaper than the shared op)."""
+        w = self.d.window
+        return self.shared is not None and (not w or w >= int(os.environ.get("DFLASH_DRAFT_SKV_MIN_WINDOW", "2048")))
+
+    def set_window(self, w):
+        # the shared-KV attention for drafter window w (0: none); call with no traces captured
+        from .shared_kv_attention import SharedKVAttention
+
+        d, old = self.d, self.shared
+        self.shared = SharedKVAttention(
+            self.mesh,
+            self.M,
+            d.nq,
+            d.nkv,
+            d.hd,
+            d.user_tables[0][None],
+            d.block_size,
+            None,
+            self.inter_mc,
+            window=w or 0,
+        )
+        self.shared.views = old.views  # the same caches
+
     def _argmax_gather(self):
         return self._gather
 
@@ -413,6 +459,9 @@ class FusedDraft:
         fab = b.ccl == "fabric"  # else: ttnn all-reduce + boundary as ops of their own
         pending = PendingBoundary(b, emb, self.g_ln1[0], entry=True)
         rot = d.rope.get_rot_mats(d.t_rot) if self.prep is None else []
+        shared = self.shared is not None and self.use_shared
+        if shared:
+            self.shared.begin(d.t_bound, d.page_table)
         for i in range(d.layers):
             L = d.L[i]
             if fab:
@@ -435,21 +484,25 @@ class FusedDraft:
                 d.kv_write(kr, vs, kc, vc, d.t_pos, d.page_table)
             kr.deallocate(True)
             vs.deallocate(True)
-            attn = ttnn.transformer.paged_scaled_dot_product_attention_decode(
-                qr,
-                kc,
-                vc,
-                cur_pos_tensor=d.t_bound,
-                sliding_window_size=d.window,
-                page_table_tensor=d.page_table,
-                scale=d.hd**-0.5,
-                program_config=d.sdpa_pc,
-                compute_kernel_config=d.ck,
-                memory_config=self.inter_mc,
-            )
+            if shared:
+                attn = self.shared(qr, kc, vc, None, d.hd**-0.5, d.ck)
+            else:
+                attn = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+                    qr,
+                    kc,
+                    vc,
+                    cur_pos_tensor=d.t_bound,
+                    sliding_window_size=d.window,
+                    page_table_tensor=d.page_table,
+                    scale=d.hd**-0.5,
+                    program_config=d.sdpa_pc,
+                    compute_kernel_config=d.ck,
+                    memory_config=self.inter_mc,
+                )
             qr.deallocate(True)
             self.o(attn, self.w_o[i], v.partial, send=(b, "attn") if fab else None)
-            attn.deallocate(True)
+            if not shared:
+                attn.deallocate(True)
             pending = PendingBoundary(b, res, self.g_ln2[i], v.partial, "attn", sent=fab)
             if self.mlp_fused is not None:
                 self.mlp_fused(pending, self.union, self.weights, self.w_gu[i], self.act, self.w_down[i], v.partial)

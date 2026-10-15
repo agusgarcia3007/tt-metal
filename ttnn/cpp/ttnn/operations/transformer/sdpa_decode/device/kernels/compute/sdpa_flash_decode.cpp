@@ -177,6 +177,9 @@ void kernel_main() {
                 // smallest bound (mask predicate), entry Tg-1 the largest (KV scan range).
                 const uint32_t spec_pos_base = cur_batch * spec_multi_pos_T;
                 spec_pos_min = read_tile_value(cb_cur_pos, 0, spec_pos_base);
+#ifdef SPEC_ROWS_PER_CAND
+                spec_pos_min -= 32 / SPEC_ROWS_PER_CAND - 1;  // the first packed candidate of row-tile 0
+#endif
                 cur_pos = read_tile_value(cb_cur_pos, 0, spec_pos_base + spec_multi_pos_T - 1);
             } else {
                 cur_pos = read_tile_value(cb_cur_pos, 0, cur_batch / q_heads_parallel_factor);

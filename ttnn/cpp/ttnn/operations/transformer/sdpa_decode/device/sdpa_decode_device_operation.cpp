@@ -562,9 +562,14 @@ void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
 
         const auto& sink_shape = attention_sink.padded_shape();
         TT_FATAL(sink_shape.size() == 2, "Attention sink must have 2 dimensions");
+        // packed spec candidates (spec_rows_per_candidate < 32): one sink row-tile per (batch, Q row-tile)
+        const uint32_t sink_rows = (operation_attributes.spec_multi_pos_tiles > 0 &&
+                                    operation_attributes.spec_rows_per_candidate < tt::constants::TILE_HEIGHT)
+                                       ? q_shape[1] * q_shape[2]
+                                       : q_shape[2];
         TT_FATAL(
-            sink_shape[0] == q_shape[2],
-            "Attention sink must have the same padded num heads as Q but got {}",
+            sink_shape[0] == sink_rows,
+            "Attention sink must have the same padded num heads as Q (x batch with packed spec candidates) but got {}",
             sink_shape[0]);
         TT_FATAL(
             sink_shape[1] == tt::constants::TILE_WIDTH,
@@ -661,7 +666,8 @@ Tensor sdpa_decode(
     std::optional<uint32_t> head_dim_v,
     std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride> paged_cache_geometry,
     std::optional<uint32_t> cache_position_modulo,
-    uint32_t spec_multi_pos_tiles) {
+    uint32_t spec_multi_pos_tiles,
+    uint32_t spec_rows_per_candidate) {
     using OperationType = SdpaDecodeDeviceOperation;
     auto operation_attributes = OperationType::operation_attributes_t{
         .is_causal = is_causal,
@@ -680,6 +686,7 @@ Tensor sdpa_decode(
             paged_cache_geometry.value_or(ttnn::operations::transformer::PagedCacheGeometryOverride{}),
         .cache_position_modulo = cache_position_modulo,
         .spec_multi_pos_tiles = spec_multi_pos_tiles,
+        .spec_rows_per_candidate = spec_rows_per_candidate,
     };
 
     auto tensor_args = OperationType::tensor_args_t{

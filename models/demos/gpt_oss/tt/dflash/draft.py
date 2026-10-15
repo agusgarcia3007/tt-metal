@@ -644,7 +644,7 @@ class DFlashDraft:
             ttnn.ShardOrientation.ROW_MAJOR,
             use_height_and_width_as_shard_shape=True,
         )
-        self.trace_draft = self.trace_ctx = None
+        self.trace_draft = self.trace_ctx = self.trace_draft_x = None
 
     def _host_rows(self, values, dtype, shape=None):
         t = torch.tensor(values, dtype=torch.int32)
@@ -836,6 +836,15 @@ class DFlashDraft:
         self.trace_draft = ttnn.begin_trace_capture(mesh, cq_id=0)
         self._draft_device()
         ttnn.end_trace_capture(mesh, self.trace_draft, cq_id=0)
+        # the draft pass with the shared-KV attention (dflash/shared_kv_attention.py), for long contexts
+        self.trace_draft_x = None
+        f = getattr(self, "fused", None)
+        if f is not None and getattr(f, "shared", None) is not None and f.shared_ok():
+            f.use_shared = True
+            self.trace_draft_x = ttnn.begin_trace_capture(mesh, cq_id=0)
+            self._draft_device()
+            ttnn.end_trace_capture(mesh, self.trace_draft_x, cq_id=0)
+            f.use_shared = False
 
     def add_context_traced(self, features, positions):
         """features None: already in t_ctx (written by the verify pass on device)."""

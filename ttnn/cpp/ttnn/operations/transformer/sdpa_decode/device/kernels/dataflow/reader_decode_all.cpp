@@ -259,7 +259,11 @@ void kernel_main() {
                 attention_sink_reader,
                 CoreLocalMem<uint32_t>(attention_sink_write_ptr),
                 attention_sink_tile_bytes,
+#ifdef SPEC_ROWS_PER_CAND
+                {.page_id = cur_batch * PNHt + tile},  // per-batch sinks (one batch row per kv head)
+#else
                 {.page_id = tile},
+#endif
                 {});
             attention_sink_write_ptr += attention_sink_tile_bytes;
         }

@@ -210,61 +210,83 @@ class FastDFlashRunner:
         """Capture the verify, drafter and context traces (call after one eager generate, which compiles the drafter).
 
         A replayed trace writes to its intermediates' addresses, which are free again once the capture ends: a buffer
-        that is allocated after the capture and still alive at a replay can be overwritten. Every verify variant is
-        therefore compiled before the first capture (the programs' cached buffers and CCL semaphores are allocated by
-        their first run), and prefill re-captures the traces when a prompt compiled new programs (see prefill)."""
+        that is allocated after the capture and still alive at a replay can be overwritten. Every variant is therefore
+        compiled before the first capture (the programs' cached buffers and CCL semaphores are allocated by their
+        first run), and prefill re-captures the traces when a prompt compiled new programs (see prefill)."""
         mesh = self.model.mesh_device
         v = self.verify
-        lengths, rows, hi, variant = self.compile_variants()
+        kinds, rows, hi, variant = self.compile_variants()
         traces = {}
         for r in rows:
-            for long in lengths:
-                variant(long, r)
+            for kind in kinds:
+                variant(kind, r)
                 tid = ttnn.begin_trace_capture(mesh, cq_id=0)
                 v.forward()
                 ttnn.end_trace_capture(mesh, tid, cq_id=0)
-                traces[long, r] = tid
-        variant(False, hi)
-        self.verify_trace = traces[False, hi]
-        self.verify_trace_long = traces.get((True, hi))
-        self.low_traces = {long: traces[long, self.rows_low] for long in lengths} if self.rows_low else {}
+                traces[kind, r] = tid
+        variant("short", hi)
+        self.verify_trace = traces["short", hi]
+        self.verify_trace_long = traces.get(("long", hi))
+        self.verify_trace_x = traces.get(("x", hi))
+        self.low_traces = {kind: traces[kind, self.rows_low] for kind in kinds} if self.rows_low else {}
         self.draft.capture_traces()
 
     def compile_variants(self):
-        """One eager verify pass per traced variant (compiles them; capture_traces calls it, and a caller that captures
-        other traces first calls it before those). Returns (lengths, row counts, full row count, variant setter)."""
+        """One eager pass per traced variant (compiles them; capture_traces calls it, and a caller that captures other
+        traces first calls it before those). Returns (variant kinds, row counts, full row count, variant setter)."""
         v = self.verify
         # DFLASH_VERIFY_ROWS_LOW=r: also traces verifying only the first r rows, used for the round after one that
         # accepted fewer than DFLASH_VERIFY_ADAPT tokens (low acceptance: the capped rows rarely matter)
         self.rows_low = int(os.environ.get("DFLASH_VERIFY_ROWS_LOW", "0"))
         self.adapt = int(os.environ.get("DFLASH_VERIFY_ADAPT", "4"))
-        # long: full-attention layers on ttnn SDPA (row attention holds row_attn_max positions; the sliding-window
-        # layers keep row attention, 128-position window); short: row attention everywhere
-        lengths = ([True] if v.row_attn is not None else []) + [False]
+        # DFLASH_SKV_MIN=n: blocks past position n use the shared-KV attention (dflash/shared_kv_attention.py: one
+        # K / V read for the block's rows) in the verify pass's full-attention layers and in the draft pass
+        self.skv_min = int(os.environ.get("DFLASH_SKV_MIN", "16384"))
+        # short: row attention everywhere; long: full-attention layers on ttnn SDPA, one K / V read per row (row
+        # attention holds row_attn_max positions; the sliding-window layers keep row attention, 128-position window);
+        # x: long with the shared-KV attention
+        kinds = (["long"] if v.row_attn is not None else []) + ["short"]
+        if v.shared_kv is not None:
+            kinds.append("x")
         hi = v.active_rows
         rows = [hi] + ([self.rows_low] if self.rows_low else [])
 
-        def variant(long, r):
-            v.use_row_attn = v.row_attn is not None and not long
+        def variant(kind, r):
+            v.use_row_attn = v.row_attn is not None and kind == "short"
+            v.use_shared = kind == "x"
             v.active_rows = r
 
         for r in rows:  # (the row-attention kernels clamp the chunk count)
-            for long in lengths:
-                variant(long, r)
+            for kind in kinds:
+                variant(kind, r)
                 v.forward()
-        variant(False, hi)
-        return lengths, rows, hi, variant
+        f = getattr(self.draft, "fused", None)
+        if f is not None and getattr(f, "shared", None) is not None and f.shared_ok():  # the shared-KV draft pass
+            f.use_shared = True
+            self.draft._draft_device()
+            f.use_shared = False
+        variant("short", hi)
+        return kinds, rows, hi, variant
+
+    def set_draft_window(self, w):
+        """The drafter's attention window (0: none, the checkpoint's setting); call with no traces captured."""
+        d = self.draft
+        d.window = w or None
+        f = getattr(d, "fused", None)
+        if f is not None and getattr(f, "shared", None) is not None:
+            f.set_window(w)
 
     def release_traces(self):
         mesh = self.model.mesh_device
-        tids = [self.verify_trace, getattr(self, "verify_trace_long", None), *getattr(self, "low_traces", {}).values()]
-        tids += [self.draft.trace_ctx, self.draft.trace_draft]
+        tids = [self.verify_trace, getattr(self, "verify_trace_long", None), getattr(self, "verify_trace_x", None)]
+        tids += [*getattr(self, "low_traces", {}).values()]
+        tids += [self.draft.trace_ctx, self.draft.trace_draft, getattr(self.draft, "trace_draft_x", None)]
         for tid in tids:
             if tid is not None:
                 ttnn.release_trace(mesh, tid)
-        self.verify_trace = self.verify_trace_long = None
+        self.verify_trace = self.verify_trace_long = self.verify_trace_x = None
         self.low_traces = {}
-        self.draft.trace_ctx = self.draft.trace_draft = None
+        self.draft.trace_ctx = self.draft.trace_draft = self.draft.trace_draft_x = None
 
     def warm_prefill(self, max_len=None):
         """Compile the prefill of every padded prompt length up to max_len (default: the KV cache's capacity) and the
@@ -280,12 +302,22 @@ class FastDFlashRunner:
         for n in lengths:
             self._prefill([0] * n)
 
-    def _verify_trace_for(self, start, low=False):
+    def _kind(self, start):
         v = self.verify
-        long = v.row_attn is not None and start + v.M > v.row_attn_max
+        if getattr(self, "verify_trace_x", None) is not None and start + v.M > self.skv_min:
+            return "x"
+        return "long" if v.row_attn is not None and start + v.M > v.row_attn_max else "short"
+
+    def _verify_trace_for(self, start, low=False):
+        kind = self._kind(start)
         if low and self.low_traces:
-            return self.low_traces[long]
-        return self.verify_trace_long if long else self.verify_trace
+            return self.low_traces[kind]
+        return {"x": self.verify_trace_x, "long": self.verify_trace_long, "short": self.verify_trace}[kind]
+
+    def _draft_trace_for(self, start):
+        d = self.draft
+        x = getattr(d, "trace_draft_x", None)
+        return x if x is not None and self._kind(start) == "x" else d.trace_draft
 
     def prefill(self, prompt_ids):
         """The target's prefill + the drafter's prompt context; returns the target's next token. A prompt shape seen
@@ -348,7 +380,7 @@ class FastDFlashRunner:
                 )
                 self.verify.forward()
             else:
-                ttnn.execute_trace(mesh, self.draft.trace_draft, cq_id=0, blocking=False)
+                ttnn.execute_trace(mesh, self._draft_trace_for(start), cq_id=0, blocking=False)
                 ttnn.execute_trace(mesh, self._verify_trace_for(start, low), cq_id=0, blocking=False)
             t1 = time.perf_counter()
             block, post = self.verify.read_result()
