@@ -44,6 +44,9 @@ void kernel_main() {
     // helper noc x, y per chunk), each chunk with its own receive-semaphore increment; slot_addr is then the slot
     // offset in the helpers' receive buffer.
     constexpr uint32_t mc = get_compile_time_arg_val(9);
+    // balance (mc, fwd_hops = bwd_hops + 1): the second half of the chunks takes the long way backward (hop counts
+    // swapped), so both directions of a link carry the same bytes (each destination still gets every chunk once)
+    constexpr uint32_t balance = get_compile_time_arg_val(10);
     constexpr uint32_t chunks = (payload + chunk - 1) / chunk;
     auto hx = [](uint32_t c) -> uint32_t { return get_arg_val<uint32_t>(5 + 2 * c); };
     auto hy = [](uint32_t c) -> uint32_t { return get_arg_val<uint32_t>(6 + 2 * c); };
@@ -71,9 +74,10 @@ void kernel_main() {
         const uint64_t dst = mc ? safe_get_noc_addr(hx(c), hy(c), slot_addr, 0)
                                 : safe_get_noc_addr(recv_noc_x, recv_noc_y, slot_addr + c * chunk, 0);
         const uint64_t sem_noc = mc ? safe_get_noc_addr(hx(c), hy(c), sem_addr, 0) : sem_noc0;
+        const bool swap = balance && 2 * c >= chunks;
         if constexpr (fwd_hops > 0) {
             fwd_hdr[h]->to_chip_multicast(
-                tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(fwd_hops)});
+                tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(swap ? bwd_hops : fwd_hops)});
             if (mc || c == last_chunk) {
                 fwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
                     tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
@@ -83,7 +87,7 @@ void kernel_main() {
         }
         if constexpr (bwd_hops > 0) {
             bwd_hdr[h]->to_chip_multicast(
-                tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(bwd_hops)});
+                tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(swap ? fwd_hops : bwd_hops)});
             if (mc || c == last_chunk) {
                 bwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
                     tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);

@@ -362,7 +362,12 @@ class DecodeBoundary:
             kernel_source=str(KERNEL_DIR / "boundary_sender.cpp"),
             core_ranges=self.cores,
             compile_time_args=[self.payload, self.chunk, self.fwd_hops, self.bwd_hops, producers, sem_id]
-            + [link, links, 1 if link == 0 else 0, 1 if self.mc else 0],
+            + [link, links, 1 if link == 0 else 0, 1 if self.mc else 0]
+            + [
+                1
+                if self.mc and self.fwd_hops == self.bwd_hops + 1 and os.environ.get("DFLASH_BND_BALANCE", "1") == "1"
+                else 0
+            ],
             runtime_args=rt,
             config=ttnn.DataMovementConfigDescriptor(
                 processor=(ttnn.DataMovementProcessor.RISCV_0, ttnn.DataMovementProcessor.RISCV_1)[link],
