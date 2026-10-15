@@ -66,8 +66,11 @@ def test_tf_cpu(mesh_device, device_params):
                 start = L + pos
                 block = [ref[pos]] + [ref_d.mask_token_id] * 7
                 hid = ref_d.forward(feats[:start], emb[block], range(start), range(start, start + 8))
-                if V:  # ids < V plus the special tokens (>= 199998)
+                if V:  # ids < V plus the special tokens (>= 199998) (+ TF_VOCAB_SEEN: every token of the corpus)
                     sub = torch.cat([torch.arange(V), torch.arange(199998, lm.shape[0])])
+                    if os.environ.get("TF_VOCAB_SEEN"):
+                        freq = torch.load(Path(__file__).parents[4] / "generated" / "dflash_vocab_freq.pt")
+                        sub = torch.unique(torch.cat([sub, (freq > 0).nonzero().reshape(-1)]))
                     d = sub[(hid[1:] @ lm[sub].T).argmax(-1)].tolist()
                 else:
                     d = (hid[1:] @ lm.T).argmax(-1).tolist()

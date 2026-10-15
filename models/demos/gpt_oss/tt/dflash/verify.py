@@ -127,6 +127,18 @@ class FusedVerify:
             rows=M,
             expert_outer=os.environ.get("DFLASH_DOWN_EO", "1") == "1",
         )
+        # DFLASH_ROW_ATTN_MAX=n (> 0): row attention (dflash/row_attention.py) for positions < n (32-chunk cores)
+        self.row_attn = None
+        self.use_row_attn = False
+        ra_max = int(os.environ.get("DFLASH_ROW_ATTN_MAX", "1024"))
+        if ra_max:
+            from .row_attention import RowAttention
+
+            self.row_attn = RowAttention(
+                mesh, M, self.nq, self.nkv, self.hd, 64, max_chunks=ra_max // TILE, cores_start=(0, 5)
+            )
+            self.row_attn_max = ra_max
+            self.use_row_attn = True
         self.moe_fused = None
         if os.environ.get("DFLASH_MOE_FUSED", "1") == "1" and self.boundary.ccl == "fabric":
             from .moe_fused import MoEFused
@@ -241,7 +253,13 @@ class FusedVerify:
         r = ttnn.to_torch(ttnn.get_device_tensors(self.result)[0]).reshape(-1).long().tolist()
         return r[: self.M], r[self.M :]
 
+    def _row_attn_for(self, start):
+        # full-attention layers use row attention only while every row's positions fit its max_chunks
+        if self.row_attn is not None:
+            self.use_row_attn = start + self.M <= self.row_attn_max
+
     def set_positions(self, start):
+        self._row_attn_for(start)
         p = ttnn.from_torch(
             torch.arange(start, start + self.M, dtype=torch.int32),
             dtype=ttnn.int32,
@@ -251,6 +269,7 @@ class FusedVerify:
 
     def set_inputs(self, tokens, start):
         """Host -> device: the M block tokens and positions start .. start + M - 1."""
+        self._row_attn_for(start)
         rep = ttnn.ReplicateTensorToMesh(self.mesh)
         t = ttnn.from_torch(
             torch.tensor([tokens], dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=rep
@@ -286,7 +305,8 @@ class FusedVerify:
                 self._capture(i - 1, res)
             sdpa = self._sdpa(i)
             self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial, send=(b, "attn"))
-            sdpa.deallocate(True)
+            if self.row_attn is None or sdpa is not self.row_attn.out:
+                sdpa.deallocate(True)
             pending = PendingBoundary(b, res, self.gamma_post[i], self.partial, "attn", sent=True)
             mlp = layer.mlp
             dw = mlp.experts.decode_weights
@@ -425,9 +445,36 @@ class FusedVerify:
             old.deallocate(True)
         self.features[L] = ttnn.sharded_to_interleaved(res, ttnn.DRAM_MEMORY_CONFIG)
 
+    def _sdpa_pc(self, sliding_window):
+        # DFLASH_SDPA_GRID="x,y" / DFLASH_SDPA_K=n: verify SDPA program config override (short-context tuning)
+        grid, k = os.environ.get("DFLASH_SDPA_GRID"), os.environ.get("DFLASH_SDPA_K")
+        if not grid and not k:
+            return sdpa_decode_program_config(sliding_window)
+        base = sdpa_decode_program_config(sliding_window)
+        gx, gy = (int(v) for v in grid.split(",")) if grid else (8, 8)
+        return ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(gx, gy),
+            q_chunk_size=0,
+            k_chunk_size=int(k) if k else base.k_chunk_size,
+            exp_approx_mode=False,
+        )
+
     def _sdpa(self, i):
         attn = self.layers[i].self_attn
         k_cache, v_cache = self.kv_cache[i]
+        if self.row_attn is not None and (self.use_row_attn or attn.config.sliding_window):
+            # short-context row attention (dflash/row_attention.py); the output buffer is reused by every layer (o_proj
+            # consumes it before the next layer's attention)
+            return self.row_attn(
+                self.q,
+                k_cache,
+                v_cache,
+                self.pos,
+                self.page_table,
+                attn.weights.decode_sinks,
+                attn.config.scaling,
+                window=attn.config.sliding_window or 0,
+            )
         return ttnn.transformer.paged_scaled_dot_product_attention_decode(
             self.q,
             k_cache,
@@ -437,7 +484,7 @@ class FusedVerify:
             attention_sink=attn.weights.decode_sinks,
             page_table_tensor=self.page_table,
             scale=attn.config.scaling,
-            program_config=sdpa_decode_program_config(attn.config.sliding_window),
+            program_config=self._sdpa_pc(attn.config.sliding_window),
             compute_kernel_config=attn.program_config.get_compute_kernel_config(),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
@@ -464,7 +511,8 @@ class FusedVerify:
                 d0 = lambda t: ttnn.to_torch(ttnn.get_device_tensors(t)[0]).float()
                 self.debug.append(("sdpa0", d0(self.q), d0(sdpa)))
             self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial)
-            sdpa.deallocate(True)
+            if self.row_attn is None or sdpa is not self.row_attn.out:
+                sdpa.deallocate(True)
             res2, x = b(res, self.gamma_post[i], partial=self.partial, site="attn")
             res.deallocate(True)
             res = res2

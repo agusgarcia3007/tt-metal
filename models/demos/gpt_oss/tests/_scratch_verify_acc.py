@@ -40,6 +40,18 @@ def test_verify_acc(mesh_device, device_params):
     kv = kv_cache[0] if isinstance(kv_cache[0][0], list) else kv_cache
     ver = FusedVerify(m, page_table, kv)
     refs = torch.load(Path(__file__).parents[4] / "generated" / "dflash_reference.pt")
+    if os.environ.get("ACC_BENCH"):  # the prompts of _scratch_dflash_bench.py
+        from models.demos.gpt_oss.tests._scratch_dflash_bench import PROMPTS
+
+        def enc(text):
+            e = tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}], add_generation_prompt=True, tokenize=True
+            )
+            if isinstance(e, dict) or hasattr(e, "input_ids"):
+                e = e["input_ids"]
+            return [int(t) for t in e]
+
+        refs = [dict(prompt_ids=enc(t)) for _, t in PROMPTS]
     tot = agree = 0
     unions = []
     gaps = []

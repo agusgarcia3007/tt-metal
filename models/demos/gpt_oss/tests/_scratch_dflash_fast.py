@@ -125,7 +125,7 @@ def test_dflash_fast(mesh_device, device_params):
             else:
                 st["set"].append(0.0)
             tm("exec_d", lambda: ttnn.execute_trace(mesh, fast.draft.trace_draft, cq_id=0, blocking=False))
-            tm("exec_v", lambda: ttnn.execute_trace(mesh, fast.verify_trace, cq_id=0, blocking=False))
+            tm("exec_v", lambda: ttnn.execute_trace(mesh, fast._verify_trace_for(start), cq_id=0, blocking=False))
             block, post = tm("read", fast.verify.read_result)
             d = block[1:]
             k = 0

@@ -207,10 +207,27 @@ class FastDFlashRunner:
 
     def capture_traces(self):
         mesh = self.model.mesh_device
+        v = self.verify
+        if v.row_attn is not None:
+            # long-context trace: full-attention layers on ttnn SDPA (row attention holds row_attn_max positions);
+            # the sliding-window layers keep row attention (128-position window)
+            v.use_row_attn = False
+            v.forward()
+            self.verify_trace_long = ttnn.begin_trace_capture(mesh, cq_id=0)
+            v.forward()
+            ttnn.end_trace_capture(mesh, self.verify_trace_long, cq_id=0)
+            v.use_row_attn = True
+            v.forward()  # warm the full-attention layers' row-attention programs (the kernels clamp the chunk count)
         self.verify_trace = ttnn.begin_trace_capture(mesh, cq_id=0)
-        self.verify.forward()
+        v.forward()
         ttnn.end_trace_capture(mesh, self.verify_trace, cq_id=0)
         self.draft.capture_traces()
+
+    def _verify_trace_for(self, start):
+        v = self.verify
+        if v.row_attn is not None and start + v.M > v.row_attn_max:
+            return self.verify_trace_long
+        return self.verify_trace
 
     def prefill(self, prompt_ids):
         L = len(prompt_ids)
@@ -246,10 +263,13 @@ class FastDFlashRunner:
                 self.verify.set_positions(start)
             if self.verify_trace is None:
                 self.draft._draft_device()
+                self.verify.use_row_attn = self.verify.row_attn is not None and start + self.verify.M <= getattr(
+                    self.verify, "row_attn_max", 0
+                )
                 self.verify.forward()
             else:
                 ttnn.execute_trace(mesh, self.draft.trace_draft, cq_id=0, blocking=False)
-                ttnn.execute_trace(mesh, self.verify_trace, cq_id=0, blocking=False)
+                ttnn.execute_trace(mesh, self._verify_trace_for(start), cq_id=0, blocking=False)
             t1 = time.perf_counter()
             block, post = self.verify.read_result()
             d = block[1:]
