@@ -300,9 +300,12 @@ class FusedDraft:
         if self.ctx_prep is not None:
             kr, k_unused, vs = self.ctx_prep(self.Kc, self.Kc, self.Vc, self.ctx_gamma, d.t_crot)
             k_unused.deallocate(True)
-            for l in range(d.layers):
-                kc, vc = d.caches[l]
-                d.kv_write(kr, vs, kc, vc, d.t_cpos, d.page_table, head_offset=l * d.nkv)
+            if os.environ.get("DFLASH_CTX_KV1", "1") == "1":  # every layer's cache write in one program
+                d.kv_write.write_layers(kr, vs, [d.caches[l] for l in range(d.layers)], d.t_cpos, d.page_table)
+            else:
+                for l in range(d.layers):
+                    kc, vc = d.caches[l]
+                    d.kv_write(kr, vs, kc, vc, d.t_cpos, d.page_table, head_offset=l * d.nkv)
             kr.deallocate(True)
             vs.deallocate(True)
             return

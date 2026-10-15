@@ -33,7 +33,17 @@ class DraftKVWrite:
         program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
         ttnn.generic_op([k, v, pos, page_table, k_cache, v_cache], program)
 
-    def parts(self, k, v, k_cache, v_cache, pos, page_table, head_offset=0, core=CORE, cb_id=0, wait=None):
+    def write_layers(self, k, v, caches, pos, page_table):
+        """One program for several layers' caches (the drafter's context pass): layer l's K / V heads are head rows
+        l * kv_heads .. of k / v; caches = [(k_cache, v_cache)] per layer."""
+        kernels, cbs = self.parts(k, v, caches[0][0], caches[0][1], pos, page_table, more_caches=caches[1:])
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        io = [k, v, pos, page_table] + [t for kc_vc in caches for t in kc_vc]
+        ttnn.generic_op(io, program)
+
+    def parts(
+        self, k, v, k_cache, v_cache, pos, page_table, head_offset=0, core=CORE, cb_id=0, wait=None, more_caches=()
+    ):
         """(kernels, cbs) of the write on `core`; wait = (first semaphore id, count): the K / V kernel first waits for
         `count` increments of semaphore id / id + 1 (fused after the producer of k / v, dflash/qk_prep.py)."""
         cores = ttnn.CoreRangeSet([ttnn.CoreRange(core, core)])
@@ -49,7 +59,10 @@ class DraftKVWrite:
             pos.buffer_address(),
             page_table.buffer_address(),
         ] + self.coords
+        rt[core.x][core.y] = list(rt[core.x][core.y]) + [t.buffer_address() for kc_vc in more_caches for t in kc_vc]
         extra = [] if wait is None else [("KV_WAIT_SEM", str(wait[0])), ("KV_WAIT_N", str(wait[1]))]
+        if more_caches:
+            extra.append(("KV_LAYERS", str(1 + len(more_caches))))
         # K on BRISC / NOC0 and V on NCRISC / NOC1 of the same core, in parallel
         kernels = [
             ttnn.KernelDescriptor(
@@ -65,11 +78,12 @@ class DraftKVWrite:
             )
             for sel in (0, 1)
         ]
+        scratch = self.scratch + len(more_caches) * 4 * self.kv_heads * self.head_tiles * 2048
         cb = ttnn.CBDescriptor(
-            total_size=self.scratch,
+            total_size=scratch,
             core_ranges=cores,
             format_descriptors=[
-                ttnn.CBFormatDescriptor(buffer_index=cb_id, data_format=ttnn.bfloat16, page_size=self.scratch)
+                ttnn.CBFormatDescriptor(buffer_index=cb_id, data_format=ttnn.bfloat16, page_size=scratch)
             ],
         )
         return kernels, [cb]

@@ -48,9 +48,7 @@ void kernel_main() {
 
     constexpr uint32_t tile = 2048;
     constexpr uint32_t src_tiles = 2 * rows * head_tiles;          // K then V, row-major (row, t)
-    constexpr uint32_t dst_tiles = 2 * 2 * kv_heads * head_tiles;  // (kv, group, h, t)
-    const auto s_kc = TensorAccessor(kc_args, k_cache, tile);
-    const auto s_vc = TensorAccessor(vc_args, v_cache, tile);
+    // dst: per layer (kv, group, h, t) tiles
     const auto s_pos = TensorAccessor(pos_args, pos_addr, 128);
     const auto s_pt = TensorAccessor(pt_args, pt_addr, pt_row_bytes);
 
@@ -91,21 +89,39 @@ void kernel_main() {
     const uint32_t blk1 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 192)[bi1 & 15];
     const uint32_t tr0 = (p0 % block) / 32, tr1 = (p1 % block) / 32;
     const uint32_t groups = (bi0 != bi1 || tr0 != tr1) ? 2 : 1;
+#ifdef KV_LAYERS
+    // KV_LAYERS = L (the drafter's context pass): the same source rows go to L layers' caches, layer l's K / V heads
+    // being source head rows head_offset + l kv_heads (runtime args 6 + 2 rows + 2 (l - 1): layer l >= 1's caches);
+    // every layer's cache tiles are read at once and written back at once
+    constexpr uint32_t n_layers = KV_LAYERS;
+#else
+    constexpr uint32_t n_layers = 1;
+#endif
     auto cache_tile = [&](uint32_t g, uint32_t h, uint32_t t) -> uint32_t {
         const uint32_t blk = g == 0 ? blk0 : blk1, tr = g == 0 ? tr0 : tr1;
         return ((blk * kv_heads + h) * (block / 32) + tr) * head_tiles + t;
     };
-    auto dst_l1 = [&](uint32_t kv, uint32_t g, uint32_t h, uint32_t t) -> uint32_t {
-        return dst + (((kv * 2 + g) * kv_heads + h) * head_tiles + t) * tile;
+    auto dst_l1 = [&](uint32_t l, uint32_t kv, uint32_t g, uint32_t h, uint32_t t) -> uint32_t {
+        return dst + ((((l * 2 + kv) * 2 + g) * kv_heads + h) * head_tiles + t) * tile;
     };
-    for (uint32_t g = 0; g < groups; ++g) {
-        for (uint32_t h = 0; h < kv_heads; ++h) {
-            for (uint32_t t = 0; t < head_tiles; ++t) {
-                if (kv_lo == 0) {
-                    noc_async_read(s_kc.get_noc_addr(cache_tile(g, h, t)), dst_l1(0, g, h, t), tile);
-                }
-                if (kv_hi == 2) {
-                    noc_async_read(s_vc.get_noc_addr(cache_tile(g, h, t)), dst_l1(1, g, h, t), tile);
+    auto layer_cache = [&](uint32_t l, uint32_t kv) -> uint32_t {
+        if (l == 0) {
+            return kv == 0 ? k_cache : v_cache;
+        }
+        return get_arg_val<uint32_t>(6 + 2 * rows + 2 * (l - 1) + kv);
+    };
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        const auto s_k = TensorAccessor(kc_args, layer_cache(l, 0), tile);
+        const auto s_v = TensorAccessor(vc_args, layer_cache(l, 1), tile);
+        for (uint32_t g = 0; g < groups; ++g) {
+            for (uint32_t h = 0; h < kv_heads; ++h) {
+                for (uint32_t t = 0; t < head_tiles; ++t) {
+                    if (kv_lo == 0) {
+                        noc_async_read(s_k.get_noc_addr(cache_tile(g, h, t)), dst_l1(l, 0, g, h, t), tile);
+                    }
+                    if (kv_hi == 2) {
+                        noc_async_read(s_v.get_noc_addr(cache_tile(g, h, t)), dst_l1(l, 1, g, h, t), tile);
+                    }
                 }
             }
         }
@@ -137,40 +153,48 @@ void kernel_main() {
     noc_async_read_barrier();
     invalidate_l1_cache();
     // Patch: source row h of the user tile -> cache row pos % 32 (16 values in each of the two faces of its half).
-    for (uint32_t r = first; r <= last; ++r) {
-        if (pos[r] < 0) {
-            continue;
-        }
-        const uint32_t p = pos[r];
-        const uint32_t g = (p / block == bi0 && (p % block) / 32 == tr0) ? 0 : 1;
-        const uint32_t rr = p % 32;
-        const uint32_t dst_off = (rr < 16 ? 0 : 1024) + (rr % 16) * 32;
-        for (uint32_t kv = kv_lo; kv < kv_hi; ++kv) {
-            for (uint32_t h = 0; h < kv_heads; ++h) {
-                const uint32_t hs = head_offset + h;
-                const uint32_t src_off = (hs < 16 ? 0 : 1024) + (hs % 16) * 32;
-                for (uint32_t t = 0; t < head_tiles; ++t) {
-                    const uint32_t s = src + ((kv * rows + r) * head_tiles + t) * tile + src_off;
-                    const uint32_t d = dst_l1(kv, g, h, t) + dst_off;
-                    for (uint32_t f = 0; f < 2; ++f) {
-                        volatile tt_l1_ptr uint32_t* sw = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(s + f * 512);
-                        volatile tt_l1_ptr uint32_t* dw = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(d + f * 512);
-                        for (uint32_t w = 0; w < 8; ++w) {
-                            dw[w] = sw[w];
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        for (uint32_t r = first; r <= last; ++r) {
+            if (pos[r] < 0) {
+                continue;
+            }
+            const uint32_t p = pos[r];
+            const uint32_t g = (p / block == bi0 && (p % block) / 32 == tr0) ? 0 : 1;
+            const uint32_t rr = p % 32;
+            const uint32_t dst_off = (rr < 16 ? 0 : 1024) + (rr % 16) * 32;
+            for (uint32_t kv = kv_lo; kv < kv_hi; ++kv) {
+                for (uint32_t h = 0; h < kv_heads; ++h) {
+                    const uint32_t hs = head_offset + l * kv_heads + h;
+                    const uint32_t src_off = (hs < 16 ? 0 : 1024) + (hs % 16) * 32;
+                    for (uint32_t t = 0; t < head_tiles; ++t) {
+                        const uint32_t s_ = src + ((kv * rows + r) * head_tiles + t) * tile + src_off;
+                        const uint32_t d = dst_l1(l, kv, g, h, t) + dst_off;
+                        for (uint32_t f = 0; f < 2; ++f) {
+                            volatile tt_l1_ptr uint32_t* sw =
+                                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(s_ + f * 512);
+                            volatile tt_l1_ptr uint32_t* dw =
+                                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(d + f * 512);
+                            for (uint32_t w = 0; w < 8; ++w) {
+                                dw[w] = sw[w];
+                            }
                         }
                     }
                 }
             }
         }
     }
-    for (uint32_t g = 0; g < groups; ++g) {
-        for (uint32_t h = 0; h < kv_heads; ++h) {
-            for (uint32_t t = 0; t < head_tiles; ++t) {
-                if (kv_lo == 0) {
-                    noc_async_write(dst_l1(0, g, h, t), s_kc.get_noc_addr(cache_tile(g, h, t)), tile);
-                }
-                if (kv_hi == 2) {
-                    noc_async_write(dst_l1(1, g, h, t), s_vc.get_noc_addr(cache_tile(g, h, t)), tile);
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        const auto s_k = TensorAccessor(kc_args, layer_cache(l, 0), tile);
+        const auto s_v = TensorAccessor(vc_args, layer_cache(l, 1), tile);
+        for (uint32_t g = 0; g < groups; ++g) {
+            for (uint32_t h = 0; h < kv_heads; ++h) {
+                for (uint32_t t = 0; t < head_tiles; ++t) {
+                    if (kv_lo == 0) {
+                        noc_async_write(dst_l1(l, 0, g, h, t), s_k.get_noc_addr(cache_tile(g, h, t)), tile);
+                    }
+                    if (kv_hi == 2) {
+                        noc_async_write(dst_l1(l, 1, g, h, t), s_v.get_noc_addr(cache_tile(g, h, t)), tile);
+                    }
                 }
             }
         }
