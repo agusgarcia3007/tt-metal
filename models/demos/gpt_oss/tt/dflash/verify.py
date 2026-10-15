@@ -35,7 +35,6 @@ from ..fused_decode.config import (
     LM_HEAD_DECODE_WEIGHT_DTYPE,
     LM_HEAD_STREAM_PREFETCH,
     OPROJ_DECODE_WEIGHT_DTYPE,
-    OPROJ_STREAM_READERS,
     QKV_DECODE_WEIGHT_DTYPE,
     QKV_STREAM_READERS,
     ROUTER_DECODE_WEIGHT_DTYPE,
@@ -95,7 +94,7 @@ class FusedVerify:
             self.nq * self.hd // TILE,
             H,
             OPROJ_DECODE_WEIGHT_DTYPE,
-            readers=int(os.environ.get("DFLASH_OPROJ_READERS", OPROJ_STREAM_READERS)),
+            readers=int(os.environ.get("DFLASH_OPROJ_READERS", "2")),  # 2: 4.81 vs 4.88 ms (1), 4.84 (3)
             x_pages=self.hd // TILE,
             out_mode=5,
             rows=M,

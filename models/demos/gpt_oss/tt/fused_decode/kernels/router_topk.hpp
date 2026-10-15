@@ -315,35 +315,40 @@ inline void rows_finish(
     volatile tt_l1_ptr uint32_t* wq,
     volatile tt_l1_ptr uint32_t* uni_w,
     volatile tt_l1_ptr uint32_t* wts_w) {
+    constexpr uint32_t n_act = active_rows < rows ? active_rows : rows;
+    uint32_t id[rows * topk];
     uint32_t mask = 0;
-    for (uint32_t i = 0; i < (active_rows < rows ? active_rows : rows) * topk; ++i) {
-        mask |= 1u << ids[i];
+    for (uint32_t i = 0; i < rows * topk; ++i) {
+        id[i] = ids[i];
+        mask |= (i < n_act * topk ? 1u : 0u) << id[i];
     }
     uint32_t slot[32];
     uint32_t u = 0;
     uint16_t list[64];
-    for (uint32_t i = 0; i < 64; ++i) {
-        list[i] = 0;
-    }
+    list[0] = 0;
     for (uint32_t m = mask; m; m &= m - 1) {
-        const uint32_t id = __builtin_ctz(m);
-        slot[id] = u;
-        list[1 + u] = id;
+        const uint32_t e = __builtin_ctz(m);
+        slot[e] = u;
+        list[1 + u] = e;
         ++u;
     }
     list[0] = u;
-    for (uint32_t i = 0; i < 32; ++i) {
+    list[1 + u] = 0;
+    // only the U union entries are read (the union buffer's [U, ids] and each weight row's first U entries)
+    const uint32_t uw = (u + 2) / 2;
+    for (uint32_t i = 0; i < uw; ++i) {
         uni_w[i] = list[2 * i] | (static_cast<uint32_t>(list[2 * i + 1]) << 16);
     }
-    uint16_t wt[32];
+    const uint32_t ww = (u + 1) / 2;
     for (uint32_t r = 0; r < rows; ++r) {
-        for (uint32_t i = 0; i < 32; ++i) {
+        uint16_t wt[34];
+        for (uint32_t i = 0; i < 2 * ww; ++i) {
             wt[i] = 0;
         }
         for (uint32_t j = 0; j < topk && r < active_rows; ++j) {
-            wt[slot[ids[r * topk + j]]] = static_cast<uint16_t>(wq[r * topk + j]);
+            wt[slot[id[r * topk + j]]] = static_cast<uint16_t>(wq[r * topk + j]);
         }
-        for (uint32_t i = 0; i < 16; ++i) {
+        for (uint32_t i = 0; i < ww; ++i) {
             wts_w[16 * r + i] = wt[2 * i] | (static_cast<uint32_t>(wt[2 * i + 1]) << 16);
         }
     }
