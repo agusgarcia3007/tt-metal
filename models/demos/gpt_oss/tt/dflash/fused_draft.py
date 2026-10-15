@@ -156,7 +156,7 @@ class FusedDraft:
         self.k = dram(torch.zeros(1, ROWS, nkv, hd), mc=self.inter_mc)
         self.vv = dram(torch.zeros(1, ROWS, nkv, hd), mc=self.inter_mc)
         S = self.slices
-        self.act = act_buffer(mesh, I_pad // S, M, slots=S, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        self.act = act_buffer(mesh, I_pad // S, M, slots=S, memory_config=self.inter_mc)
         u = torch.zeros(1, 64, dtype=torch.int32)
         u[0, 0] = S  # the dense MLP as S "experts" (column slices), ids 0 .. S - 1
         u[0, 1 : 1 + S] = torch.arange(S)
