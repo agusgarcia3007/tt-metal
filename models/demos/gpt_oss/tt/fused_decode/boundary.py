@@ -167,6 +167,7 @@ class DecodeBoundary:
         grid = mesh_device.compute_with_storage_grid_size()
         all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
         recv_config = flat_memory_config(mesh_device, hidden, self.ring * self.all)
+        # Fabric receive slots (the "ttnn" CCL reduces into its own scratch instead: no slots).
         self.sites = {
             name: (
                 ttnn.empty(
@@ -175,7 +176,9 @@ class DecodeBoundary:
                     layout=ttnn.TILE_LAYOUT,
                     device=mesh_device,
                     memory_config=recv_config,
-                ),
+                )
+                if ccl == "fabric"
+                else None,
                 ttnn.create_global_semaphore(mesh_device, all_cores, 0),
             )
             for name in sites
@@ -348,7 +351,8 @@ class DecodeBoundary:
         recv, sem = self.sites[site] if ccl else (reduced, None)
         sem_addr = ttnn.get_global_semaphore_address(sem) if ccl else 0
         slots = self.ring if ccl else (1 if reduced is not None else 0)
-        expected = (self.ring - 1) * self.chunks + 1 if ccl else 0
+        # one increment per sender (link) per source device (kernels/boundary_sender.cpp) + the local copy's
+        expected = (self.ring - 1) * min(self.links, self.chunks) + 1 if ccl else 0
         # CB indices clear of the streamed-matmul ops' (0-4, 16), which share programs with this part (consumer_parts).
         cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, cb_y = 8, 9, 10, 11, 24, 25, 26, 27, 28
         cb_p, cb_rsum = 29, 30  # multi-row RMSNorm: row-sum matrix, per-row sums
@@ -422,7 +426,11 @@ class DecodeBoundary:
         for coord in self.coords:
             program = ttnn.ProgramDescriptor(kernels=kernels(coord), semaphores=[], cbs=cbs)
             if send:
-                self._add_sender(coord, program, self._sender_kernel(coord, partial, site))
+                links = min(self.links, self.chunks)
+                for link in range(links):
+                    self._add_sender(
+                        coord, program, self._sender_kernel(coord, partial, site, link=link, links=links), link
+                    )
             mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
         ttnn.generic_op(io, mesh_program)
         if reduced is not None:

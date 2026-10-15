@@ -56,20 +56,32 @@ void kernel_main() {
     volatile PACKET_HEADER_TYPE* fwd_hdr[ring_hdrs];
     volatile PACKET_HEADER_TYPE* bwd_hdr[ring_hdrs];
     const uint64_t sem_noc = safe_get_noc_addr(recv_noc_x, recv_noc_y, sem_addr, 0);
+    // Plain writes; only this sender's last chunk carries the receive-semaphore increment (packets of one route
+    // arrive in order), so a receiver counts one increment per sender and source device (as ttnn's all-reduce does:
+    // a fused atomic per packet costs more than the write).
+    constexpr uint32_t last_chunk = first_chunk + (my_chunks - 1) * chunk_step;
     auto prepare = [&](uint32_t c, uint32_t h) {
         const uint32_t bytes = c + 1 < chunks ? chunk : payload - c * chunk;
         const uint64_t dst = safe_get_noc_addr(recv_noc_x, recv_noc_y, slot_addr + c * chunk, 0);
         if constexpr (fwd_hops > 0) {
             fwd_hdr[h]->to_chip_multicast(
                 tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(fwd_hops)});
-            fwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
-                tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
+            if (c == last_chunk) {
+                fwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
+                    tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
+            } else {
+                fwd_hdr[h]->to_noc_unicast_write(tt::tt_fabric::NocUnicastCommandHeader{dst}, bytes);
+            }
         }
         if constexpr (bwd_hops > 0) {
             bwd_hdr[h]->to_chip_multicast(
                 tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(bwd_hops)});
-            bwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
-                tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
+            if (c == last_chunk) {
+                bwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
+                    tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
+            } else {
+                bwd_hdr[h]->to_noc_unicast_write(tt::tt_fabric::NocUnicastCommandHeader{dst}, bytes);
+            }
         }
     };
     for (uint32_t h = 0; h < ring_hdrs; ++h) {

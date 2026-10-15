@@ -64,7 +64,13 @@ class FusedVerify:
         self.nq, self.nkv, self.hd = attn0.num_heads // tp, attn0.num_kv_heads // tp, attn0.head_dim
         q_cols, k_cols = self.nq * self.hd // TILE, self.nkv * self.hd // TILE
         self.boundary = DecodeBoundary(
-            mesh, H, cfg.rms_norm_eps, cluster_axis=1, rows=M, links=int(os.environ.get("DFLASH_BOUNDARY_LINKS", "1"))
+            mesh,
+            H,
+            cfg.rms_norm_eps,
+            cluster_axis=1,
+            rows=M,
+            links=int(os.environ.get("DFLASH_BOUNDARY_LINKS", "1")),
+            ccl=os.environ.get("DFLASH_CCL", "fabric"),
         )
         b = self.boundary
         self.gamma_in = [b.flat_gamma(L.input_layernorm) for L in self.layers]
@@ -188,7 +194,7 @@ class FusedVerify:
         self.rot = rope_rotation_tiles(mesh)
         self.cos_table, self.sin_table = model.rope_setup.cos_matrix, model.rope_setup.sin_matrix
         self.features = {}
-        self.fused = True
+        self.fused = self.boundary.ccl == "fabric"  # producer-sent / consumer-fused boundaries need the fabric CCL
         self.debug = None  # list: (tag, host [M, hidden]) after every boundary (debugging)
 
     def enable_device_argmax(self):
@@ -378,6 +384,8 @@ class FusedVerify:
                 self._capture(i, res)
         res.deallocate(True)
         self.lm_head(x, self.lm_weights, self.lists)
+        if getattr(self, "argmax_gather", None) is not None:
+            self.argmax_gather(self.lists, self.tokens, self.result)
         x.deallocate(True)
 
     def _dbg(self, tag, res, x):

@@ -169,11 +169,16 @@ class FusedDraft:
         )
         toks.deallocate(True)
         emb = ttnn.reshape(emb, (1, 1, M, d.hidden))
+        fab = b.ccl == "fabric"  # else: ttnn all-reduce + boundary as ops of their own
         pending = PendingBoundary(b, emb, self.g_ln1[0], entry=True)
         rot = d.rope.get_rot_mats(d.t_rot)
         for i in range(d.layers):
             L = d.L[i]
-            self.qkv(pending, self.w_qkv[i], (self.q, self.k, self.vv))
+            if fab:
+                self.qkv(pending, self.w_qkv[i], (self.q, self.k, self.vv))
+            else:
+                pending.run()
+                self.qkv(pending.x, self.w_qkv[i], (self.q, self.k, self.vv))
             res = pending.residual_out
             pending.x.deallocate(True)
             pending.residual.deallocate(True)
@@ -196,17 +201,19 @@ class FusedDraft:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
             qr.deallocate(True)
-            self.o(attn, self.w_o[i], v.partial, send=(b, "attn"))
+            self.o(attn, self.w_o[i], v.partial, send=(b, "attn") if fab else None)
             attn.deallocate(True)
-            pending = PendingBoundary(b, res, self.g_ln2[i], v.partial, "attn", sent=True)
+            pending = PendingBoundary(b, res, self.g_ln2[i], v.partial, "attn", sent=fab)
             res, x = pending.run()
             pending.residual.deallocate(True)
             self.gu(x, self.union, self.weights, self.w_gu[i], self.act)
             x.deallocate(True)
-            self.down(self.act, self.union, self.weights, self.w_down[i], v.partial, send=(b, "moe"))
+            self.down(self.act, self.union, self.weights, self.w_down[i], v.partial, send=(b, "moe") if fab else None)
             gamma = self.g_ln1[i + 1] if i + 1 < d.layers else self.g_final
-            pending = PendingBoundary(b, res, gamma, v.partial, "moe", sent=True)
-        v.lm_head(pending, v.lm_weights, d.lists)
+            pending = PendingBoundary(b, res, gamma, v.partial, "moe", sent=fab)
+        if not fab:
+            pending.run()
+        v.lm_head(pending if fab else pending.x, v.lm_weights, d.lists)
         pending.x.deallocate(True)
         pending.residual.deallocate(True)
         pending.residual_out.deallocate(True)
