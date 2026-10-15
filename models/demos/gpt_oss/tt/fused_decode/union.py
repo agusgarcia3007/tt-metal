@@ -13,6 +13,8 @@ down columns of the same experts and sums over them (K = U segments [w-scaled ac
 the row-tile partial sum the boundary all-reduces. Every union expert's weights are read once for the M rows.
 """
 
+import os
+
 import torch
 
 import ttnn
@@ -54,10 +56,17 @@ def union_buffers(mesh_device, rows):
     return uni, w
 
 
-def act_buffer(mesh_device, inter_pad, rows, slots=MAX_EXPERTS, memory_config=ttnn.L1_MEMORY_CONFIG):
-    """[slots, I_pad / 32 [rows, 32] tiles] BF16 activation buffer (one row-major page per slot), L1 interleaved."""
+# DFLASH_ACT_SPREAD=1: one page per [rows, 32] activation tile (a slot's tiles spread over the interleaved banks)
+ACT_SPREAD = os.environ.get("DFLASH_ACT_SPREAD", "1") == "1"
+
+
+def act_buffer(mesh_device, inter_pad, rows, slots=MAX_EXPERTS, memory_config=ttnn.L1_MEMORY_CONFIG, spread=None):
+    """[slots, I_pad / 32 [rows, 32] tiles] BF16 activation buffer, L1 interleaved: one row-major page per slot, or
+    (spread, ACT_SPREAD) one page per tile (slot s, tile t = page s I_pad / 32 + t): every down core reads every tile
+    of a slot, and a slot in one page puts all those reads on one core."""
+    spread = ACT_SPREAD if spread is None else spread
     return ttnn.from_torch(
-        torch.zeros(slots, inter_pad * rows),
+        torch.zeros(slots * inter_pad // TILE, TILE * rows) if spread else torch.zeros(slots, inter_pad * rows),
         dtype=ttnn.bfloat16,
         layout=ttnn.ROW_MAJOR_LAYOUT,
         device=mesh_device,
@@ -104,11 +113,12 @@ class ExpertGateUpUnion(_BankStreamOp):
         weight_dtype=ttnn.bfloat4_b,
         exclude=(),
         real_inter=None,
+        coord=None,
     ):
         """dense_silu: plain silu(g) * u (a dense MLP run as one union expert, e.g. the DFlash drafter).
         real_inter: the unpadded intermediate size; cores whose column pairs are all padding are dropped (their act
-        tiles stay zero, as do the matching down weights)."""
-        super().__init__(mesh_device, readers, exclude=exclude)
+        tiles stay zero, as do the matching down weights). coord: per-device placement (_BankStreamOp)."""
+        super().__init__(mesh_device, readers, exclude=exclude, coord=coord)
         self.dense_silu = dense_silu
         self.max_experts = max_experts
         self.rows = rows
@@ -124,6 +134,9 @@ class ExpertGateUpUnion(_BankStreamOp):
         self.col_bytes = self.kt * self.tile_bytes
         self.expert_stride = 2 * self.P * self.col_bytes
         self.page_bytes = _page_bytes(self.kt, self.tile_bytes)
+        # DFLASH_G_BUFS / DFLASH_G_INFLIGHT: the weight ring's columns and the columns in flight beyond the one consumed
+        self.g_bufs = int(os.environ.get("DFLASH_G_BUFS", "3"))
+        self.g_inflight = int(os.environ.get("DFLASH_G_INFLIGHT", "1"))
         if real_inter is not None:
             keep = [a for a in self.assignments if (a[1] * self.P + a[2] * self.pairs) * TILE < real_inter]
             if len(keep) < len(self.assignments):
@@ -156,7 +169,7 @@ class ExpertGateUpUnion(_BankStreamOp):
         tiny = TINY_BYTES * M
         cbs = [
             self._cb(cb_x, ttnn.bfloat16, tiny, self.kt, tiny=True, rows=M),
-            self._cb(cb_w, self.weight_dtype, self.tile_bytes, 3 * self.kt),
+            self._cb(cb_w, self.weight_dtype, self.tile_bytes, self.g_bufs * self.kt),
             self._cb(cb_idx, ttnn.uint16, 256, 1),
             self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 32, 1),
             self._cb(cb_sc, ttnn.bfloat16, tiny, self.max_experts, tiny=True, rows=M),
@@ -202,6 +215,12 @@ class ExpertGateUpUnion(_BankStreamOp):
             compute_ct,
             "gate_up_union",
             defines=[("ROWS", str(M))]
+            + ([("ACT_SPREAD", "1")] if act.shape[-1] == TILE * M else [])
+            + (
+                [("G_BUFS", str(self.g_bufs)), ("G_INFLIGHT", str(self.g_inflight))]
+                if (self.g_bufs, self.g_inflight) != (3, 1)
+                else []
+            )
             + ([("DENSE_SILU", "1")] if self.dense_silu else [])
             + ([("X_LOCAL", "1")] if x_local_addr is not None else [])
             + list(extra_defines or []),
@@ -228,11 +247,12 @@ class ExpertDownUnion(_BankStreamOp):
         weight_dtype=ttnn.bfloat4_b,
         num_buffers=3,
         exclude=(),
+        coord=None,
     ):
         """num_buffers: weight blocks in the reader's ring (expert-outer; 2 when the blocks are large).
         expert_outer: kernels/stream_down_union2_*: each core reads its columns of one expert as one contiguous
         block and accumulates its (<= 4) output tiles across the experts in DST (larger DRAM reads)."""
-        super().__init__(mesh_device, readers, exclude=exclude)
+        super().__init__(mesh_device, readers, exclude=exclude, coord=coord)
         self.rows = rows
         self.hidden = hidden
         self.inter_pad = inter_pad
@@ -250,7 +270,9 @@ class ExpertDownUnion(_BankStreamOp):
         self.chunk = chunk
         self.max_experts = max_experts
         self.expert_outer = expert_outer
-        self.num_buffers = num_buffers
+        # DFLASH_D_BUFS / DFLASH_D_INFLIGHT (expert-outer): the weight ring's blocks / blocks in flight beyond one
+        self.num_buffers = int(os.environ.get("DFLASH_D_BUFS", num_buffers)) if expert_outer else num_buffers
+        self.d_inflight = int(os.environ.get("DFLASH_D_INFLIGHT", "1"))
         assert not expert_outer or self.cols <= 4, "expert-outer down keeps a core's output tiles in DST"
 
     def weight_rows(self, num_experts):
@@ -275,6 +297,8 @@ class ExpertDownUnion(_BankStreamOp):
         notify_args (build_only): the writers' sender notification [1, x, y, semaphore id] (a fused program's sender).
         """
         M = self.rows
+        spread = act.shape[-1] == TILE * M  # act_buffer(spread=True)
+        assert self.expert_outer or not spread, "the spread activation layout is read by the expert-outer kernels"
         cb_in0, cb_w, cb_idx, cb_scr, cb_out = 0, 1, 2, 3, 16
         fused = any(d[0] == "MOE_FUSED" for d in (extra_defines or []))
         in0_slots = min(4, self.max_experts) if fused and self.expert_outer else self.max_experts
@@ -332,7 +356,9 @@ class ExpertDownUnion(_BankStreamOp):
                 writer_rt,
                 compute_ct,
                 name,
-                defines=list(extra_defines or []),
+                defines=list(extra_defines or [])
+                + ([("ACT_SPREAD", "1")] if spread else [])
+                + ([("D_INFLIGHT", str(self.d_inflight))] if self.expert_outer and self.d_inflight != 1 else []),
             )
 
         if build_only:

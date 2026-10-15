@@ -86,7 +86,11 @@ void kernel_main() {
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, noc_index);
     noc_async_read_one_packet_set_state<true>(w_base, page_bytes, vc);
 
+#ifdef D_INFLIGHT
+    constexpr uint32_t extra_in_flight = D_INFLIGHT;  // union.py DFLASH_D_INFLIGHT
+#else
     constexpr uint32_t extra_in_flight = 1;
+#endif
     cb_reserve_back(cb_w, block_tiles * (extra_in_flight + 1));
     uint32_t l1_write = get_write_ptr(cb_w);
     const uint32_t cb_base = cb_start;

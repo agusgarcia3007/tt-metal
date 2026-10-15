@@ -62,21 +62,40 @@ class MoEFused:
         rc = router.assignments[0][0]
         taken = [(rc.x, rc.y), (boundary.core.x, boundary.core.y)]
         taken += [(h.x, h.y) for h in getattr(boundary, "helpers", [])] if getattr(boundary, "mc", False) else []
-        self.gate_up = ExpertGateUpUnion(
-            mesh_device,
-            hidden,
-            inter_pad,
-            swiglu_limit,
-            alpha,
-            readers=gate_up_readers,
-            rows=rows,
-            exclude=taken,
-            real_inter=real_inter,
-        )
-        taken += [(c.x, c.y) for c, *_ in self.gate_up.assignments]
-        self.down = ExpertDownUnion(
-            mesh_device, hidden, inter_pad, readers=down_readers, rows=rows, expert_outer=True, exclude=taken
-        )
+        # DFLASH_MOE_PER_DEVICE=1: gate|up / down placed per device next to that chip's own DRAM-bank workers (the
+        # harvested columns differ per chip, so the first device's placement is up to two columns off on the others)
+        per_device = os.environ.get("DFLASH_MOE_PER_DEVICE", "0") == "1"
+        self.coords = list(boundary.coords)
+        self.parts = {}
+        for coord in self.coords if per_device else [None]:
+            gu = ExpertGateUpUnion(
+                mesh_device,
+                hidden,
+                inter_pad,
+                swiglu_limit,
+                alpha,
+                readers=gate_up_readers,
+                rows=rows,
+                exclude=taken,
+                real_inter=real_inter,
+                coord=coord,
+            )
+            dn = ExpertDownUnion(
+                mesh_device,
+                hidden,
+                inter_pad,
+                readers=down_readers,
+                rows=rows,
+                expert_outer=True,
+                exclude=taken + [(c.x, c.y) for c, *_ in gu.assignments],
+                coord=coord,
+            )
+            self.parts[None if coord is None else (coord[0], coord[1])] = (gu, dn)
+        self.gate_up, self.down = next(iter(self.parts.values()))
+        # every device's G / D cores (the router's union notification and the semaphores cover all of them)
+        self.G_all, self.D_all = self.gate_up.cores, self.down.cores
+        for gu, dn in self.parts.values():
+            self.G_all, self.D_all = self.G_all.merge(gu.cores), self.D_all.merge(dn.cores)
         self.R = router.cores
         # the router's per-row top-k split over BRISC and NCRISC (kernels/stream_linear_{writer,reader}.cpp)
         self.split_defines = (
@@ -119,6 +138,9 @@ class MoEFused:
             flush=True,
         )
 
+    def _part(self, coord):
+        return self.parts.get((coord[0], coord[1])) or self.parts[None]
+
     def __call__(self, pending, router_ws, union, weights, gate_up_ws, act, down_ws, partial, layer=0, active_rows=0):
         """pending: the attn-site PendingBoundary (its partial sent by o_proj); runs the boundary, router, gate|up and
         down and sends the down partial to the moe site. Sets pending.residual_out / pending.x. active_rows: only rows
@@ -127,7 +149,7 @@ class MoEFused:
         b, mesh = self.boundary, self.mesh
         ctr = self.counters.buffer_address()
         rx, ry = self.router_noc.x, self.router_noc.y
-        gd = _noc(mesh, self.G) + _noc(mesh, self.D)
+        gd = _noc(mesh, self.G_all) + _noc(mesh, self.D_all)
         router_rt = [ctr, len(gd)] + [v for p in gd for v in (p.x, p.y)]
         P = self.pred_p
         pred_addr = self.pred.buffer_address() + 16 * layer
@@ -139,57 +161,58 @@ class MoEFused:
             router_ws,
             (union, weights),
             build_only=True,
-            consumer_cores=self.R.merge(self.G),
+            consumer_cores=self.R.merge(self.G_all),
             extra_defines=MOE_ + self.split_defines + pdef,
             extra_writer_rt=router_rt,
         )
         x = pending.x
         n_g = self.G.num_cores()
-        gprog, gio = self.gate_up(
-            x,
-            union,
-            weights,
-            gate_up_ws,
-            act,
-            build_only=True,
-            extra_defines=MOE_ + pdef + _wait_n(b),
-            extra_writer_rt=[ctr, rx, ry] + ([pred_addr] if P else []),
-            extra_reader_rt=[rx, ry, pred_addr] if P else None,
-            pred_p=P,
-            x_local_addr=b.x_mirror.buffer_address() if getattr(b, "x_mirror", None) is not None else None,
-        )
-        dprog, dio = self.down(
-            act,
-            union,
-            weights,
-            down_ws,
-            partial,
-            build_only=True,
-            extra_defines=MOE_ + pdef,
-            extra_writer_rt=[ctr, rx, ry, n_g] + ([pred_addr] if P else []),
-            notify_args=[1, b.noc_xy[0], b.noc_xy[1], 2],
-            extra_reader_rt=[rx, ry, pred_addr] if P else None,
-            pred_p=P,
-        )
         # semaphore 0: x ready (R, G, B) (+ the multi-core boundary's 5 / 6)
         assert {sd.id for sd in rprog.semaphores} <= {0, 5, 6}
         sems = list(rprog.semaphores) + [
-            ttnn.SemaphoreDescriptor(1, ttnn.CoreType.WORKER, self.G.merge(self.D), 0),
-            ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, self.D.merge(b.cores), 0),
+            ttnn.SemaphoreDescriptor(1, ttnn.CoreType.WORKER, self.G_all.merge(self.D_all), 0),
+            ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, self.D_all.merge(b.cores), 0),
         ]
         if self.split_defines:
             sems.append(ttnn.SemaphoreDescriptor(3, ttnn.CoreType.WORKER, self.R, 0))
         if P:
             sems.append(ttnn.SemaphoreDescriptor(4, ttnn.CoreType.WORKER, self.R, 0))
         mesh_program = ttnn.MeshProgramDescriptor()
-        n_d = self.D.num_cores()
         for coord in b.coords:
+            gu, dn = self._part(coord)
+            assert gu.cores.num_cores() == n_g
+            gprog, gio = gu(
+                x,
+                union,
+                weights,
+                gate_up_ws,
+                act,
+                build_only=True,
+                extra_defines=MOE_ + pdef + _wait_n(b),
+                extra_writer_rt=[ctr, rx, ry] + ([pred_addr] if P else []),
+                extra_reader_rt=[rx, ry, pred_addr] if P else None,
+                pred_p=P,
+                x_local_addr=b.x_mirror.buffer_address() if getattr(b, "x_mirror", None) is not None else None,
+            )
+            dprog, dio = dn(
+                act,
+                union,
+                weights,
+                down_ws,
+                partial,
+                build_only=True,
+                extra_defines=MOE_ + pdef,
+                extra_writer_rt=[ctr, rx, ry, n_g] + ([pred_addr] if P else []),
+                notify_args=[1, b.noc_xy[0], b.noc_xy[1], 2],
+                extra_reader_rt=[rx, ry, pred_addr] if P else None,
+                pred_p=P,
+            )
             program = ttnn.ProgramDescriptor(
                 kernels=list(rprog.kernels) + list(gprog.kernels) + list(dprog.kernels),
                 semaphores=list(sems),
                 cbs=list(rprog.cbs) + list(gprog.cbs) + list(dprog.cbs),
             )
-            sender = b._sender_kernel(coord, partial, "moe", producers=n_d, sem_id=2)
+            sender = b._sender_kernel(coord, partial, "moe", producers=dn.cores.num_cores(), sem_id=2)
             b._add_sender(coord, program, sender)
             mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
         io = []

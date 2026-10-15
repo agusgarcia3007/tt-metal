@@ -94,9 +94,14 @@ void kernel_main() {
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, noc_index);
     noc_async_read_one_packet_set_state<true>(w_base, pkt, vc);
 
-    // Triple-buffered columns, one extra column in flight (transaction ids 1..3).
+    // Triple-buffered columns, one extra column in flight (transaction ids 1..3; G_BUFS / G_INFLIGHT: deeper).
+#ifdef G_BUFS
+    constexpr uint32_t num_buffers = G_BUFS;  // ring columns (union.py DFLASH_G_BUFS)
+    constexpr uint32_t extra_in_flight = G_INFLIGHT;
+#else
     constexpr uint32_t num_buffers = 3;
     constexpr uint32_t extra_in_flight = 1;
+#endif
     cb_reserve_back(cb_w, kt * (extra_in_flight + 1));
     uint32_t l1_write = get_write_ptr(cb_w);
     const uint32_t cb_base = cb_start;

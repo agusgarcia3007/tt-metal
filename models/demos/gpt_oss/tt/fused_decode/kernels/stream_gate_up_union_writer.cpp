@@ -58,7 +58,13 @@ void kernel_main() {
     constexpr uint32_t row_face = 32 * rows;
 
     const auto s_x = TensorAccessor(x_args, x_addr, 2048);
+#ifdef ACT_SPREAD
+    // one page per [rows, 32] tile: slot s, tile t = page s * slot_tiles + t (union.py act_buffer spread)
+    constexpr uint32_t slot_tiles = act_page_bytes / tiny_bytes;
+    const auto s_act = TensorAccessor(act_args, act_addr, tiny_bytes);
+#else
     const auto s_act = TensorAccessor(act_args, act_addr, act_page_bytes);
+#endif
     const auto s_w = TensorAccessor(w_args, w_addr, 64 * rows);
     const auto s_uni = TensorAccessor(uni_args, uni_addr, 128);
     const auto s_id = TensorAccessor(id_args, ident_addr, ident_bytes);
@@ -177,7 +183,11 @@ void kernel_main() {
             }
 #endif
             const uint32_t src = get_read_ptr(cb_act);
+#ifdef ACT_SPREAD
+            noc_async_write(src, s_act.get_noc_addr(order[e] * slot_tiles + act_tile0 + p), tiny_bytes);
+#else
             noc_async_write(src, s_act.get_noc_addr(order[e], (act_tile0 + p) * tiny_bytes), tiny_bytes);
+#endif
             noc_async_writes_flushed();
             cb_pop_front(cb_act, 1);
         }

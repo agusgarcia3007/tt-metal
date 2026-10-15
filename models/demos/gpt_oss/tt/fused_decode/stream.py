@@ -189,13 +189,18 @@ class _BankStreamOp:
     coalesced into rectangles: dispatch writes kernel binaries and arguments per core range, and single-core ranges
     made multi-reader programs measurably slower to launch under trace."""
 
-    def __init__(self, mesh_device, readers, active_banks=None, exclude=()):
+    def __init__(self, mesh_device, readers, active_banks=None, exclude=(), coord=None):
         """exclude: logical (x, y) cores to leave free (a fused program's other kernels); a bank's readers then also
-        spill onto the neighbouring rows when its own row is full."""
+        spill onto the neighbouring rows when its own row is full. coord: place for that device's own optimal bank
+        workers (harvesting differs per chip) instead of the first device's."""
         self.mesh_device = mesh_device
         self.banks = mesh_device.dram_grid_size().x
         self.readers = readers
-        bank_workers = mesh_device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0)
+        if coord is not None:
+            a = mesh_device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0, coord)
+            bank_workers = [a[b] for b in sorted(a)]
+        else:
+            bank_workers = mesh_device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0)
         shift = int(os.environ.get("DFLASH_BANK_X_SHIFT", "0")) if exclude else 0  # experiment: fused MoE only
         if shift:
             bank_workers = [ttnn.CoreCoord(c.x + shift, c.y) if c.x > 3 else c for c in bank_workers]

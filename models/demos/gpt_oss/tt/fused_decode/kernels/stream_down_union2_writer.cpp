@@ -51,7 +51,13 @@ void kernel_main() {
 
     constexpr uint32_t tiny_bytes = 64 * rows;
 
+#ifdef ACT_SPREAD
+    // one page per [rows, 32] tile: slot s, tile t = page s * slot_tiles + t (union.py act_buffer spread)
+    constexpr uint32_t slot_tiles = act_page_bytes / tiny_bytes;
+    const auto s_act = TensorAccessor(act_args, act_addr, tiny_bytes);
+#else
     const auto s_act = TensorAccessor(act_args, act_addr, act_page_bytes);
+#endif
     const auto s_w = TensorAccessor(w_args, w_addr, 64 * rows);
     const auto s_out = TensorAccessor(out_args, out_addr, 2048);
     const auto s_uni = TensorAccessor(uni_args, uni_addr, 128);
@@ -110,6 +116,16 @@ void kernel_main() {
 #endif
     for (uint32_t e = 0; e < num_sel; ++e) {
 #ifdef MOE_FUSED
+        // the slot's bias-multiplier tile first (it needs only the weights), then wait for the activation
+        cb_reserve_back(cb_in0, seg_tiles);
+        const uint32_t slot = get_write_ptr(cb_in0);
+        {
+            volatile tt_l1_ptr uint16_t* aug =
+                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(slot + (seg_tiles - 1) * tiny_bytes);
+            for (uint32_t i = 0; i < 32 * rows; ++i) {
+                aug[i] = (i < 16 * rows && i % 16 < nbias) ? w[(i / 16) * 32 + order[e]] : 0;
+            }
+        }
         // Slot e is complete once all gate|up cores counted it; push each slot as it arrives (compute waits per slot).
         volatile tt_l1_ptr uint32_t* poll = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128 + 64 * rows);
         do {
@@ -123,17 +139,21 @@ void kernel_main() {
             invalidate_l1_cache();
         } while (poll[0] < producers);
         DeviceTimestampedData("MOE_T", 310 + e);
-        cb_reserve_back(cb_in0, seg_tiles);
-        const uint32_t slot = get_write_ptr(cb_in0);
 #else
         const uint32_t slot = in0 + e * seg_tiles * tiny_bytes;
-#endif
-        noc_async_read(s_act.get_noc_addr(order[e]), slot, act_page_bytes);
         volatile tt_l1_ptr uint16_t* aug =
             reinterpret_cast<volatile tt_l1_ptr uint16_t*>(slot + (seg_tiles - 1) * tiny_bytes);
         for (uint32_t i = 0; i < 32 * rows; ++i) {
             aug[i] = (i < 16 * rows && i % 16 < nbias) ? w[(i / 16) * 32 + order[e]] : 0;
         }
+#endif
+#ifdef ACT_SPREAD
+        for (uint32_t t = 0; t < slot_tiles; ++t) {
+            noc_async_read(s_act.get_noc_addr(order[e] * slot_tiles + t), slot + t * tiny_bytes, tiny_bytes);
+        }
+#else
+        noc_async_read(s_act.get_noc_addr(order[e]), slot, act_page_bytes);
+#endif
 #ifdef MOE_FUSED
         noc_async_read_barrier();
         cb_push_back(cb_in0, seg_tiles);
