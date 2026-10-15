@@ -39,6 +39,8 @@ class LMRescore:
         )
 
     def __call__(self, lists1, x, w8, lists2):
+        if os.environ.get("DFLASH_RS_DEDUP", "1") == "1":
+            return self._dedup(lists1, x, w8, lists2)
         cb_x, cb_w, cb_scr, cb_meta, cb_out = 0, 1, 3, 4, 16
         tiny = ttnn.TileDescriptor(ttnn.Tile([1, TILE]))
 
@@ -102,5 +104,70 @@ class LMRescore:
         ]
         assert l1_bytes == lists1.shape[0] * lists1.shape[-1] * 4, (l1_bytes, lists1.shape)
         sems = [ttnn.SemaphoreDescriptor(0, ttnn.CoreType.WORKER, self.cores, 0)] if self.mcast else []
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
+        ttnn.generic_op([lists1, x, w8, lists2], program)
+
+    def _dedup(self, lists1, x, w8, lists2):
+        """Stage 2 with column-tile de-duplication (kernels/lm_rescore2_*.cpp): the row cores merge the lists into a
+        hub table that is multicast to all; each candidate's column tile is read and multiplied (all rows of x) by
+        the first entry that has it, which writes every entry of that tile."""
+        M, K = self.M, self.K
+        cb_x, cb_w, cb_tab, cb_scr, cb_out = 0, 1, 2, 3, 16
+        rows_tile = ttnn.TileDescriptor(ttnn.Tile([M, TILE]))
+
+        def cb(i, dtype, page, pages, tile=None):
+            fmt = dict(buffer_index=i, data_format=dtype, page_size=page)
+            if tile is not None:
+                fmt["tile"] = tile
+            return ttnn.CBDescriptor(
+                total_size=page * pages, core_ranges=self.cores, format_descriptors=[ttnn.CBFormatDescriptor(**fmt)]
+            )
+
+        cbs = [
+            cb(cb_x, ttnn.bfloat16, 2 * TILE * M, self.kt, rows_tile),
+            cb(cb_w, ttnn.bfloat8_b, BFP8_TILE_BYTES, self.kt),
+            cb(cb_tab, ttnn.uint32, max(4 * M * K, 64), 1),
+            cb(cb_scr, ttnn.uint32, self.n1 * K * 8, 1),
+            cb(cb_out, ttnn.bfloat16, 2 * TILE * M, 1, rows_tile),
+        ]
+        reader_ct = [cb_x, cb_w, cb_tab, cb_scr, self.n1, K, M, self.kx, self.col_bytes, self.C, NBIAS]
+        for t in (lists1, x):
+            reader_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+        writer_ct = [cb_out, cb_tab, M, K, K * M * 8] + ttnn.TensorAccessorArgs(lists2).get_compile_time_args()
+        c0, c1 = self.core_list[0], self.core_list[-1]
+        a_, b_ = self.mesh.worker_core_from_logical_core(c0), self.mesh.worker_core_from_logical_core(c1)
+        reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for i, c in enumerate(self.core_list):
+            r, j = i % M, i // M  # (x0 + j, y0 + r)
+            reader_rt[c.x][c.y] = [lists1.buffer_address(), x.buffer_address(), w8.buffer_address(), r, j]
+            reader_rt[c.x][c.y] = list(reader_rt[c.x][c.y]) + [a_.x, a_.y, b_.x, b_.y, a_.x, a_.y]
+            writer_rt[c.x][c.y] = [lists2.buffer_address(), r, j]
+        dm = ttnn.DataMovementConfigDescriptor
+        kernels = [
+            ttnn.KernelDescriptor(
+                kernel_source=str(KERNEL_DIR / "lm_rescore2_reader.cpp"),
+                core_ranges=self.cores,
+                compile_time_args=reader_ct,
+                runtime_args=reader_rt,
+                config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_0),
+            ),
+            ttnn.KernelDescriptor(
+                kernel_source=str(KERNEL_DIR / "lm_rescore2_writer.cpp"),
+                core_ranges=self.cores,
+                compile_time_args=writer_ct,
+                runtime_args=writer_rt,
+                config=dm(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_1),
+            ),
+            ttnn.KernelDescriptor(
+                kernel_source=str(KERNEL_DIR / "lm_rescore2_compute.cpp"),
+                core_ranges=self.cores,
+                compile_time_args=[cb_x, cb_w, cb_out, self.kt],
+                runtime_args=[],
+                config=ttnn.ComputeConfigDescriptor(
+                    math_fidelity=ttnn.MathFidelity.LoFi, fp32_dest_acc_en=True, math_approx_mode=False
+                ),
+            ),
+        ]
+        sems = [ttnn.SemaphoreDescriptor(i, ttnn.CoreType.WORKER, self.cores, 0) for i in (0, 1)]
         program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
         ttnn.generic_op([lists1, x, w8, lists2], program)

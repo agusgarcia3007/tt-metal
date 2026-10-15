@@ -177,7 +177,7 @@ class FusedVerify:
         )
         # DFLASH_LM_PRESCREEN=K (> 0): two-stage LM head (dflash/lm_rescore.py): the BFP4 head keeps each row's K
         # best columns per core, then the device's K best per row are rescored with the BF8 weights
-        self.prescreen = int(os.environ.get("DFLASH_LM_PRESCREEN", "0"))
+        self.prescreen = int(os.environ.get("DFLASH_LM_PRESCREEN", "8"))
         if self.prescreen:
             from .lm_head import padded_lm_head
             from .lm_rescore import LMRescore
