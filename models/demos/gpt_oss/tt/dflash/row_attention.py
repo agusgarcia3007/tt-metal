@@ -31,12 +31,15 @@ class RowAttention:
         x0, y0 = cores_start
         self.core_list = [ttnn.CoreCoord(x0 + (i % 8), y0 + i // 8) for i in range(rows * n_kv)]
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(self.core_list[0], self.core_list[-1])])
+        # DFLASH_RA_OUT_L1=1: the output in L1 (the o_proj stream reads rows straight from it; a DRAM source is staged
+        # whole tiles first)
+        out_mc = ttnn.L1_MEMORY_CONFIG if os.environ.get("DFLASH_RA_OUT_L1", "1") == "1" else ttnn.DRAM_MEMORY_CONFIG
         self.out = ttnn.from_torch(
             torch.zeros(1, rows, n_heads, head_dim),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=mesh_device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=out_mc,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
         )
 
