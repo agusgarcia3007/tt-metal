@@ -150,6 +150,7 @@ class MoEFused:
             extra_writer_rt=[ctr, rx, ry, n_g] + ([pred_addr] if P else []),
             notify_args=[1, b.noc_xy[0], b.noc_xy[1], 2],
             extra_reader_rt=[rx, ry, pred_addr] if P else None,
+            pred_p=P,
         )
         # semaphore 0: x ready (R, G, B) (+ the multi-core boundary's 5 / 6)
         assert {sd.id for sd in rprog.semaphores} <= {0, 5, 6}

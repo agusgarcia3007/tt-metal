@@ -84,10 +84,17 @@ void kernel_main() {
     volatile tt_l1_ptr uint16_t* w = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr + 128);
     uint32_t order[32];
 #ifdef MOE_PRED
+    uint32_t hits = 0;
     {
         uint32_t kept_pred[MOE_PRED];
-        moe_order::make_order<MOE_PRED>(pred, uni, order, kept_pred);
+        const uint32_t kept = moe_order::make_order<MOE_PRED>(pred, uni, order, kept_pred);
+        for (uint32_t j = 0; j < kept; ++j) {
+            hits |= 1u << kept_pred[j];
+        }
     }
+    ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, hits);
+    ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, hits);
+    ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, hits);
 #else
     for (uint32_t e = 0; e < num_sel; ++e) {
         order[e] = e;

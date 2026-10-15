@@ -78,6 +78,7 @@ void kernel_main() {
     const uint32_t kept = moe_order::make_order<P>(pred, uni, order, kept_pred);
     noc_async_read_barrier();                  // the prefetch
     cb_push_back(MOE_PRED_CB, P * cols * kt);  // compute takes the routed ones, skips the others
+    DeviceTimestampedData("MOE_T", 402);
     e0 = kept;
 #else
     for (uint32_t e = 0; e < num_sel; ++e) {

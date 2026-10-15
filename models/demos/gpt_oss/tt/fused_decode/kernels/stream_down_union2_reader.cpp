@@ -40,16 +40,25 @@ void kernel_main() {
     constexpr uint32_t pages = block_bytes / page_bytes;
     static_assert(pages * page_bytes == block_bytes && page_bytes <= NOC_MAX_BURST_SIZE, "packet size");
 
+    cb_reserve_back(cb_idx, 1);
+    const uint32_t idx_l1 = get_write_ptr(cb_idx);
+    const uint32_t cb_start = get_write_ptr(cb_w);  // the ring's first block (nothing reserved yet)
+#ifdef MOE_PRED
+    // runtime args 5..7: hub noc x, y, this layer's prediction address; prefetch the predicted experts' blocks into
+    // MOE_PRED_CB before the union is known (the boundary and the router are still running)
+    uint32_t pred[MOE_PRED];
+    moe_order::read_pred<MOE_PRED>(
+        get_arg_val<uint32_t>(5), get_arg_val<uint32_t>(6), get_arg_val<uint32_t>(7), idx_l1 + 128, MOE_PRED_SEM, pred);
+    cb_reserve_back(MOE_PRED_CB, MOE_PRED * block_tiles);
+    const uint32_t pre = get_write_ptr(MOE_PRED_CB);
+    for (uint32_t k = 0; k < MOE_PRED; ++k) {
+        const uint64_t src = get_noc_addr_from_bank_id<true>(bank_id, w_addr + pred[k] * expert_stride + reader_offset);
+        noc_async_read(src, pre + k * block_bytes, block_bytes);
+    }
+#endif
 #if defined(MOE_FUSED) && !defined(MOE_NO_ROUTER)
     // fused MoE program (dflash/moe_fused.py): the router's union is written (program semaphore 1)
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1)), 1);
-#endif
-    cb_reserve_back(cb_idx, 1);
-    const uint32_t idx_l1 = get_write_ptr(cb_idx);
-#ifdef MOE_PRED
-    uint32_t pred[MOE_PRED];  // runtime args 5..7: hub noc x, y, this layer's prediction address
-    moe_order::read_pred<MOE_PRED>(
-        get_arg_val<uint32_t>(5), get_arg_val<uint32_t>(6), get_arg_val<uint32_t>(7), idx_l1 + 128, MOE_PRED_SEM, pred);
 #endif
     const auto s_uni = TensorAccessor(uni_args, uni_addr, 128);
     noc_async_read(s_uni.get_noc_addr(0), idx_l1, 128);
@@ -58,11 +67,14 @@ void kernel_main() {
     volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(idx_l1);
     const uint32_t num_sel = uni[0];
     uint32_t order[32];
+    uint32_t e0 = 0;  // first slot (in `order`) streamed through the ring
 #ifdef MOE_PRED
     {
         constexpr uint32_t P = MOE_PRED;
         uint32_t kept_pred[P];
-        moe_order::make_order<P>(pred, uni, order, kept_pred);
+        e0 = moe_order::make_order<P>(pred, uni, order, kept_pred);
+        noc_async_read_barrier();                           // the prefetch
+        cb_push_back(MOE_PRED_CB, MOE_PRED * block_tiles);  // compute takes the routed ones, skips the others
     }
 #else
     for (uint32_t e = 0; e < num_sel; ++e) {
@@ -77,13 +89,13 @@ void kernel_main() {
     constexpr uint32_t extra_in_flight = 1;
     cb_reserve_back(cb_w, block_tiles * (extra_in_flight + 1));
     uint32_t l1_write = get_write_ptr(cb_w);
-    const uint32_t cb_base = l1_write;
+    const uint32_t cb_base = cb_start;
     const uint32_t cb_end = cb_base + num_buffers * block_bytes;
     uint32_t free_blocks = num_buffers;
     uint32_t trid = 1;
     uint32_t trid_to_wait = 1;
 
-    for (uint32_t e = 0; e < num_sel; ++e) {
+    for (uint32_t e = e0; e < num_sel; ++e) {
         const uint32_t src = static_cast<uint32_t>(uni[1 + order[e]]) * expert_stride + reader_offset;
         noc_async_read_set_trid(trid);
         for (uint32_t pg = 0; pg < pages; ++pg) {
@@ -104,7 +116,7 @@ void kernel_main() {
             l1_write = cb_base;
         }
     }
-    const uint32_t pending = num_sel < extra_in_flight ? num_sel : extra_in_flight;
+    const uint32_t pending = num_sel - e0 < extra_in_flight ? num_sel - e0 : extra_in_flight;
     for (uint32_t i = 0; i < pending; ++i) {
         noc_async_read_barrier_with_trid(trid_to_wait);
         cb_push_back(cb_w, block_tiles);

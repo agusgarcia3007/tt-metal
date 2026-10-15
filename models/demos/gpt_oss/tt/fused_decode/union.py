@@ -259,6 +259,7 @@ class ExpertDownUnion(_BankStreamOp):
         extra_writer_rt=None,
         notify_args=None,
         extra_reader_rt=None,
+        pred_p=0,
     ):
         """send = (boundary, site): fuse the boundary all-reduce's fabric send (DecodeBoundary.sending_program).
         notify_args (build_only): the writers' sender notification [1, x, y, semaphore id] (a fused program's sender).
@@ -274,6 +275,8 @@ class ExpertDownUnion(_BankStreamOp):
             self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 64, 1),
             self._cb(cb_out, ttnn.bfloat16, tiny, 4, tiny=True, rows=M),
         ]
+        if pred_p:  # MOE_PRED: the predicted experts' prefetched blocks (CB 6)
+            cbs.append(self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * block))
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for core, bank, r, vc in self.assignments:
             reader_rt[core.x][core.y] = [

@@ -140,7 +140,8 @@ void kernel_main() {
     volatile tt_l1_ptr uint16_t* w = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr + 128);
     cb_reserve_back(cb_sc, num_sel);
     const uint32_t sc_l1 = get_write_ptr(cb_sc);
-    for (uint32_t i = 0; i < num_sel; ++i) {
+    // scale tile i: row r = w[r][order[i]] in all 32 entries; built one expert ahead of compute (below)
+    auto scale_tile = [&](uint32_t i) {
         volatile tt_l1_ptr uint32_t* t = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc_l1 + i * tiny_bytes);
         for (uint32_t r = 0; r < rows; ++r) {
             const uint32_t v = w[r * 32 + order[i]];
@@ -150,12 +151,26 @@ void kernel_main() {
                 t[(row_face + r * 32) / 4 + q] = pair;  // face 1, row r
             }
         }
-        cb_push_back(cb_sc, 1);  // compute starts on expert i as soon as its scale tile is here
+        cb_push_back(cb_sc, 1);
+    };
+    if (num_sel > 0) {
+        scale_tile(0);
     }
+#ifdef MOE_FUSED
+    DeviceTimestampedData("MOE_T", 203);
+#endif
 
     for (uint32_t e = 0; e < num_sel; ++e) {
+        if (e + 1 < num_sel) {
+            scale_tile(e + 1);  // while compute works on expert e
+        }
         for (uint32_t p = 0; p < pairs; ++p) {
             cb_wait_front(cb_act, 1);
+#ifdef MOE_FUSED
+            if (e < 2) {
+                DeviceTimestampedData("MOE_T", 205 + e);
+            }
+#endif
             const uint32_t src = get_read_ptr(cb_act);
             noc_async_write(src, s_act.get_noc_addr(order[e], (act_tile0 + p) * tiny_bytes), tiny_bytes);
             noc_async_writes_flushed();

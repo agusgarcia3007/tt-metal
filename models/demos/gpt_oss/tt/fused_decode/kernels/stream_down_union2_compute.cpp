@@ -35,19 +35,40 @@ void kernel_main() {
     cb_wait_front(cb_in0, num_sel * seg_tiles);
 #endif
     tile_regs_acquire();
-    for (uint32_t e = 0; e < num_sel; ++e) {
+    // union expert e (processing order) from weight CB wcb, accumulated into DST 0 .. cols - 1
+    auto expert = [&](uint32_t e, uint32_t wcb) {
 #ifdef MOE_FUSED
         cb_wait_front(cb_in0, (e + 1) * seg_tiles);  // slot e's activation (the writer pushes slot by slot)
 #endif
-        cb_wait_front(cb_w, cols * seg_tiles);
+        cb_wait_front(wcb, cols * seg_tiles);
         for (uint32_t c = 0; c < cols; ++c) {
             if (e + 1 == num_sel) {
-                custom_mm_block<true>(cb_in0, cb_w, e * seg_tiles, c * seg_tiles, c, seg_tiles);
+                custom_mm_block<true>(cb_in0, wcb, e * seg_tiles, c * seg_tiles, c, seg_tiles);
             } else {
-                custom_mm_block<false>(cb_in0, cb_w, e * seg_tiles, c * seg_tiles, c, seg_tiles);
+                custom_mm_block<false>(cb_in0, wcb, e * seg_tiles, c * seg_tiles, c, seg_tiles);
             }
         }
-        cb_pop_front(cb_w, cols * seg_tiles);
+        cb_pop_front(wcb, cols * seg_tiles);
+    };
+    uint32_t e = 0;
+#ifdef MOE_PRED
+    // the predicted experts' blocks (MOE_PRED_CB, prefetched before the union was known): hit bit k from the writer
+    uint32_t hits = 0;
+    UNPACK(hits = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+    MATH(hits = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+    PACK(hits = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+    for (uint32_t k = 0; k < MOE_PRED; ++k) {
+        if ((hits >> k) & 1) {
+            expert(e, MOE_PRED_CB);
+            ++e;
+        } else {
+            cb_wait_front(MOE_PRED_CB, cols * seg_tiles);
+            cb_pop_front(MOE_PRED_CB, cols * seg_tiles);
+        }
+    }
+#endif
+    for (; e < num_sel; ++e) {
+        expert(e, cb_w);
     }
     tile_regs_commit();
     tile_regs_wait();
