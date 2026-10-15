@@ -68,7 +68,17 @@ class FusedDraft:
             rows=M,
             prefetch_cols=2,
         )
-        self.o = LinearStream(mesh, nq * hd // TILE, H, dtype, readers=2, x_pages=hd // TILE, out_mode=5, rows=M)
+        self.o = LinearStream(
+            mesh,
+            nq * hd // TILE,
+            H,
+            dtype,
+            readers=2,
+            x_pages=hd // TILE,
+            out_mode=5,
+            rows=M,
+            gather_split=os.environ.get("DFLASH_OPROJ_SPLIT", "1") == "1",
+        )
         # DFLASH_DRAFT_MLP_FUSED=1: boundary + gate|up + down as one program (dflash/moe_fused.py DenseMLPFused),
         # the MLP split into `slices` column slices so down overlaps gate|up.
         self.mlp_fused = None
@@ -94,7 +104,7 @@ class FusedDraft:
             from ..fused_decode.config import LM_HEAD_STREAM_PREFETCH
             from .lm_head import padded_lm_head
 
-            readers = len(verify.lm_head.assignments) // banks
+            readers = int(os.environ.get("DFLASH_DRAFT_LM_READERS", "3"))
             self.lm_w, n = padded_lm_head(
                 mesh, draft.target.decode_terminal, readers, os.environ.get("TT_CACHE_PATH"), dtype=ttnn.bfloat4_b
             )
@@ -109,6 +119,18 @@ class FusedDraft:
                 rows=M,
             )
         rep = ttnn.ReplicateTensorToMesh(mesh)
+        # this LM head's own per-core argmax lists (its reader count may differ from the eager drafter's head)
+        self.lists = ttnn.from_torch(
+            torch.zeros(1, len(self.lm.assignments) * M * 2, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            mesh_mapper=rep,
+        )
+        from .argmax import ArgmaxGather
+
+        self._gather = ArgmaxGather(mesh, M, len(self.lm.assignments), draft.vd, kind=0)  # (no allocation in a trace)
 
         def dram(t, dt=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, mc=ttnn.DRAM_MEMORY_CONFIG):
             return ttnn.from_torch(t, dtype=dt, layout=layout, device=mesh, memory_config=mc, mesh_mapper=rep)
@@ -127,6 +149,9 @@ class FusedDraft:
         w = w.reshape(1, 32 * M)
         self.weights = dram(w, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, ttnn.L1_MEMORY_CONFIG)
         self._init_context(dtype, banks, dram)
+
+    def _argmax_gather(self):
+        return self._gather
 
     # -- context pass ----------------------------------------------------------------------------------------------
     def _init_context(self, dtype, banks, dram):
@@ -385,10 +410,10 @@ class FusedDraft:
             pending = PendingBoundary(b, res, gamma, v.partial, "moe", sent=fab)
         if not fab:
             pending.run()
-        self.lm(pending if fab else pending.x, self.lm_w, d.lists)
+        self.lm(pending if fab else pending.x, self.lm_w, self.lists)
         pending.x.deallocate(True)
         pending.residual.deallocate(True)
         pending.residual_out.deallocate(True)
-        d.argmax_gather(d.lists, d.t_toks, d.verify_tokens)
+        self._argmax_gather()(self.lists, d.t_toks, d.verify_tokens)
         for t in rot:
             t.deallocate(True)

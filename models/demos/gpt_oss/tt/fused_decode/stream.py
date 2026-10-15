@@ -451,7 +451,10 @@ class LinearStream(_BankStreamOp):
         prefetch_cols=None,
         rows=1,
         x_tile_rows=False,
+        gather_split=False,
     ):
+        """gather_split (x_pages > 0, rows > 1): each core gathers 1 / n of the activation tiles and copies them to the
+        other cores (kernels/stream_linear_writer.cpp X_GATHER_SPLIT) instead of every core gathering all of them."""
         n_tiles = -(-n // TILE)
         banks = mesh_device.dram_grid_size().x
         self.C = -(-n_tiles // banks)
@@ -471,6 +474,7 @@ class LinearStream(_BankStreamOp):
         self.rows = rows
         # x_tile_rows: x is a [32, 32 k_tiles] BF16 tile tensor whose rows 0 .. rows - 1 are the token rows
         self.x_tile_rows = x_tile_rows
+        self.gather_split = gather_split and self.x_pages > 0 and rows > 1 and len(self.assignments) > 1
         assert not x_tile_rows or (x_pages is None and rows > 1)
         assert rows in (1, 2, 4, 8), "custom_mm in0 tiles are [1, 2, 4 or 8] x 32"
         assert out_mode != 6 or rows > 1, "out_mode 6 (per-row argmax) is the multi-row LM head"
@@ -560,6 +564,11 @@ class LinearStream(_BankStreamOp):
                 self._cb(cb_kv, ttnn.bfloat8_b, BFP8_TILE_BYTES, kv_pages),
             ]
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        gs_noc = []
+        if self.gather_split:
+            for c, *_ in self.assignments:
+                p = self.mesh_device.worker_core_from_logical_core(c)
+                gs_noc += [p.x, p.y]
         for i, (core, bank, r, vc) in enumerate(self.assignments):
             reader_rt[core.x][core.y] = [weights.buffer_address(), bank, vc, r * self.cols * self.col_bytes]
             writer_rt[core.x][core.y] = [
@@ -571,6 +580,8 @@ class LinearStream(_BankStreamOp):
             ] + (exchange.writer_runtime_args(i) if exchange is not None else [])
             if self.out_mode == 6:
                 writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [i]
+            if self.gather_split:
+                writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [i, len(self.assignments)] + gs_noc
             if rope_kv is not None:
                 writer_rt[core.x][core.y] = (
                     list(writer_rt[core.x][core.y]) + rope_kv.writer_runtime_args() + self._slot_columns(bank, r, order)
@@ -599,6 +610,8 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("ROWS", str(M))]
         if self.x_tile_rows:
             defines = defines + [("X_TILE_ROWS", "1")]
+        if self.gather_split:
+            defines = (defines or []) + [("X_GATHER_SPLIT", "1")]
         if extra_defines:
             defines = (defines or []) + list(extra_defines)
 
@@ -615,10 +628,14 @@ class LinearStream(_BankStreamOp):
                 compute_rt=compute_rt,
                 defines=defines,
             )
+            if self.gather_split:
+                program.semaphores = list(program.semaphores) + [
+                    ttnn.SemaphoreDescriptor(1, ttnn.CoreType.WORKER, self.cores, 0)
+                ]
             if pending is not None:
                 program.kernels = list(program.kernels) + fused_kernels
                 program.cbs = list(program.cbs) + fused_cbs
-                program.semaphores = fused_semaphores
+                program.semaphores = list(program.semaphores) + list(fused_semaphores)
             return program
 
         assert not (send and pending), "an op is either a boundary producer or its consumer"

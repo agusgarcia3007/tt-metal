@@ -340,17 +340,19 @@ void kernel_main() {
     DeviceTimestampedData("MOE_T", 101);
 #endif
     uint32_t x_stage = 0;
-    if constexpr (x_stage_pages > 0) {
-        // DRAM source: 32-byte reads must be 64-byte aligned there, so stage the whole tiles in L1 first and pick
-        // the rows out of the local copy.
-        cb_reserve_back(cb_stage, x_stage_pages);
-        x_stage = get_write_ptr(cb_stage);
-        for (uint32_t p = 0; p < x_stage_pages; ++p) {  // x_stage_pages = rows * x_pages
-            noc_async_read(s_x.get_noc_addr(p), x_stage + p * 2048, 2048);
+    {
+        DeviceZoneScopedN("LIN_XGATHER");
+        if constexpr (x_stage_pages > 0) {
+            // DRAM source: 32-byte reads must be 64-byte aligned there, so stage the whole tiles in L1 first and pick
+            // the rows out of the local copy.
+            cb_reserve_back(cb_stage, x_stage_pages);
+            x_stage = get_write_ptr(cb_stage);
+            for (uint32_t p = 0; p < x_stage_pages; ++p) {  // x_stage_pages = rows * x_pages
+                noc_async_read(s_x.get_noc_addr(p), x_stage + p * 2048, 2048);
+            }
+            noc_async_read_barrier();
         }
-        noc_async_read_barrier();
-    }
-    constexpr uint32_t gather_pages = x_pages > 0 ? x_pages : 1;
+        constexpr uint32_t gather_pages = x_pages > 0 ? x_pages : 1;
 #if !defined(X_TILE_ROWS)
     if constexpr (x_pages == 0) {
         noc_async_read(s_x.get_noc_addr(0), x_l1, kx * tiny_bytes);
@@ -367,7 +369,20 @@ void kernel_main() {
         }
     }
 #endif
-    for (uint32_t j = 0; x_pages > 0 && j < kx; ++j) {
+#ifdef X_GATHER_SPLIT
+    // Split gather (multi-row o_proj): this core gathers activation tiles [j0, j1) only and copies them to the same
+    // offset of every other core's cb_x (same CB address on all cores), then counts the n - 1 other cores' copies
+    // (program semaphore X_GATHER_SPLIT). runtime args 5..: [core index, n, (noc x, y) x n].
+    const uint32_t gs_i = get_arg_val<uint32_t>(5);
+    const uint32_t gs_n = get_arg_val<uint32_t>(6);
+    const uint32_t gs_per = (kx + gs_n - 1) / gs_n;
+    const uint32_t j0 = gs_i * gs_per < kx ? gs_i * gs_per : kx;
+    const uint32_t j1 = j0 + gs_per < kx ? j0 + gs_per : kx;
+#else
+        constexpr uint32_t j0 = 0;
+        constexpr uint32_t j1 = kx;
+#endif
+    for (uint32_t j = j0; x_pages > 0 && j < j1; ++j) {
         const uint32_t row = j / gather_pages;
         const uint32_t off = row < 16 ? row * half_row : 2 * face_bytes + (row - 16) * half_row;  // faces 0/1, 2/3
         for (uint32_t r = 0; r < rows; ++r) {
@@ -383,6 +398,33 @@ void kernel_main() {
         ones[i] = (i < 16 * rows && i % 16 < nbias) ? 0x3F80 : 0;  // BF16 1.0
     }
     noc_async_read_barrier();
+#ifdef X_GATHER_SPLIT
+    if (j1 > j0) {
+        const uint32_t sem = get_semaphore(X_GATHER_SPLIT);
+        for (uint32_t c = 0; c < gs_n; ++c) {
+            if (c != gs_i) {
+                const uint32_t cx = get_arg_val<uint32_t>(7 + 2 * c), cy = get_arg_val<uint32_t>(8 + 2 * c);
+                noc_async_write(
+                    x_l1 + j0 * tiny_bytes, get_noc_addr(cx, cy, x_l1 + j0 * tiny_bytes), (j1 - j0) * tiny_bytes);
+            }
+        }
+        noc_async_write_barrier();
+        for (uint32_t c = 0; c < gs_n; ++c) {
+            if (c != gs_i) {
+                noc_semaphore_inc(
+                    get_noc_addr(get_arg_val<uint32_t>(7 + 2 * c), get_arg_val<uint32_t>(8 + 2 * c), sem), 1);
+            }
+        }
+        noc_async_atomic_barrier();
+    }
+    {
+        // every other core that owns tiles copied them here
+        const uint32_t owners = (kx + gs_per - 1) / gs_per;
+        const uint32_t others = owners - (j1 > j0 ? 1 : 0);
+        noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(X_GATHER_SPLIT)), others);
+    }
+#endif
+    }
     cb_push_back(cb_x, kx + 1);
 #ifdef MOE_FUSED
     DeviceTimestampedData("MOE_T", 102);

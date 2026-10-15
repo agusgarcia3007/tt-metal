@@ -96,6 +96,7 @@ class FusedVerify:
             x_pages=self.hd // TILE,
             out_mode=5,
             rows=M,
+            gather_split=os.environ.get("DFLASH_OPROJ_SPLIT", "1") == "1",
         )
         mlp0 = self.layers[0].mlp
         self.top_k, self.n_experts = mlp0.router.top_k, mlp0.router.num_experts

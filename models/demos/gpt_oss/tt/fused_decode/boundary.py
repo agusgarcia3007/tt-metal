@@ -313,8 +313,10 @@ class DecodeBoundary:
         n = producer_cores.num_cores()
         for coord in self.coords:
             program = build()
-            assert not program.semaphores, "the producer program's semaphore 0 is the notification semaphore"
-            program.semaphores = [
+            assert all(
+                sd.id != 0 for sd in program.semaphores
+            ), "the producer program's semaphore 0 is the notification"
+            program.semaphores = list(program.semaphores) + [
                 ttnn.SemaphoreDescriptor(0, ttnn.CoreType.WORKER, producer_cores.merge(self.cores), 0)
             ]
             links = min(self.links, self.chunks)
