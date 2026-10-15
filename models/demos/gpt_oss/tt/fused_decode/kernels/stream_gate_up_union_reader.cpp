@@ -10,6 +10,9 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
+#ifdef MOE_PRED
+#include "moe_order.hpp"
+#endif
 
 void kernel_main() {
     const uint32_t w_addr = get_arg_val<uint32_t>(0);
@@ -34,6 +37,26 @@ void kernel_main() {
     constexpr uint32_t full_pkts = col_bytes / pkt;
     constexpr uint32_t tail = col_bytes - full_pkts * pkt;
     (void)page_bytes;
+    const uint32_t cb_start = get_write_ptr(cb_w);  // the ring's first column (nothing reserved yet)
+#ifdef MOE_PRED
+    // runtime args 5..7: hub (router) noc x, y, this layer's prediction address. Prefetch the predicted experts'
+    // columns into MOE_PRED_CB while the boundary and the router run.
+    constexpr uint32_t P = MOE_PRED;
+    uint32_t pred[P];
+    cb_reserve_back(cb_idx, 1);
+    moe_order::read_pred<P>(
+        get_arg_val<uint32_t>(5),
+        get_arg_val<uint32_t>(6),
+        get_arg_val<uint32_t>(7),
+        get_write_ptr(cb_idx) + 128,
+        MOE_PRED_SEM,
+        pred);
+    const uint32_t pre = get_write_ptr(MOE_PRED_CB);
+    for (uint32_t k = 0; k < P; ++k) {
+        const uint64_t src = get_noc_addr_from_bank_id<true>(bank_id, w_addr + pred[k] * expert_stride + reader_offset);
+        noc_async_read(src, pre + k * cols * col_bytes, cols * col_bytes);
+    }
+#endif
 
 #if defined(MOE_FUSED) && !defined(MOE_NO_ROUTER)
     // fused MoE program (dflash/moe_fused.py): the router's union is written (program semaphore 1)
@@ -47,9 +70,29 @@ void kernel_main() {
     invalidate_l1_cache();
     volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(idx_l1);
     const uint32_t num_sel = uni[0];
-    uint32_t offsets[32];
+    uint32_t order[32];
+    uint32_t e0 = 0;  // first union slot streamed from DRAM (in `order`)
+#ifdef MOE_PRED
+    uint32_t kept_pred[P];
+    const uint32_t kept = moe_order::make_order<P>(pred, uni, order, kept_pred);
+    noc_async_read_barrier();              // the prefetch
+    for (uint32_t j = 0; j < kept; ++j) {  // predicted and routed: copy the prefetched columns into the ring
+        for (uint32_t c = 0; c < cols; ++c) {
+            cb_reserve_back(cb_w, kt);
+            noc_async_read(get_noc_addr(pre + (kept_pred[j] * cols + c) * col_bytes), get_write_ptr(cb_w), col_bytes);
+            noc_async_read_barrier();
+            cb_push_back(cb_w, kt);
+        }
+    }
+    e0 = kept;
+#else
     for (uint32_t e = 0; e < num_sel; ++e) {
-        offsets[e] = static_cast<uint32_t>(uni[1 + e]) * expert_stride + reader_offset;
+        order[e] = e;
+    }
+#endif
+    uint32_t offsets[32];
+    for (uint32_t e = e0; e < num_sel; ++e) {
+        offsets[e] = static_cast<uint32_t>(uni[1 + order[e]]) * expert_stride + reader_offset;
     }
 
     const uint64_t w_base = get_noc_addr_from_bank_id<true>(bank_id, w_addr);
@@ -61,14 +104,14 @@ void kernel_main() {
     constexpr uint32_t extra_in_flight = 1;
     cb_reserve_back(cb_w, kt * (extra_in_flight + 1));
     uint32_t l1_write = get_write_ptr(cb_w);
-    const uint32_t cb_base = l1_write;
+    const uint32_t cb_base = cb_start;
     const uint32_t cb_end = cb_base + num_buffers * col_bytes;
     uint32_t free_blocks = num_buffers;
     uint32_t trid = 1;
     uint32_t trid_to_wait = 1;
     uint32_t issued = 0;
 
-    for (uint32_t e = 0; e < num_sel; ++e) {
+    for (uint32_t e = e0; e < num_sel; ++e) {
         uint32_t src = offsets[e];
         for (uint32_t c = 0; c < cols; ++c) {
             noc_async_read_set_trid(trid);

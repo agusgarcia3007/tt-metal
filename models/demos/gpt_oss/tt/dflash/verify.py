@@ -296,10 +296,14 @@ class FusedVerify:
                     self.act,
                     dw.down_stream,
                     self.partial,
+                    layer=i,
                 )
                 res = pending.residual_out
                 pending.residual.deallocate(True)
                 pending.x.deallocate(True)
+                if getattr(self, "union_sets", None) is not None:  # debugging: the union's expert ids (eager)
+                    u = ttnn.to_torch(ttnn.get_device_tensors(self.union)[0]).reshape(-1).tolist()
+                    self.union_sets.append(u[1 : 1 + u[0]])
                 last = i + 1 == len(self.layers)
                 gamma = self.gamma_final if last else self.gamma_in[i + 1]
                 pending = PendingBoundary(b, res, gamma, self.partial, "moe", sent=True)

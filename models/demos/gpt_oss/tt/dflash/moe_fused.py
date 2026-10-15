@@ -84,13 +84,24 @@ class MoEFused:
             memory_config=ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard),
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
         )
+        # Expert prediction (MOE_PRED): per layer, the previous round's P most-routed experts (16 B per layer in the
+        # router core's L1), prefetched by gate|up during the boundary + router and processed first if routed again.
+        self.pred_p = int(os.environ.get("DFLASH_MOE_PRED", "3"))
+        self.pred = ttnn.from_torch(
+            torch.zeros(32, 4, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh_device,
+            memory_config=ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+        )
         print(
             f"MoEFused: router {rc}, boundary {boundary.core}, gate|up {[(c.x, c.y) for c, *_ in self.gate_up.assignments]}"
             f", down {[(c.x, c.y) for c, *_ in self.down.assignments]}",
             flush=True,
         )
 
-    def __call__(self, pending, router_ws, union, weights, gate_up_ws, act, down_ws, partial):
+    def __call__(self, pending, router_ws, union, weights, gate_up_ws, act, down_ws, partial, layer=0):
         """pending: the attn-site PendingBoundary (its partial sent by o_proj); runs the boundary, router, gate|up and
         down and sends the down partial to the moe site. Sets pending.residual_out / pending.x."""
         b, mesh = self.boundary, self.mesh
@@ -98,19 +109,33 @@ class MoEFused:
         rx, ry = self.router_noc.x, self.router_noc.y
         gd = _noc(mesh, self.G) + _noc(mesh, self.D)
         router_rt = [ctr, len(gd)] + [v for p in gd for v in (p.x, p.y)]
+        P = self.pred_p
+        pred_addr = self.pred.buffer_address() + 16 * layer
+        pdef = [("MOE_PRED", str(P)), ("MOE_PRED_SEM", "4"), ("MOE_PRED_CB", "6")] if P else []
+        if P:
+            router_rt += [pred_addr, 2 * (self.G.num_cores() + self.D.num_cores())]
         rprog, rio = self.router(
             pending,
             router_ws,
             (union, weights),
             build_only=True,
             consumer_cores=self.R.merge(self.G),
-            extra_defines=MOE + self.split_defines,
+            extra_defines=MOE + self.split_defines + pdef,
             extra_writer_rt=router_rt,
         )
         x = pending.x
         n_g = self.G.num_cores()
         gprog, gio = self.gate_up(
-            x, union, weights, gate_up_ws, act, build_only=True, extra_defines=MOE, extra_writer_rt=[ctr, rx, ry]
+            x,
+            union,
+            weights,
+            gate_up_ws,
+            act,
+            build_only=True,
+            extra_defines=MOE + pdef,
+            extra_writer_rt=[ctr, rx, ry] + ([pred_addr] if P else []),
+            extra_reader_rt=[rx, ry, pred_addr] if P else None,
+            pred_p=P,
         )
         dprog, dio = self.down(
             act,
@@ -119,9 +144,10 @@ class MoEFused:
             down_ws,
             partial,
             build_only=True,
-            extra_defines=MOE,
-            extra_writer_rt=[ctr, rx, ry, n_g],
+            extra_defines=MOE + pdef,
+            extra_writer_rt=[ctr, rx, ry, n_g] + ([pred_addr] if P else []),
             notify_args=[1, b.noc_xy[0], b.noc_xy[1], 2],
+            extra_reader_rt=[rx, ry, pred_addr] if P else None,
         )
         assert len(rprog.semaphores) == 1  # semaphore 0: x ready (R, G, B)
         sems = list(rprog.semaphores) + [
@@ -130,6 +156,8 @@ class MoEFused:
         ]
         if self.split_defines:
             sems.append(ttnn.SemaphoreDescriptor(3, ttnn.CoreType.WORKER, self.R, 0))
+        if P:
+            sems.append(ttnn.SemaphoreDescriptor(4, ttnn.CoreType.WORKER, self.R, 0))
         mesh_program = ttnn.MeshProgramDescriptor()
         n_d = self.D.num_cores()
         for coord in b.coords:
@@ -142,7 +170,7 @@ class MoEFused:
             b._add_sender(coord, program, sender)
             mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
         io = []
-        for t in [*rio, *gio, *dio, self.counters]:
+        for t in [*rio, *gio, *dio, self.counters, self.pred]:
             if all(t is not u for u in io):
                 io.append(t)
         ttnn.generic_op(io, mesh_program)

@@ -125,19 +125,35 @@ class ExpertGateUpUnion(_BankStreamOp):
     def weight_rows(self, num_experts):
         return num_experts * 2 * self.P * self.kt * TILE
 
-    def __call__(self, x, union, weights, w_stream, act, build_only=False, extra_defines=None, extra_writer_rt=None):
+    def __call__(
+        self,
+        x,
+        union,
+        weights,
+        w_stream,
+        act,
+        build_only=False,
+        extra_defines=None,
+        extra_writer_rt=None,
+        extra_reader_rt=None,
+        pred_p=0,
+    ):
+        """pred_p > 0 (fused MoE with prediction, MOE_PRED): a CB (index 6) for the prefetched columns of pred_p
+        experts."""
         M = self.rows
         cb_x, cb_w, cb_idx, cb_scr, cb_sc, cb_id, cb_act = 0, 1, 2, 3, 4, 5, 16
         tiny = TINY_BYTES * M
         cbs = [
             self._cb(cb_x, ttnn.bfloat16, tiny, self.kt, tiny=True, rows=M),
             self._cb(cb_w, self.weight_dtype, self.tile_bytes, 3 * self.kt),
-            self._cb(cb_idx, ttnn.uint16, 128, 1),
-            self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M, 1),
+            self._cb(cb_idx, ttnn.uint16, 256, 1),
+            self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 32, 1),
             self._cb(cb_sc, ttnn.bfloat16, tiny, self.max_experts, tiny=True, rows=M),
             self._cb(cb_id, self.weight_dtype, self.tile_bytes, 1),
             self._cb(cb_act, ttnn.bfloat16, tiny, 4, tiny=True, rows=M),
         ]
+        if pred_p:
+            cbs.append(self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * 2 * self.pairs * self.kt))
         ident = bfp4_identity(self.mesh_device, self.weight_dtype)
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for core, bank, r, vc in self.assignments:
@@ -147,7 +163,7 @@ class ExpertGateUpUnion(_BankStreamOp):
                 bank,
                 vc,
                 r * 2 * self.pairs * self.col_bytes,
-            ]
+            ] + list(extra_reader_rt or [])
             writer_rt[core.x][core.y] = [
                 x.buffer_address(),
                 act.buffer_address(),
@@ -238,6 +254,7 @@ class ExpertDownUnion(_BankStreamOp):
         extra_defines=None,
         extra_writer_rt=None,
         notify_args=None,
+        extra_reader_rt=None,
     ):
         """send = (boundary, site): fuse the boundary all-reduce's fabric send (DecodeBoundary.sending_program).
         notify_args (build_only): the writers' sender notification [1, x, y, semaphore id] (a fused program's sender).
@@ -249,8 +266,8 @@ class ExpertDownUnion(_BankStreamOp):
         cbs = [
             self._cb(cb_in0, ttnn.bfloat16, tiny, self.max_experts * self.seg_tiles, tiny=True, rows=M),
             self._cb(cb_w, self.weight_dtype, self.tile_bytes, self.num_buffers * block),
-            self._cb(cb_idx, ttnn.uint16, 128, 1),
-            self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 32, 1),
+            self._cb(cb_idx, ttnn.uint16, 256, 1),
+            self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 64, 1),
             self._cb(cb_out, ttnn.bfloat16, tiny, 4, tiny=True, rows=M),
         ]
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -261,7 +278,7 @@ class ExpertDownUnion(_BankStreamOp):
                 bank,
                 vc,
                 r * self.cols * self.seg_bytes,
-            ]
+            ] + list(extra_reader_rt or [])
             writer_rt[core.x][core.y] = [
                 act.buffer_address(),
                 weights.buffer_address(),

@@ -630,6 +630,45 @@ void kernel_main() {
             noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(7 + 2 * i), get_arg_val<uint32_t>(8 + 2 * i), sem), 1);
         }
         noc_async_atomic_barrier();
+#ifdef MOE_PRED
+        // Next round's prediction for this layer: the P union experts routed by the most rows (ties: lower slot),
+        // written once every gate|up / down kernel read the current one (program semaphore MOE_PRED_SEM).
+        // runtime args 7 + 2 n: this layer's prediction address (this core), 8 + 2 n: the readers to wait for.
+        {
+            volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks);
+            volatile tt_l1_ptr uint16_t* wts = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks + 128);
+            const uint32_t u = uni[0];
+            uint32_t cnt[32];
+            for (uint32_t i = 0; i < u; ++i) {
+                cnt[i] = 0;
+                for (uint32_t r = 0; r < rows; ++r) {
+                    cnt[i] += wts[r * 32 + i] != 0 ? 1 : 0;
+                }
+            }
+            uint32_t pick[4] = {0, 1, 2, 3};
+            for (uint32_t k = 0; k < MOE_PRED && k < u; ++k) {
+                uint32_t best = 32;
+                for (uint32_t i = 0; i < u; ++i) {
+                    bool taken = false;
+                    for (uint32_t j = 0; j < k; ++j) {
+                        taken |= pick[j] == uni[1 + i];
+                    }
+                    if (!taken && (best == 32 || cnt[i] > cnt[best])) {
+                        best = i;
+                    }
+                }
+                pick[k] = uni[1 + best];
+            }
+            const uint32_t pred_addr = get_arg_val<uint32_t>(7 + 2 * n);
+            noc_semaphore_wait(
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(MOE_PRED_SEM)),
+                get_arg_val<uint32_t>(8 + 2 * n));
+            volatile tt_l1_ptr uint32_t* pr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pred_addr);
+            for (uint32_t k = 0; k < 4; ++k) {
+                pr[k] = pick[k];
+            }
+        }
+#endif
     }
 #ifdef MOE_FUSED
     DeviceTimestampedData("MOE_T", 105);

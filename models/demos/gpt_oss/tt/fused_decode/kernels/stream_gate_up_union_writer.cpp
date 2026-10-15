@@ -20,6 +20,9 @@
 #include "api/dataflow/dataflow_api.h"
 #include "ckernel.h"
 #include "ckernel_defs.h"
+#ifdef MOE_PRED
+#include "moe_order.hpp"
+#endif
 
 void kernel_main() {
     const uint32_t x_addr = get_arg_val<uint32_t>(0);
@@ -55,9 +58,20 @@ void kernel_main() {
     const auto s_uni = TensorAccessor(uni_args, uni_addr, 128);
     const auto s_id = TensorAccessor(id_args, ident_addr, ident_bytes);
 
-    // scratch: [union (128 B) | weights (64 rows B)]
+    // scratch: [union (128 B) | weights (64 rows B) | prediction (16 B)]
     cb_reserve_back(cb_scr, 1);
     const uint32_t scr = get_write_ptr(cb_scr);
+#ifdef MOE_PRED
+    constexpr uint32_t P = MOE_PRED;
+    uint32_t pred[P];  // runtime args 9: this layer's prediction address (hub = runtime args 7, 8)
+    moe_order::read_pred<P>(
+        get_arg_val<uint32_t>(7),
+        get_arg_val<uint32_t>(8),
+        get_arg_val<uint32_t>(9),
+        scr + 128 + 64 * rows,
+        MOE_PRED_SEM,
+        pred);
+#endif
 #ifndef MOE_FUSED
     noc_async_read(s_uni.get_noc_addr(0), scr, 128);
     noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
@@ -92,6 +106,17 @@ void kernel_main() {
 
     volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr);
     const uint32_t num_sel = uni[0];
+    uint32_t order[32];
+#ifdef MOE_PRED
+    {
+        uint32_t kept_pred[P];
+        moe_order::make_order<P>(pred, uni, order, kept_pred);
+    }
+#else
+    for (uint32_t e = 0; e < num_sel; ++e) {
+        order[e] = e;
+    }
+#endif
     ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, num_sel);
     ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, num_sel);
     ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, num_sel);
@@ -102,7 +127,7 @@ void kernel_main() {
     for (uint32_t i = 0; i < num_sel; ++i) {
         volatile tt_l1_ptr uint32_t* t = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc_l1 + i * tiny_bytes);
         for (uint32_t r = 0; r < rows; ++r) {
-            const uint32_t v = w[r * 32 + i];
+            const uint32_t v = w[r * 32 + order[i]];
             const uint32_t pair = v | (v << 16);
             for (uint32_t q = 0; q < 8; ++q) {
                 t[r * 8 + q] = pair;                    // face 0, row r
@@ -116,7 +141,7 @@ void kernel_main() {
         for (uint32_t p = 0; p < pairs; ++p) {
             cb_wait_front(cb_act, 1);
             const uint32_t src = get_read_ptr(cb_act);
-            noc_async_write(src, s_act.get_noc_addr(e, (act_tile0 + p) * tiny_bytes), tiny_bytes);
+            noc_async_write(src, s_act.get_noc_addr(order[e], (act_tile0 + p) * tiny_bytes), tiny_bytes);
             noc_async_writes_flushed();
             cb_pop_front(cb_act, 1);
         }
@@ -127,9 +152,9 @@ void kernel_main() {
         DeviceTimestampedData("MOE_T", 210 + e);
 #ifdef MOE_CTR_SEM
         // counters = program semaphores MOE_CTR_SEM + e of the hub core (reset at every launch)
-        const uint32_t ctr_e = get_semaphore(MOE_CTR_SEM + e);
+        const uint32_t ctr_e = get_semaphore(MOE_CTR_SEM + order[e]);
 #else
-        const uint32_t ctr_e = get_arg_val<uint32_t>(6) + 16 * e;
+        const uint32_t ctr_e = get_arg_val<uint32_t>(6) + 16 * order[e];
 #endif
         noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(7), get_arg_val<uint32_t>(8), ctr_e), 1);
 #endif

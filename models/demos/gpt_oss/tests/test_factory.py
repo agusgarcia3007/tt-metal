@@ -125,7 +125,14 @@ def _worker_l1_param():
     dispatch can stage a large program's binaries while the previous program runs (Blackhole default ring 69 KB,
     allocator space 1461120 B)."""
     extra = int(os.environ.get("GPT_OSS_KERNEL_CONFIG_EXTRA_KB", "0"))
-    return {"worker_l1_size": 1461120 - extra * 1024} if extra else {}
+    params = {"worker_l1_size": 1461120 - extra * 1024} if extra else {}
+    # GPT_OSS_FABRIC_PAYLOAD=n: fabric packet payload bytes (Blackhole default 4352, max 15232)
+    payload = int(os.environ.get("GPT_OSS_FABRIC_PAYLOAD", "0"))
+    if payload:
+        cfg = ttnn.FabricRouterConfig()
+        cfg.max_packet_payload_size_bytes = payload
+        params["fabric_router_config"] = cfg
+    return params
 
 
 def parametrize_mesh_with_fabric(mesh_shapes=None):

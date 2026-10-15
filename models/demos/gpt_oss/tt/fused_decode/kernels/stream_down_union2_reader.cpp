@@ -13,6 +13,9 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
+#ifdef MOE_PRED
+#include "moe_order.hpp"
+#endif
 
 void kernel_main() {
     const uint32_t w_addr = get_arg_val<uint32_t>(0);
@@ -43,12 +46,29 @@ void kernel_main() {
 #endif
     cb_reserve_back(cb_idx, 1);
     const uint32_t idx_l1 = get_write_ptr(cb_idx);
+#ifdef MOE_PRED
+    uint32_t pred[MOE_PRED];  // runtime args 5..7: hub noc x, y, this layer's prediction address
+    moe_order::read_pred<MOE_PRED>(
+        get_arg_val<uint32_t>(5), get_arg_val<uint32_t>(6), get_arg_val<uint32_t>(7), idx_l1 + 128, MOE_PRED_SEM, pred);
+#endif
     const auto s_uni = TensorAccessor(uni_args, uni_addr, 128);
     noc_async_read(s_uni.get_noc_addr(0), idx_l1, 128);
     noc_async_read_barrier();
     invalidate_l1_cache();
     volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(idx_l1);
     const uint32_t num_sel = uni[0];
+    uint32_t order[32];
+#ifdef MOE_PRED
+    {
+        constexpr uint32_t P = MOE_PRED;
+        uint32_t kept_pred[P];
+        moe_order::make_order<P>(pred, uni, order, kept_pred);
+    }
+#else
+    for (uint32_t e = 0; e < num_sel; ++e) {
+        order[e] = e;
+    }
+#endif
 
     const uint64_t w_base = get_noc_addr_from_bank_id<true>(bank_id, w_addr);
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, noc_index);
@@ -64,7 +84,7 @@ void kernel_main() {
     uint32_t trid_to_wait = 1;
 
     for (uint32_t e = 0; e < num_sel; ++e) {
-        const uint32_t src = static_cast<uint32_t>(uni[1 + e]) * expert_stride + reader_offset;
+        const uint32_t src = static_cast<uint32_t>(uni[1 + order[e]]) * expert_stride + reader_offset;
         noc_async_read_set_trid(trid);
         for (uint32_t pg = 0; pg < pages; ++pg) {
             noc_async_read_one_packet_with_state_with_trid(

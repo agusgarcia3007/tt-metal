@@ -19,6 +19,9 @@
 #include "api/dataflow/dataflow_api.h"
 #include "ckernel.h"
 #include "ckernel_defs.h"
+#ifdef MOE_PRED
+#include "moe_order.hpp"
+#endif
 
 void kernel_main() {
     const uint32_t act_addr = get_arg_val<uint32_t>(0);
@@ -64,6 +67,11 @@ void kernel_main() {
 #endif
     cb_reserve_back(cb_scr, 1);
     const uint32_t scr = get_write_ptr(cb_scr);
+#ifdef MOE_PRED
+    uint32_t pred[MOE_PRED];  // runtime args 9: this layer's prediction address (hub = runtime args 6, 7)
+    moe_order::read_pred<MOE_PRED>(
+        hub_x, hub_y, get_arg_val<uint32_t>(9), scr + 128 + 64 * rows + 16, MOE_PRED_SEM, pred);
+#endif
     noc_async_read(s_uni.get_noc_addr(0), scr, 128);
     noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
     noc_async_read_barrier();
@@ -74,6 +82,17 @@ void kernel_main() {
     ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, num_sel);
     ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, num_sel);
     volatile tt_l1_ptr uint16_t* w = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr + 128);
+    uint32_t order[32];
+#ifdef MOE_PRED
+    {
+        uint32_t kept_pred[MOE_PRED];
+        moe_order::make_order<MOE_PRED>(pred, uni, order, kept_pred);
+    }
+#else
+    for (uint32_t e = 0; e < num_sel; ++e) {
+        order[e] = e;
+    }
+#endif
 
     cb_reserve_back(cb_in0, num_sel * seg_tiles);
     const uint32_t in0 = get_write_ptr(cb_in0);
@@ -83,9 +102,9 @@ void kernel_main() {
         volatile tt_l1_ptr uint32_t* poll = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128 + 64 * rows);
         do {
 #ifdef MOE_CTR_SEM
-            const uint32_t ctr_e = get_semaphore(MOE_CTR_SEM + e);
+            const uint32_t ctr_e = get_semaphore(MOE_CTR_SEM + order[e]);
 #else
-            const uint32_t ctr_e = get_arg_val<uint32_t>(5) + 16 * e;
+            const uint32_t ctr_e = get_arg_val<uint32_t>(5) + 16 * order[e];
 #endif
             noc_async_read(get_noc_addr(hub_x, hub_y, ctr_e), scr + 128 + 64 * rows, 16);
             noc_async_read_barrier();
@@ -93,11 +112,11 @@ void kernel_main() {
         } while (poll[0] < producers);
         DeviceTimestampedData("MOE_T", 310 + e);
 #endif
-        noc_async_read(s_act.get_noc_addr(e), in0 + e * seg_tiles * tiny_bytes, act_page_bytes);
+        noc_async_read(s_act.get_noc_addr(order[e]), in0 + e * seg_tiles * tiny_bytes, act_page_bytes);
         volatile tt_l1_ptr uint16_t* aug =
             reinterpret_cast<volatile tt_l1_ptr uint16_t*>(in0 + (e * seg_tiles + seg_tiles - 1) * tiny_bytes);
         for (uint32_t i = 0; i < 32 * rows; ++i) {
-            aug[i] = (i < 16 * rows && i % 16 < nbias) ? w[(i / 16) * 32 + e] : 0;
+            aug[i] = (i < 16 * rows && i % 16 < nbias) ? w[(i / 16) * 32 + order[e]] : 0;
         }
 #ifdef MOE_FUSED
         noc_async_read_barrier();
