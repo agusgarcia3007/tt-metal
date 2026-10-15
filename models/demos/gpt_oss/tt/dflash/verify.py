@@ -530,7 +530,10 @@ class FusedVerify:
             scale=attn.config.scaling,
             program_config=self._sdpa_pc(attn.config.sliding_window),
             compute_kernel_config=attn.program_config.get_compute_kernel_config(),
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            # DFLASH_L1_INTER=1: the output in L1 (o_proj reads rows straight from it)
+            memory_config=ttnn.L1_MEMORY_CONFIG
+            if os.environ.get("DFLASH_L1_INTER", "1") == "1"
+            else ttnn.DRAM_MEMORY_CONFIG,
         )
 
     def _forward_unfused(self):
