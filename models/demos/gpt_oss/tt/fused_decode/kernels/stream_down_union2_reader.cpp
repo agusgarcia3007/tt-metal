@@ -37,7 +37,7 @@ void kernel_main() {
     constexpr uint32_t pages = block_bytes / page_bytes;
     static_assert(pages * page_bytes == block_bytes && page_bytes <= NOC_MAX_BURST_SIZE, "packet size");
 
-#ifdef MOE_FUSED
+#if defined(MOE_FUSED) && !defined(MOE_NO_ROUTER)
     // fused MoE program (dflash/moe_fused.py): the router's union is written (program semaphore 1)
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1)), 1);
 #endif

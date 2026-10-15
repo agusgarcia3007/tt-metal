@@ -70,6 +70,7 @@ void kernel_main() {
     // Fused MoE program (dflash/moe_fused.py): x once the boundary packed it (program semaphore 0), the union and
     // weights once the router wrote them (semaphore 1).
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), 1);
+    DeviceTimestampedData("MOE_T", 201);
 #endif
     noc_async_read(s_x.get_noc_addr(0), x_l1, kx * tiny_bytes);
     volatile tt_l1_ptr uint16_t* ones = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(x_l1 + kx * tiny_bytes);
@@ -77,7 +78,10 @@ void kernel_main() {
         ones[i] = (i < 16 * rows && i % 16 < nbias) ? 0x3F80 : 0;  // BF16 1.0
     }
 #ifdef MOE_FUSED
+#ifndef MOE_NO_ROUTER
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1)), 1);
+#endif
+    DeviceTimestampedData("MOE_T", 202);
     noc_async_read(s_uni.get_noc_addr(0), scr, 128);
     noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
 #endif
@@ -120,8 +124,14 @@ void kernel_main() {
         // slot e's columns of this core are in DRAM: count them in the router core's counter e (runtime args 6..8:
         // counters address, router noc x, y); the down cores start on slot e once every gate|up core has.
         noc_async_write_barrier();
-        noc_semaphore_inc(
-            get_noc_addr(get_arg_val<uint32_t>(7), get_arg_val<uint32_t>(8), get_arg_val<uint32_t>(6) + 16 * e), 1);
+        DeviceTimestampedData("MOE_T", 210 + e);
+#ifdef MOE_CTR_SEM
+        // counters = program semaphores MOE_CTR_SEM + e of the hub core (reset at every launch)
+        const uint32_t ctr_e = get_semaphore(MOE_CTR_SEM + e);
+#else
+        const uint32_t ctr_e = get_arg_val<uint32_t>(6) + 16 * e;
+#endif
+        noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(7), get_arg_val<uint32_t>(8), ctr_e), 1);
 #endif
     }
 #ifdef MOE_FUSED

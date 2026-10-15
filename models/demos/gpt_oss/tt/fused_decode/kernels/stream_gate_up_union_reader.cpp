@@ -35,7 +35,7 @@ void kernel_main() {
     constexpr uint32_t tail = col_bytes - full_pkts * pkt;
     (void)page_bytes;
 
-#ifdef MOE_FUSED
+#if defined(MOE_FUSED) && !defined(MOE_NO_ROUTER)
     // fused MoE program (dflash/moe_fused.py): the router's union is written (program semaphore 1)
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1)), 1);
 #endif
@@ -88,6 +88,11 @@ void kernel_main() {
             if (free_blocks == num_buffers - extra_in_flight) {
                 noc_async_read_barrier_with_trid(trid_to_wait);
                 cb_push_back(cb_w, kt);
+#ifdef MOE_FUSED
+                if (issued == 2) {
+                    DeviceTimestampedData("MOE_T", 401);
+                }
+#endif
                 trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
                 cb_reserve_back(cb_w, kt * (extra_in_flight + 1));
             } else {

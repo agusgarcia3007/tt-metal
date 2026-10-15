@@ -69,12 +69,23 @@ class FusedDraft:
             prefetch_cols=2,
         )
         self.o = LinearStream(mesh, nq * hd // TILE, H, dtype, readers=2, x_pages=hd // TILE, out_mode=5, rows=M)
-        self.gu = ExpertGateUpUnion(
-            mesh, H, I_pad, 0.0, 1.0, readers=4, rows=M, dense_silu=True, max_experts=1, weight_dtype=dtype
-        )
-        self.down = ExpertDownUnion(
-            mesh, H, I_pad, readers=4, rows=M, expert_outer=True, max_experts=1, weight_dtype=dtype, num_buffers=2
-        )
+        # DFLASH_DRAFT_MLP_FUSED=1: boundary + gate|up + down as one program (dflash/moe_fused.py DenseMLPFused),
+        # the MLP split into `slices` column slices so down overlaps gate|up.
+        self.mlp_fused = None
+        self.slices = 1
+        if os.environ.get("DFLASH_DRAFT_MLP_FUSED", "1") == "1" and b.ccl == "fabric":
+            from .moe_fused import DenseMLPFused
+
+            self.slices = int(os.environ.get("DFLASH_DRAFT_MLP_SLICES", "2"))
+            self.mlp_fused = DenseMLPFused(mesh, b, H, I_pad // self.slices, self.slices, M, dtype)
+            self.gu, self.down = self.mlp_fused.gate_up, self.mlp_fused.down
+        else:
+            self.gu = ExpertGateUpUnion(
+                mesh, H, I_pad, 0.0, 1.0, readers=4, rows=M, dense_silu=True, max_experts=1, weight_dtype=dtype
+            )
+            self.down = ExpertDownUnion(
+                mesh, H, I_pad, readers=4, rows=M, expert_outer=True, max_experts=1, weight_dtype=dtype, num_buffers=2
+            )
         self._load_weights(dtype, banks)
         # LM head: the verify pass's (BF8) by default; DFLASH_DRAFT_LM_BFP4=1: a BFP4 copy (drafts only need the argmax
         # to agree with the target's often, the verify pass keeps its BF8 head).
@@ -105,12 +116,15 @@ class FusedDraft:
         self.q = dram(torch.zeros(1, ROWS, nq, hd))
         self.k = dram(torch.zeros(1, ROWS, nkv, hd))
         self.vv = dram(torch.zeros(1, ROWS, nkv, hd))
-        self.act = act_buffer(mesh, I_pad, M, slots=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        S = self.slices
+        self.act = act_buffer(mesh, I_pad // S, M, slots=S, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         u = torch.zeros(1, 64, dtype=torch.int32)
-        u[0, 0] = 1  # one "expert": the dense MLP, id 0
+        u[0, 0] = S  # the dense MLP as S "experts" (column slices), ids 0 .. S - 1
+        u[0, 1 : 1 + S] = torch.arange(S)
         self.union = dram(u, ttnn.uint16, ttnn.ROW_MAJOR_LAYOUT, ttnn.L1_MEMORY_CONFIG)
-        w = torch.zeros(1, 32 * M)
-        w[0, ::32] = 1.0  # every row's weight of expert 0
+        w = torch.zeros(1, M, 32)
+        w[0, :, :S] = 1.0  # every row's weight of every slice
+        w = w.reshape(1, 32 * M)
         self.weights = dram(w, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, ttnn.L1_MEMORY_CONFIG)
         self._init_context(dtype, banks, dram)
 
@@ -240,7 +254,9 @@ class FusedDraft:
         D, H, hd, nq, nkv, I, I_pad = d.D, d.hidden, d.hd, d.nq, d.nkv, d.inter, self.I_pad
         dt = {ttnn.bfloat8_b: "bfp8", ttnn.bfloat4_b: "bfp4", ttnn.bfloat16: "bf16"}[dtype]
         cache_dir = os.environ.get("TT_CACHE_PATH")
-        base = None if cache_dir is None else f"{cache_dir}/dflash_fused_draft_{dt}_b{banks}_i{I_pad}"
+        S = self.slices
+        sfx = f"_s{S}" if S > 1 else ""
+        base = None if cache_dir is None else f"{cache_dir}/dflash_fused_draft_{dt}_b{banks}_i{I_pad}{sfx}"
         marker = None if base is None else Path(base + ".built")
         w = None
         if marker is None or not marker.exists():
@@ -277,11 +293,16 @@ class FusedDraft:
                     )
                     gd = torch.nn.functional.pad(g[dv * I : (dv + 1) * I].T, (0, I_pad - I))
                     ud = torch.nn.functional.pad(u[dv * I : (dv + 1) * I].T, (0, I_pad - I))
-                    lay["gu"].append(
-                        stream_gate_up_layout(torch.cat([gd, ud], -1)[None], torch.zeros(1, 2 * I_pad), banks)
+                    Is = I_pad // S  # slice s = intermediate columns [s Is, (s + 1) Is)
+                    gu_s = torch.stack(
+                        [
+                            torch.cat([gd[:, s_ * Is : (s_ + 1) * Is], ud[:, s_ * Is : (s_ + 1) * Is]], -1)
+                            for s_ in range(S)
+                        ]
                     )
+                    lay["gu"].append(stream_gate_up_layout(gu_s, torch.zeros(S, 2 * Is), banks))
                     dd = torch.nn.functional.pad(dn[dv * I : (dv + 1) * I], (0, 0, 0, I_pad - I))
-                    lay["down"].append(stream_down_layout(dd[None], torch.zeros(1, H), banks))
+                    lay["down"].append(stream_down_layout(dd.reshape(S, Is, H), torch.zeros(S, H), banks))
 
             def put(name, rows):
                 cache = None if base is None else f"{base}_l{i}_{name}"
@@ -289,8 +310,8 @@ class FusedDraft:
 
             self.w_qkv.append(put("qkv", self.qkv.weight_rows()))
             self.w_o.append(put("o", self.o.weight_rows()))
-            self.w_gu.append(put("gu", self.gu.weight_rows(1)))
-            self.w_down.append(put("down", self.down.weight_rows(1)))
+            self.w_gu.append(put("gu", self.gu.weight_rows(S)))
+            self.w_down.append(put("down", self.down.weight_rows(S)))
         if marker is not None:
             marker.touch()
 
@@ -347,6 +368,14 @@ class FusedDraft:
             self.o(attn, self.w_o[i], v.partial, send=(b, "attn") if fab else None)
             attn.deallocate(True)
             pending = PendingBoundary(b, res, self.g_ln2[i], v.partial, "attn", sent=fab)
+            if self.mlp_fused is not None:
+                self.mlp_fused(pending, self.union, self.weights, self.w_gu[i], self.act, self.w_down[i], v.partial)
+                res = pending.residual_out
+                pending.residual.deallocate(True)
+                pending.x.deallocate(True)
+                gamma = self.g_ln1[i + 1] if i + 1 < d.layers else self.g_final
+                pending = PendingBoundary(b, res, gamma, v.partial, "moe", sent=fab)
+                continue
             res, x = pending.run()
             pending.residual.deallocate(True)
             self.gu(x, self.union, self.weights, self.w_gu[i], self.act)

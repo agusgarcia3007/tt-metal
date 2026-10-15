@@ -56,8 +56,10 @@ void kernel_main() {
 #ifdef MOE_FUSED
     // Fused MoE program (dflash/moe_fused.py): wait for the router (program semaphore 1); runtime args 5..8: the
     // counters address, router noc x, y, the gate|up core count.
+#ifndef MOE_NO_ROUTER
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1)), 1);
-    const uint64_t ctr_noc = get_noc_addr(get_arg_val<uint32_t>(6), get_arg_val<uint32_t>(7), get_arg_val<uint32_t>(5));
+#endif
+    const uint32_t hub_x = get_arg_val<uint32_t>(6), hub_y = get_arg_val<uint32_t>(7);
     const uint32_t producers = get_arg_val<uint32_t>(8);
 #endif
     cb_reserve_back(cb_scr, 1);
@@ -80,10 +82,16 @@ void kernel_main() {
         // Slot e is complete once all gate|up cores counted it; push each slot as it arrives (compute waits per slot).
         volatile tt_l1_ptr uint32_t* poll = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128 + 64 * rows);
         do {
-            noc_async_read(ctr_noc + 16 * e, scr + 128 + 64 * rows, 16);
+#ifdef MOE_CTR_SEM
+            const uint32_t ctr_e = get_semaphore(MOE_CTR_SEM + e);
+#else
+            const uint32_t ctr_e = get_arg_val<uint32_t>(5) + 16 * e;
+#endif
+            noc_async_read(get_noc_addr(hub_x, hub_y, ctr_e), scr + 128 + 64 * rows, 16);
             noc_async_read_barrier();
             invalidate_l1_cache();
         } while (poll[0] < producers);
+        DeviceTimestampedData("MOE_T", 310 + e);
 #endif
         noc_async_read(s_act.get_noc_addr(e), in0 + e * seg_tiles * tiny_bytes, act_page_bytes);
         volatile tt_l1_ptr uint16_t* aug =

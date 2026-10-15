@@ -130,3 +130,85 @@ class MoEFused:
             if all(t is not u for u in io):
                 io.append(t)
         ttnn.generic_op(io, mesh_program)
+
+
+class DenseMLPFused:
+    """The drafter's dense SwiGLU MLP as one program per device: the post-attention boundary (B), gate|up (G) and down
+    (D) on disjoint cores. The MLP is split into `slices` fixed "experts" of I_pad / slices columns (union = all of
+    them, weight 1), so down starts on slice i once every G core wrote it; with no router both weight streams start
+    at launch, during the boundary. Slice counters: program semaphores 3 .. 3 + slices - 1 of B (reset per launch)."""
+
+    CTR_SEM = 3
+
+    def __init__(
+        self, mesh_device, boundary, hidden, slice_pad, slices, rows, weight_dtype, gate_up_readers=4, down_readers=4
+    ):
+        self.mesh, self.boundary, self.slices = mesh_device, boundary, slices
+        taken = [(boundary.core.x, boundary.core.y)]
+        self.gate_up = ExpertGateUpUnion(
+            mesh_device,
+            hidden,
+            slice_pad,
+            0.0,
+            1.0,
+            readers=gate_up_readers,
+            rows=rows,
+            dense_silu=True,
+            max_experts=slices,
+            weight_dtype=weight_dtype,
+            exclude=taken,
+        )
+        taken += [(c.x, c.y) for c, *_ in self.gate_up.assignments]
+        self.down = ExpertDownUnion(
+            mesh_device,
+            hidden,
+            slice_pad,
+            readers=down_readers,
+            rows=rows,
+            expert_outer=True,
+            max_experts=slices,
+            weight_dtype=weight_dtype,
+            num_buffers=2,
+            exclude=taken,
+        )
+        self.G, self.D = self.gate_up.cores, self.down.cores
+        self.defines = MOE + [("MOE_NO_ROUTER", "1"), ("MOE_CTR_SEM", str(self.CTR_SEM))]
+
+    def __call__(self, pending, union, weights, gate_up_ws, act, down_ws, partial):
+        b = self.boundary
+        hx, hy = b.noc_xy
+        bk, bcbs, bsems, bio = b.consumer_parts(pending, self.G, notify_in_reader=True)
+        x = pending.x
+        gprog, gio = self.gate_up(
+            x, union, weights, gate_up_ws, act, build_only=True, extra_defines=self.defines, extra_writer_rt=[0, hx, hy]
+        )
+        dprog, dio = self.down(
+            act,
+            union,
+            weights,
+            down_ws,
+            partial,
+            build_only=True,
+            extra_defines=self.defines,
+            extra_writer_rt=[0, hx, hy, self.G.num_cores()],
+            notify_args=[1, hx, hy, 2],
+        )
+        sems = list(bsems) + [ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, self.D.merge(b.cores), 0)]
+        sems += [
+            ttnn.SemaphoreDescriptor(self.CTR_SEM + s, ttnn.CoreType.WORKER, b.cores, 0) for s in range(self.slices)
+        ]
+        mesh_program = ttnn.MeshProgramDescriptor()
+        n_d = self.D.num_cores()
+        for coord in b.coords:
+            program = ttnn.ProgramDescriptor(
+                kernels=list(bk) + list(gprog.kernels) + list(dprog.kernels),
+                semaphores=list(sems),
+                cbs=list(bcbs) + list(gprog.cbs) + list(dprog.cbs),
+            )
+            b._add_sender(coord, program, b._sender_kernel(coord, partial, "moe", producers=n_d, sem_id=2))
+            mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
+        io = []
+        for t in [*bio, *gio, *dio]:
+            if all(t is not u for u in io):
+                io.append(t)
+        ttnn.generic_op(io, mesh_program)
