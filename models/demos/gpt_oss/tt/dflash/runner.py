@@ -12,6 +12,7 @@ import os
 import time
 
 import torch
+from loguru import logger
 
 import ttnn
 
@@ -206,39 +207,78 @@ class FastDFlashRunner:
         return self.verify.argmax()
 
     def capture_traces(self):
+        """Capture the verify, drafter and context traces (call after one eager generate, which compiles the drafter).
+
+        A replayed trace writes to its intermediates' addresses, which are free again once the capture ends: a buffer
+        that is allocated after the capture and still alive at a replay can be overwritten. Every verify variant is
+        therefore compiled before the first capture (the programs' cached buffers and CCL semaphores are allocated by
+        their first run), and prefill re-captures the traces when a prompt compiled new programs (see prefill)."""
         mesh = self.model.mesh_device
         v = self.verify
-        if v.row_attn is not None:
-            # long-context trace: full-attention layers on ttnn SDPA (row attention holds row_attn_max positions);
-            # the sliding-window layers keep row attention (128-position window)
-            v.use_row_attn = False
-            v.forward()
-            self.verify_trace_long = ttnn.begin_trace_capture(mesh, cq_id=0)
-            v.forward()
-            ttnn.end_trace_capture(mesh, self.verify_trace_long, cq_id=0)
-            v.use_row_attn = True
-            v.forward()  # warm the full-attention layers' row-attention programs (the kernels clamp the chunk count)
-        self.verify_trace = ttnn.begin_trace_capture(mesh, cq_id=0)
-        v.forward()
-        ttnn.end_trace_capture(mesh, self.verify_trace, cq_id=0)
+        lengths, rows, hi, variant = self.compile_variants()
+        traces = {}
+        for r in rows:
+            for long in lengths:
+                variant(long, r)
+                tid = ttnn.begin_trace_capture(mesh, cq_id=0)
+                v.forward()
+                ttnn.end_trace_capture(mesh, tid, cq_id=0)
+                traces[long, r] = tid
+        variant(False, hi)
+        self.verify_trace = traces[False, hi]
+        self.verify_trace_long = traces.get((True, hi))
+        self.low_traces = {long: traces[long, self.rows_low] for long in lengths} if self.rows_low else {}
+        self.draft.capture_traces()
+
+    def compile_variants(self):
+        """One eager verify pass per traced variant (compiles them; capture_traces calls it, and a caller that captures
+        other traces first calls it before those). Returns (lengths, row counts, full row count, variant setter)."""
+        v = self.verify
         # DFLASH_VERIFY_ROWS_LOW=r: also traces verifying only the first r rows, used for the round after one that
         # accepted fewer than DFLASH_VERIFY_ADAPT tokens (low acceptance: the capped rows rarely matter)
         self.rows_low = int(os.environ.get("DFLASH_VERIFY_ROWS_LOW", "0"))
         self.adapt = int(os.environ.get("DFLASH_VERIFY_ADAPT", "4"))
+        # long: full-attention layers on ttnn SDPA (row attention holds row_attn_max positions; the sliding-window
+        # layers keep row attention, 128-position window); short: row attention everywhere
+        lengths = ([True] if v.row_attn is not None else []) + [False]
+        hi = v.active_rows
+        rows = [hi] + ([self.rows_low] if self.rows_low else [])
+
+        def variant(long, r):
+            v.use_row_attn = v.row_attn is not None and not long
+            v.active_rows = r
+
+        for r in rows:  # (the row-attention kernels clamp the chunk count)
+            for long in lengths:
+                variant(long, r)
+                v.forward()
+        variant(False, hi)
+        return lengths, rows, hi, variant
+
+    def release_traces(self):
+        mesh = self.model.mesh_device
+        tids = [self.verify_trace, getattr(self, "verify_trace_long", None), *getattr(self, "low_traces", {}).values()]
+        tids += [self.draft.trace_ctx, self.draft.trace_draft]
+        for tid in tids:
+            if tid is not None:
+                ttnn.release_trace(mesh, tid)
+        self.verify_trace = self.verify_trace_long = None
         self.low_traces = {}
-        if self.rows_low:
-            hi = v.active_rows
-            v.active_rows = self.rows_low
-            for long in ([True] if v.row_attn is not None else []) + [False]:
-                v.use_row_attn = not long
-                v.forward()
-                tid = ttnn.begin_trace_capture(mesh, cq_id=0)
-                v.forward()
-                ttnn.end_trace_capture(mesh, tid, cq_id=0)
-                self.low_traces[long] = tid
-            v.active_rows = hi
-            v.use_row_attn = v.row_attn is not None
-        self.draft.capture_traces()
+        self.draft.trace_ctx = self.draft.trace_draft = None
+
+    def warm_prefill(self, max_len=None):
+        """Compile the prefill of every padded prompt length up to max_len (default: the KV cache's capacity) and the
+        drafter's prompt-context chunk sizes (64 .. 256 rows), so that no later prompt compiles programs after the
+        traces are captured (which would make prefill re-capture them). Call before capture_traces."""
+        cap = self.page_table.shape[-1] * self.verify.kv_cache[0][0].shape[2]
+        max_len = min(cap, max_len or cap)
+        lengths = [n for n in (64, 128, 192) if n <= max_len]
+        n = 1024  # prefill pads to 128, 1024, then powers of 2 (tt_transformers get_padded_prefill_len)
+        while n <= max_len:
+            lengths.append(n)
+            n *= 2
+        for n in lengths:
+            self._prefill([0] * n)
 
     def _verify_trace_for(self, start, low=False):
         v = self.verify
@@ -248,6 +288,25 @@ class FastDFlashRunner:
         return self.verify_trace_long if long else self.verify_trace
 
     def prefill(self, prompt_ids):
+        """The target's prefill + the drafter's prompt context; returns the target's next token. A prompt shape seen
+        for the first time after capture_traces compiles new programs, whose persistent buffers (program-cache buffers,
+        the all-reduce's global semaphores) can sit where the traces' intermediates were: a replay overwrites them
+        (a corrupted semaphore hung the next prefill's all-reduce). The traces are then re-captured, now laid out
+        around those buffers, and the prefill is repeated (the capture's eager verify passes write K / V rows)."""
+        mesh = self.model.mesh_device
+        n0 = mesh.num_program_cache_entries()
+        first = self._prefill(prompt_ids)
+        if self.verify_trace is not None and mesh.num_program_cache_entries() != n0:
+            logger.warning(
+                f"DFlash: prompt length {len(prompt_ids)} compiled new prefill programs after the trace capture; "
+                "re-capturing the traces (warm_prefill avoids this)"
+            )
+            self.release_traces()
+            self.capture_traces()
+            first = self._prefill(prompt_ids)
+        return first
+
+    def _prefill(self, prompt_ids):
         L = len(prompt_ids)
         logits = self.generator.prefill_forward_text(
             torch.tensor([prompt_ids]),

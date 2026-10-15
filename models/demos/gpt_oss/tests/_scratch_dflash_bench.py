@@ -58,8 +58,18 @@ def test_dflash_bench(mesh_device, device_params):
     sampling = SamplingParams(temperature=[0], top_k=[1], top_p=[1.0], enable_log_probs=[False], num_logprobs=[0])
     which = [int(i) for i in os.environ["BENCH_PROMPTS"].split(",")] if os.environ.get("BENCH_PROMPTS") else None
     prompts = [p for i, p in enumerate(PROMPTS) if which is None or i in which]
+    # BENCH_RANDOM=n: n prompts of 100 uniformly random (non-special) token ids, each run twice: as the text of a
+    # chat user message ("rchat") and as raw ids with no chat template ("rraw")
+    n_rand = int(os.environ.get("BENCH_RANDOM", "0"))
+    if n_rand:
+        g = torch.Generator().manual_seed(0)
+        rand_ids = [torch.randint(0, 199998, (100,), generator=g).tolist() for _ in range(n_rand)]
+        prompts = [("rchat", tokenizer.decode(r)) for r in rand_ids] + [("rraw", r) for r in rand_ids]
+        prompts = [p for i, p in enumerate(prompts) if which is None or i in which]
 
     def encode(text):
+        if isinstance(text, list):
+            return list(text)
         e = tokenizer.apply_chat_template(
             [{"role": "user", "content": text}], add_generation_prompt=True, tokenize=True
         )
@@ -104,33 +114,54 @@ def test_dflash_bench(mesh_device, device_params):
 
     # warm up both paths (compile + trace capture) on the first prompt
     ids0 = encode(prompts[0][1])
-    first = fast.prefill(ids0)
-    fast.generate(ids0, 16, first=first)
-    fast.capture_traces()
-    first = fast.prefill(ids0)
-    plain_decode(ids0, first)
+    plain_only = os.environ.get("BENCH_PLAIN_ONLY") == "1"  # (debugging: prefill + plain decode only, no DFlash)
+    no_plain = os.environ.get("BENCH_NO_PLAIN") == "1"  # (debugging: DFlash only)
+    # everything is compiled before the first trace capture (a buffer allocated after a capture can be overwritten by
+    # its replays): every prefill length (BENCH_WARM_PREFILL=0: none, the runner then re-captures on new lengths),
+    # the DFlash programs, then the plain decode trace, then the DFlash traces
+    if os.environ.get("BENCH_WARM_PREFILL", "1") == "1":
+        fast.warm_prefill()
+    if not plain_only:
+        first = fast.prefill(ids0)
+        fast.generate(ids0, 16, first=first)
+        fast.compile_variants()
+    if not no_plain:
+        first = fast.prefill(ids0)
+        plain_decode(ids0, first)
+    if not plain_only:
+        fast.capture_traces()
 
     rows = []
     for cat, text in prompts:
         ids = encode(text)
-        first = fast.prefill(ids)
-        toks, acc, tm = fast.generate(ids, NEW, first=first)
-        n = min(len(toks), NEW)
-        r = tm["rounds"]
-        d_ms = sum(sum(x) for x in r) * 1e3  # all rounds (issue + wait / read + context)
-        d_tps = n / d_ms * 1e3
+        if plain_only:
+            first = fast.prefill(ids)
+            toks, _ = plain_decode(ids, first)
+            acc, n, d_tps = [1], len(toks), 1.0
+        else:
+            first = fast.prefill(ids)
+            toks, acc, tm = fast.generate(ids, NEW, first=first)
+            n = min(len(toks), NEW)
+            r = tm["rounds"]
+            d_ms = sum(sum(x) for x in r) * 1e3  # all rounds (issue + wait / read + context)
+            d_tps = n / d_ms * 1e3
+        if no_plain:
+            print(f"BENCH {cat}: {n} tokens, accept {sum(acc) / len(acc):.2f}, DFlash {d_tps:.1f} tok/s/u", flush=True)
+            continue
         first = fast.prefill(ids)
         plain, p_ms = plain_decode(ids, first)
         same = toks[:n] == plain[:n]
         bad = next((i for i in range(n) if toks[i] != plain[i]), None)
         rows.append((cat, sum(acc) / len(acc), d_tps, 1e3 / p_ms))
+        if os.environ.get("BENCH_SHOW"):  # the generated text
+            print(f"BENCHTXT {cat}: {tokenizer.decode(toks[:n])!r}"[:1500], flush=True)
         print(
-            f"BENCH {cat} '{text[:40]}': {n} tokens, accept {sum(acc) / len(acc):.2f}, DFlash {d_tps:.1f} tok/s/u, "
+            f"BENCH {cat} '{str(text)[:40]}': {n} tokens, accept {sum(acc) / len(acc):.2f}, DFlash {d_tps:.1f} tok/s/u, "
             f"plain {1e3 / p_ms:.1f} tok/s/u ({p_ms:.3f} ms/token) -> {d_tps * p_ms / 1e3:.2f}x; == plain greedy: "
             f"{same}{'' if same else f' (first difference at token {bad})'}",
             flush=True,
         )
-    for cat in ("math", "code", "chat", None):
+    for cat in ("math", "code", "chat", "rchat", "rraw", None):
         sel = [x for x in rows if cat is None or x[0] == cat]
         if not sel:
             continue
