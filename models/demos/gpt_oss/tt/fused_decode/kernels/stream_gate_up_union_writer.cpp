@@ -58,17 +58,29 @@ void kernel_main() {
     // scratch: [union (128 B) | weights (64 rows B)]
     cb_reserve_back(cb_scr, 1);
     const uint32_t scr = get_write_ptr(cb_scr);
+#ifndef MOE_FUSED
     noc_async_read(s_uni.get_noc_addr(0), scr, 128);
     noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
+#endif
     cb_reserve_back(cb_id, 1);
     noc_async_read(s_id.get_noc_addr(0), get_write_ptr(cb_id), ident_bytes);
     cb_reserve_back(cb_x, kx + 1);
     const uint32_t x_l1 = get_write_ptr(cb_x);
+#ifdef MOE_FUSED
+    // Fused MoE program (dflash/moe_fused.py): x once the boundary packed it (program semaphore 0), the union and
+    // weights once the router wrote them (semaphore 1).
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), 1);
+#endif
     noc_async_read(s_x.get_noc_addr(0), x_l1, kx * tiny_bytes);
     volatile tt_l1_ptr uint16_t* ones = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(x_l1 + kx * tiny_bytes);
     for (uint32_t i = 0; i < 32 * rows; ++i) {
         ones[i] = (i < 16 * rows && i % 16 < nbias) ? 0x3F80 : 0;  // BF16 1.0
     }
+#ifdef MOE_FUSED
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1)), 1);
+    noc_async_read(s_uni.get_noc_addr(0), scr, 128);
+    noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
+#endif
     noc_async_read_barrier();
     invalidate_l1_cache();
     cb_push_back(cb_x, kx + 1);
@@ -104,6 +116,16 @@ void kernel_main() {
             noc_async_writes_flushed();
             cb_pop_front(cb_act, 1);
         }
+#ifdef MOE_FUSED
+        // slot e's columns of this core are in DRAM: count them in the router core's counter e (runtime args 6..8:
+        // counters address, router noc x, y); the down cores start on slot e once every gate|up core has.
+        noc_async_write_barrier();
+        noc_semaphore_inc(
+            get_noc_addr(get_arg_val<uint32_t>(7), get_arg_val<uint32_t>(8), get_arg_val<uint32_t>(6) + 16 * e), 1);
+#endif
     }
+#ifdef MOE_FUSED
+    noc_async_atomic_barrier();
+#endif
     noc_async_write_barrier();
 }

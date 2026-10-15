@@ -135,4 +135,15 @@ void kernel_main() {
     if constexpr (do_norm) {
         cb_push_back(cb_gamma, tiles);
     }
+#ifdef BND_NOTIFY
+    // The consumer notification (else kernels/boundary_notify.cpp on BRISC, which a fused sender may need): once the
+    // compute packed x, increment program semaphore BND_NOTIFY_SEM on every consumer core (runtime args 3..: noc x, y).
+    cb_wait_front(BND_NOTIFY_CB_X, tiles);
+    const uint32_t nsem = get_semaphore(BND_NOTIFY_SEM);
+    for (uint32_t i = 0; i < BND_NOTIFY_N; ++i) {
+        noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(3 + 2 * i), get_arg_val<uint32_t>(4 + 2 * i), nsem), 1);
+    }
+    noc_async_atomic_barrier();
+    cb_pop_front(BND_NOTIFY_CB_X, tiles);
+#endif
 }

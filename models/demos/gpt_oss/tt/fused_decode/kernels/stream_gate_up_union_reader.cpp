@@ -35,6 +35,10 @@ void kernel_main() {
     constexpr uint32_t tail = col_bytes - full_pkts * pkt;
     (void)page_bytes;
 
+#ifdef MOE_FUSED
+    // fused MoE program (dflash/moe_fused.py): the router's union is written (program semaphore 1)
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1)), 1);
+#endif
     cb_reserve_back(cb_idx, 1);
     const uint32_t idx_l1 = get_write_ptr(cb_idx);
     const auto s_uni = TensorAccessor(uni_args, uni_addr, 128);

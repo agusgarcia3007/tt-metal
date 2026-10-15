@@ -442,7 +442,7 @@ class DecodeBoundary:
             reduced.deallocate(True)
         return out_res, out_x
 
-    def consumer_parts(self, pending, consumer_cores):
+    def consumer_parts(self, pending, consumer_cores, notify_in_reader=False):
         """Boundary fused into the program of the op that consumes its normed output (`pending`, a PendingBoundary whose
         partial the producer op already sent, or an entry boundary): the boundary core's reader and compute plus a
         notifier (kernels/boundary_notify.cpp) that, once x is packed, increments program semaphore 0 on every
@@ -457,6 +457,21 @@ class DecodeBoundary:
         consumer_list = ttnn.corerange_to_cores(consumer_cores, row_wise=True)
         noc = [self.mesh_device.worker_core_from_logical_core(c) for c in consumer_list]
         rt[self.core.x][self.core.y] = [v for p in noc for v in (p.x, p.y)]
+        semaphores = [ttnn.SemaphoreDescriptor(0, ttnn.CoreType.WORKER, consumer_cores.merge(self.cores), 0)]
+        pending.residual_out, pending.x = out_res, out_x
+        if notify_in_reader:
+            # the reader notifies (frees BRISC for a fused fabric sender)
+            ks = kernels(self.coords[0])
+            ks[0].defines = list(ks[0].defines or []) + [
+                ("BND_NOTIFY", "1"),
+                ("BND_NOTIFY_CB_X", str(cb_x)),
+                ("BND_NOTIFY_N", str(len(noc))),
+                ("BND_NOTIFY_SEM", "0"),
+            ]
+            ks[0].runtime_args[self.core.x][self.core.y] = list(ks[0].runtime_args[self.core.x][self.core.y]) + [
+                v for p in noc for v in (p.x, p.y)
+            ]
+            return ks, cbs, semaphores, io
         notifier = ttnn.KernelDescriptor(
             kernel_source=str(KERNEL_DIR / "boundary_notify.cpp"),
             core_ranges=self.cores,

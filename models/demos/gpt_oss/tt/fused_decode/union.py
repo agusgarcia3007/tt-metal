@@ -102,9 +102,10 @@ class ExpertGateUpUnion(_BankStreamOp):
         dense_silu=False,
         max_experts=MAX_EXPERTS,
         weight_dtype=ttnn.bfloat4_b,
+        exclude=(),
     ):
         """dense_silu: plain silu(g) * u (a dense MLP run as one union expert, e.g. the DFlash drafter)."""
-        super().__init__(mesh_device, readers)
+        super().__init__(mesh_device, readers, exclude=exclude)
         self.dense_silu = dense_silu
         self.max_experts = max_experts
         self.rows = rows
@@ -124,7 +125,7 @@ class ExpertGateUpUnion(_BankStreamOp):
     def weight_rows(self, num_experts):
         return num_experts * 2 * self.P * self.kt * TILE
 
-    def __call__(self, x, union, weights, w_stream, act):
+    def __call__(self, x, union, weights, w_stream, act, build_only=False, extra_defines=None, extra_writer_rt=None):
         M = self.rows
         cb_x, cb_w, cb_idx, cb_scr, cb_sc, cb_id, cb_act = 0, 1, 2, 3, 4, 5, 16
         tiny = TINY_BYTES * M
@@ -154,7 +155,7 @@ class ExpertGateUpUnion(_BankStreamOp):
                 weights.buffer_address(),
                 union.buffer_address(),
                 ident.buffer_address(),
-            ]
+            ] + list(extra_writer_rt or [])
         reader_ct = [cb_w, cb_idx, self.kt, 2 * self.pairs, self.expert_stride, self.tile_bytes, self.page_bytes]
         reader_ct += ttnn.TensorAccessorArgs(union).get_compile_time_args()
         act_page = self.inter_pad // TILE * tiny
@@ -173,8 +174,10 @@ class ExpertGateUpUnion(_BankStreamOp):
             writer_rt,
             compute_ct,
             "gate_up_union",
-            defines=[("ROWS", str(M))] + ([("DENSE_SILU", "1")] if self.dense_silu else []),
+            defines=[("ROWS", str(M))] + ([("DENSE_SILU", "1")] if self.dense_silu else []) + list(extra_defines or []),
         )
+        if build_only:
+            return program, [w_stream, x, union, weights, ident, act]
         return ttnn.generic_op([w_stream, x, union, weights, ident, act], program)
 
 
@@ -194,11 +197,12 @@ class ExpertDownUnion(_BankStreamOp):
         max_experts=MAX_EXPERTS,
         weight_dtype=ttnn.bfloat4_b,
         num_buffers=3,
+        exclude=(),
     ):
         """num_buffers: weight blocks in the reader's ring (expert-outer; 2 when the blocks are large).
         expert_outer: kernels/stream_down_union2_*: each core reads its columns of one expert as one contiguous
         block and accumulates its (<= 4) output tiles across the experts in DST (larger DRAM reads)."""
-        super().__init__(mesh_device, readers)
+        super().__init__(mesh_device, readers, exclude=exclude)
         self.rows = rows
         self.hidden = hidden
         self.inter_pad = inter_pad
@@ -222,8 +226,22 @@ class ExpertDownUnion(_BankStreamOp):
     def weight_rows(self, num_experts):
         return num_experts * self.C * self.seg_tiles * TILE
 
-    def __call__(self, act, union, weights, w_stream, out, send=None):
-        """send = (boundary, site): fuse the boundary all-reduce's fabric send (DecodeBoundary.sending_program)."""
+    def __call__(
+        self,
+        act,
+        union,
+        weights,
+        w_stream,
+        out,
+        send=None,
+        build_only=False,
+        extra_defines=None,
+        extra_writer_rt=None,
+        notify_args=None,
+    ):
+        """send = (boundary, site): fuse the boundary all-reduce's fabric send (DecodeBoundary.sending_program).
+        notify_args (build_only): the writers' sender notification [1, x, y, semaphore id] (a fused program's sender).
+        """
         M = self.rows
         cb_in0, cb_w, cb_idx, cb_scr, cb_out = 0, 1, 2, 3, 16
         tiny = TINY_BYTES * M
@@ -232,7 +250,7 @@ class ExpertDownUnion(_BankStreamOp):
             self._cb(cb_in0, ttnn.bfloat16, tiny, self.max_experts * self.seg_tiles, tiny=True, rows=M),
             self._cb(cb_w, self.weight_dtype, self.tile_bytes, self.num_buffers * block),
             self._cb(cb_idx, ttnn.uint16, 128, 1),
-            self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M, 1),
+            self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 32, 1),
             self._cb(cb_out, ttnn.bfloat16, tiny, 4, tiny=True, rows=M),
         ]
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -250,7 +268,7 @@ class ExpertDownUnion(_BankStreamOp):
                 out.buffer_address(),
                 bank * self.C + r * self.cols,
                 union.buffer_address(),
-            ]
+            ] + list(extra_writer_rt or [])
         if self.expert_outer:
             reader_ct = [cb_w, cb_idx, self.seg_tiles, self.cols, self.expert_stride, self.tile_bytes, self.page_bytes]
             reader_ct.append(self.num_buffers)
@@ -261,14 +279,26 @@ class ExpertDownUnion(_BankStreamOp):
         writer_ct = [cb_in0, cb_out, cb_scr, self.seg_tiles, M, NBIAS, self.cols, self.hidden // TILE, act_page]
         for t in (act, weights, out, union):
             writer_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
-        writer_ct += send[0].notify_args() if send else [0, 0, 0, 0]
+        writer_ct += notify_args if notify_args is not None else (send[0].notify_args() if send else [0, 0, 0, 0])
         compute_ct = [cb_in0, cb_w, cb_out, self.seg_tiles, self.cols]
         if not self.expert_outer:
             compute_ct.append(self.chunk)
         name = "down_union2" if self.expert_outer else "down_union"
 
         def build():
-            return self._program(name, cbs, reader_ct, reader_rt, writer_ct, writer_rt, compute_ct, name)
+            return self._program(
+                name,
+                cbs,
+                reader_ct,
+                reader_rt,
+                writer_ct,
+                writer_rt,
+                compute_ct,
+                name,
+                defines=list(extra_defines or []),
+            )
 
+        if build_only:
+            return build(), [w_stream, act, union, weights, out]
         program = send[0].sending_program(build, out, send[1], self.cores) if send else build()
         return ttnn.generic_op([w_stream, act, union, weights, out], program)

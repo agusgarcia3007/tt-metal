@@ -123,6 +123,22 @@ class FusedVerify:
             rows=M,
             expert_outer=os.environ.get("DFLASH_DOWN_EO", "1") == "1",
         )
+        self.moe_fused = None
+        if os.environ.get("DFLASH_MOE_FUSED", "1") == "1" and self.boundary.ccl == "fabric":
+            from .moe_fused import MoEFused
+
+            self.moe_fused = MoEFused(
+                mesh,
+                self.boundary,
+                self.router,
+                H,
+                inter_pad,
+                ex.config.swiglu_limit,
+                ex.config.alpha,
+                M,
+                gate_up_readers=GATE_UP_STREAM_READERS,
+                down_readers=int(os.environ.get("DFLASH_DOWN_READERS", "3")),
+            )
         term = model.decode_terminal
         self.vd = term.vd
         lm_readers = int(os.environ.get("DFLASH_LM_READERS", "2"))
@@ -265,10 +281,28 @@ class FusedVerify:
             sdpa.deallocate(True)
             pending = PendingBoundary(b, res, self.gamma_post[i], self.partial, "attn", sent=True)
             mlp = layer.mlp
+            dw = mlp.experts.decode_weights
+            if self.moe_fused is not None:
+                self.moe_fused(
+                    pending,
+                    mlp.router.weight_stream,
+                    self.union,
+                    self.weights,
+                    dw.gate_up_stream,
+                    self.act,
+                    dw.down_stream,
+                    self.partial,
+                )
+                res = pending.residual_out
+                pending.residual.deallocate(True)
+                pending.x.deallocate(True)
+                last = i + 1 == len(self.layers)
+                gamma = self.gamma_final if last else self.gamma_in[i + 1]
+                pending = PendingBoundary(b, res, gamma, self.partial, "moe", sent=True)
+                continue
             self.router(pending, mlp.router.weight_stream, (self.union, self.weights))
             res, x = pending.residual_out, pending.x
             pending.residual.deallocate(True)
-            dw = mlp.experts.decode_weights
             if getattr(self, "union_log", None) is not None:  # debugging: union size per layer (host read, eager)
                 self.union_log.append(int(ttnn.to_torch(ttnn.get_device_tensors(self.union)[0]).reshape(-1)[0]))
             self.gate_up(x, self.union, self.weights, dw.gate_up_stream, self.act)

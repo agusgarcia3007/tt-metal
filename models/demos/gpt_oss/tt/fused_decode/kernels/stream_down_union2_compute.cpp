@@ -31,9 +31,14 @@ void kernel_main() {
     MATH(num_sel = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
     PACK(num_sel = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
 
+#ifndef MOE_FUSED
     cb_wait_front(cb_in0, num_sel * seg_tiles);
+#endif
     tile_regs_acquire();
     for (uint32_t e = 0; e < num_sel; ++e) {
+#ifdef MOE_FUSED
+        cb_wait_front(cb_in0, (e + 1) * seg_tiles);  // slot e's activation (the writer pushes slot by slot)
+#endif
         cb_wait_front(cb_w, cols * seg_tiles);
         for (uint32_t c = 0; c < cols; ++c) {
             if (e + 1 == num_sel) {

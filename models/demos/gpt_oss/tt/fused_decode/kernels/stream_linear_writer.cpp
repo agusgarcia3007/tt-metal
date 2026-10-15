@@ -576,6 +576,23 @@ void kernel_main() {
         noc_async_atomic_barrier();
     }
     noc_async_write_barrier();
+#ifdef MOE_FUSED
+    // Router of the fused MoE program (dflash/moe_fused.py): zero the per-slot expert-done counters (16 B apart, in
+    // this core's L1, runtime arg 5), then release the gate|up and down cores (program semaphore 1; runtime args 6:
+    // their count, 7..: noc x, y). The union / weights writes above are complete (barrier).
+    {
+        volatile tt_l1_ptr uint32_t* ctr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_val<uint32_t>(5));
+        for (uint32_t i = 0; i < 32 * 4; ++i) {
+            ctr[i] = 0;
+        }
+        const uint32_t n = get_arg_val<uint32_t>(6);
+        const uint32_t sem = get_semaphore(1);
+        for (uint32_t i = 0; i < n; ++i) {
+            noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(7 + 2 * i), get_arg_val<uint32_t>(8 + 2 * i), sem), 1);
+        }
+        noc_async_atomic_barrier();
+    }
+#endif
     if constexpr (notify) {
         // Fused all-reduce send (fused_decode/boundary.py: DecodeBoundary.sending_program): this core's columns of the
         // partial sum are written; tell the boundary core's sender.

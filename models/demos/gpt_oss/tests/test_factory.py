@@ -120,6 +120,14 @@ class TestFactory:
 L1_SMALL_SIZE = 16384
 
 
+def _worker_l1_param():
+    """GPT_OSS_KERNEL_CONFIG_EXTRA_KB=n: n KB more kernel-config ring per worker (taken from the L1 allocator), so
+    dispatch can stage a large program's binaries while the previous program runs (Blackhole default ring 69 KB,
+    allocator space 1461120 B)."""
+    extra = int(os.environ.get("GPT_OSS_KERNEL_CONFIG_EXTRA_KB", "0"))
+    return {"worker_l1_size": 1461120 - extra * 1024} if extra else {}
+
+
 def parametrize_mesh_with_fabric(mesh_shapes=None):
     """Universal mesh + fabric parametrization for gpt_oss tests.
 
@@ -188,6 +196,7 @@ def parametrize_mesh_with_fabric(mesh_shapes=None):
                     "fabric_config": (None if shape == (1, 1) else ttnn.FabricConfig.FABRIC_1D_RING),
                     "l1_small_size": L1_SMALL_SIZE,
                     TRACE_MODEL_KEY_PARAM: "gpt-oss-120b",
+                    **_worker_l1_param(),
                 },
                 id=f"{shape[0]}x{shape[1]}",
             )

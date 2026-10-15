@@ -53,6 +53,13 @@ void kernel_main() {
     const auto s_out = TensorAccessor(out_args, out_addr, 2048);
     const auto s_uni = TensorAccessor(uni_args, uni_addr, 128);
 
+#ifdef MOE_FUSED
+    // Fused MoE program (dflash/moe_fused.py): wait for the router (program semaphore 1); runtime args 5..8: the
+    // counters address, router noc x, y, the gate|up core count.
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(1)), 1);
+    const uint64_t ctr_noc = get_noc_addr(get_arg_val<uint32_t>(6), get_arg_val<uint32_t>(7), get_arg_val<uint32_t>(5));
+    const uint32_t producers = get_arg_val<uint32_t>(8);
+#endif
     cb_reserve_back(cb_scr, 1);
     const uint32_t scr = get_write_ptr(cb_scr);
     noc_async_read(s_uni.get_noc_addr(0), scr, 128);
@@ -69,15 +76,30 @@ void kernel_main() {
     cb_reserve_back(cb_in0, num_sel * seg_tiles);
     const uint32_t in0 = get_write_ptr(cb_in0);
     for (uint32_t e = 0; e < num_sel; ++e) {
+#ifdef MOE_FUSED
+        // Slot e is complete once all gate|up cores counted it; push each slot as it arrives (compute waits per slot).
+        volatile tt_l1_ptr uint32_t* poll = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128 + 64 * rows);
+        do {
+            noc_async_read(ctr_noc + 16 * e, scr + 128 + 64 * rows, 16);
+            noc_async_read_barrier();
+            invalidate_l1_cache();
+        } while (poll[0] < producers);
+#endif
         noc_async_read(s_act.get_noc_addr(e), in0 + e * seg_tiles * tiny_bytes, act_page_bytes);
         volatile tt_l1_ptr uint16_t* aug =
             reinterpret_cast<volatile tt_l1_ptr uint16_t*>(in0 + (e * seg_tiles + seg_tiles - 1) * tiny_bytes);
         for (uint32_t i = 0; i < 32 * rows; ++i) {
             aug[i] = (i < 16 * rows && i % 16 < nbias) ? w[(i / 16) * 32 + e] : 0;
         }
+#ifdef MOE_FUSED
+        noc_async_read_barrier();
+        cb_push_back(cb_in0, seg_tiles);
+#endif
     }
+#ifndef MOE_FUSED
     noc_async_read_barrier();
     cb_push_back(cb_in0, num_sel * seg_tiles);
+#endif
 
     for (uint32_t c = 0; c < cols; ++c) {
         cb_wait_front(cb_out, 1);

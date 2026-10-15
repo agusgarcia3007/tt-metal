@@ -188,7 +188,9 @@ class _BankStreamOp:
     coalesced into rectangles: dispatch writes kernel binaries and arguments per core range, and single-core ranges
     made multi-reader programs measurably slower to launch under trace."""
 
-    def __init__(self, mesh_device, readers, active_banks=None):
+    def __init__(self, mesh_device, readers, active_banks=None, exclude=()):
+        """exclude: logical (x, y) cores to leave free (a fused program's other kernels); a bank's readers then also
+        spill onto the neighbouring rows when its own row is full."""
         self.mesh_device = mesh_device
         self.banks = mesh_device.dram_grid_size().x
         self.readers = readers
@@ -196,18 +198,24 @@ class _BankStreamOp:
         assert len(bank_workers) == self.banks
         bank_workers = bank_workers[: active_banks or self.banks]
         grid = mesh_device.compute_with_storage_grid_size()
-        used = {(c.x, c.y) for c in bank_workers}
+        exclude = {tuple(c) for c in exclude}
+        used = {(c.x, c.y) for c in bank_workers} | exclude
         placed = []
         for bank, core in enumerate(bank_workers):
-            cores = [core]
-            dx = 1
-            while len(cores) < readers:
-                assert dx < grid.x, f"no room for {readers} readers next to bank {bank} worker {core}"
-                for x in (core.x + dx, core.x - dx):
-                    if 0 <= x < grid.x and (x, core.y) not in used and len(cores) < readers:
-                        cores.append(ttnn.CoreCoord(x, core.y))
-                        used.add((x, core.y))
-                dx += 1
+            cores = [] if (core.x, core.y) in exclude else [core]
+            # along the row (+dx before -dx); with exclusions, nearest first (Manhattan) over the rows within 2
+            cand = [(dx, 0) for d in range(1, grid.x) for dx in (d, -d)]
+            if exclude:
+                cand = sorted(
+                    ((dx, dy) for dx in range(-grid.x, grid.x) for dy in range(-2, 3)),
+                    key=lambda p: (abs(p[0]) + abs(p[1]), abs(p[1]), abs(p[0]), p[0] < 0, p[1] < 0),
+                )
+            for dx, dy in cand:
+                x, y = core.x + dx, core.y + dy
+                if len(cores) < readers and 0 <= x < grid.x and 0 <= y < grid.y and (x, y) not in used:
+                    cores.append(ttnn.CoreCoord(x, y))
+                    used.add((x, y))
+            assert len(cores) == readers, f"no room for {readers} readers next to bank {bank} worker {core}"
             placed += [(c, bank, r) for r, c in enumerate(cores)]
         vcs = []
         for i, (core, bank, r) in enumerate(placed):
@@ -251,6 +259,7 @@ class _BankStreamOp:
                 compile_time_args=reader_ct,
                 runtime_args=reader_rt,
                 config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_0),
+                defines=defines or [],
             ),
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / f"stream_{name}_writer.cpp"),
@@ -478,7 +487,19 @@ class LinearStream(_BankStreamOp):
         first = bank * self.C + r * self.cols
         return [order[first + c] for c in range(self.cols)]
 
-    def __call__(self, x, weights, out, send=None, exchange=None, rope_kv=None):
+    def __call__(
+        self,
+        x,
+        weights,
+        out,
+        send=None,
+        exchange=None,
+        rope_kv=None,
+        build_only=False,
+        consumer_cores=None,
+        extra_defines=None,
+        extra_writer_rt=None,
+    ):
         """send = (boundary, site), out_mode 5: fuse the boundary all-reduce's fabric send (fused_decode/boundary.py
         sending_program). x may be a fused_decode.boundary.PendingBoundary: the boundary producing x then runs inside
         this op (DecodeBoundary.consumer_parts) while the weight readers stream ahead. exchange (out_mode 3): an object
@@ -490,7 +511,9 @@ class LinearStream(_BankStreamOp):
         pending = None
         if not isinstance(x, ttnn.Tensor):
             pending = x
-            fused_kernels, fused_cbs, fused_semaphores, fused_io = pending.boundary.consumer_parts(pending, self.cores)
+            fused_kernels, fused_cbs, fused_semaphores, fused_io = pending.boundary.consumer_parts(
+                pending, consumer_cores or self.cores, notify_in_reader=consumer_cores is not None
+            )
             x = pending.x
         if self.out_mode == 3:
             outs = tuple(out)
@@ -552,6 +575,8 @@ class LinearStream(_BankStreamOp):
                 writer_rt[core.x][core.y] = (
                     list(writer_rt[core.x][core.y]) + rope_kv.writer_runtime_args() + self._slot_columns(bank, r, order)
                 )
+            if extra_writer_rt is not None:
+                writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + list(extra_writer_rt)
         reader_ct = [cb_w, self.kt, self.cols, self.tile_bytes, self.page_bytes, w_cols]
         writer_ct = [cb_x, cb_out, cb_scr, self.kx, self.x_pages, NBIAS, self.cols, self.n_tiles, self.out_mode]
         writer_ct += [self.out_page_bytes, stage, cb_stage, self.heads[0], self.heads[1], self.head_tiles]
@@ -574,6 +599,8 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("ROWS", str(M))]
         if self.x_tile_rows:
             defines = defines + [("X_TILE_ROWS", "1")]
+        if extra_defines:
+            defines = (defines or []) + list(extra_defines)
 
         def build():
             program = self._program(
@@ -609,6 +636,8 @@ class LinearStream(_BankStreamOp):
             for t in rope_kv.io:
                 if all(t is not u for u in (x, *unique, *extra)):
                     extra.append(t)
+        if build_only:
+            return program, [weights, x, *unique, *extra]
         ttnn.generic_op([weights, x, *unique, *extra], program)
         return out
 
