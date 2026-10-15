@@ -35,7 +35,11 @@ void kernel_main() {
     constexpr uint32_t res_mode = get_compile_time_arg_val(7);
     constexpr uint32_t row_bytes = get_compile_time_arg_val(8);  // hidden * 2
     constexpr uint32_t do_norm = get_compile_time_arg_val(9);
-    constexpr auto gamma_args = TensorAccessorArgs<10>();
+    // rows > 1 (multi-row decode): `tiles` pages hold `rows` token rows in the row-tile layout of
+    // fused_decode/boundary.py (gamma in that layout too); cb_p gets the row-sum matrix of the multi-row RMSNorm.
+    constexpr uint32_t rows = get_compile_time_arg_val(10);
+    constexpr uint32_t cb_p = get_compile_time_arg_val(11);
+    constexpr auto gamma_args = TensorAccessorArgs<12>();
     constexpr auto res_args = TensorAccessorArgs<gamma_args.next_compile_time_args_offset()>();
 
     constexpr uint32_t page = 2048;
@@ -50,11 +54,25 @@ void kernel_main() {
         const auto s_res = TensorAccessor(res_args, res_src_addr, row_bytes);
         cb_reserve_back(cb_res, tiles);
         const uint32_t dst = get_write_ptr(cb_res);
-        noc_async_read(s_res.get_noc_addr(0), dst, row_bytes);
         const uint64_t zeros = get_noc_addr(MEM_ZEROS_BASE);
-        for (uint32_t z = row_bytes; z < tiles * page; z += MEM_ZEROS_SIZE) {
+        for (uint32_t z = 0; z < tiles * page; z += MEM_ZEROS_SIZE) {
             const uint32_t n = tiles * page - z < MEM_ZEROS_SIZE ? tiles * page - z : MEM_ZEROS_SIZE;
             noc_async_read(zeros, dst + z, n);
+        }
+        noc_async_read_barrier();
+        if constexpr (rows == 1) {
+            noc_async_read(s_res.get_noc_addr(0), dst, row_bytes);
+        } else {
+            // Embedding row r (page r of the [1, 1, rows, hidden] row-major input): its values 32 j .. 32 j + 31 go to
+            // row r of row tile j (16 in face 0, 16 in face 1 of the [rows, 32] tile).
+            for (uint32_t r = 0; r < rows; ++r) {
+                const uint64_t src = s_res.get_noc_addr(r);
+                for (uint32_t j = 0; j < row_bytes / 64; ++j) {
+                    const uint32_t t = dst + j * rows * 64;
+                    noc_async_read(src + j * 64, t + r * 32, 32);
+                    noc_async_read(src + j * 64 + 32, t + rows * 32 + r * 32, 32);
+                }
+            }
         }
     } else {
         cb_reserve_back(cb_res, tiles);
@@ -73,6 +91,17 @@ void kernel_main() {
             }
         }
         cb_push_back(cb_scaler, 1);
+        if constexpr (rows > 1) {
+            // P[R][R'] = 1 iff R = R' (mod rows), BF16 32x32 tile (faces of 16x16, row-major).
+            cb_reserve_back(cb_p, 1);
+            volatile tt_l1_ptr uint16_t* pm = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(cb_p));
+            for (uint32_t R = 0; R < 32; ++R) {
+                for (uint32_t C = 0; C < 32; ++C) {
+                    pm[((R / 16) * 2 + C / 16) * 256 + (R % 16) * 16 + C % 16] = (R % rows == C % rows) ? 0x3F80 : 0;
+                }
+            }
+            cb_push_back(cb_p, 1);
+        }
     }
 
     noc_async_read_barrier();

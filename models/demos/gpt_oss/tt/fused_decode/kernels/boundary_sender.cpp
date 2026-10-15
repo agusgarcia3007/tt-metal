@@ -47,27 +47,39 @@ void kernel_main() {
     auto fabric = FabricConnectionManager::build_from_args<
         FabricConnectionManager::BuildFromArgsMode::BUILD_AND_OPEN_CONNECTION_START_ONLY>(arg_idx);
 
+    // Packet headers: one per chunk when they fit this RISC's share of the header pool (all prepared while the
+    // producers run); a multi-row payload has more chunks, so it cycles a ring of `ring_hdrs` headers, each rewritten
+    // for its next chunk once the previous send out of it has left L1.
     PacketHeaderPool::reset();
-    volatile PACKET_HEADER_TYPE* fwd_hdr[chunks];
-    volatile PACKET_HEADER_TYPE* bwd_hdr[chunks];
+    constexpr uint32_t my_chunks = (chunks - first_chunk + chunk_step - 1) / chunk_step;
+    constexpr uint32_t ring_hdrs = my_chunks <= 4 ? my_chunks : 4;
+    volatile PACKET_HEADER_TYPE* fwd_hdr[ring_hdrs];
+    volatile PACKET_HEADER_TYPE* bwd_hdr[ring_hdrs];
     const uint64_t sem_noc = safe_get_noc_addr(recv_noc_x, recv_noc_y, sem_addr, 0);
-    for (uint32_t c = first_chunk; c < chunks; c += chunk_step) {
+    auto prepare = [&](uint32_t c, uint32_t h) {
         const uint32_t bytes = c + 1 < chunks ? chunk : payload - c * chunk;
         const uint64_t dst = safe_get_noc_addr(recv_noc_x, recv_noc_y, slot_addr + c * chunk, 0);
         if constexpr (fwd_hops > 0) {
-            fwd_hdr[c] = PacketHeaderPool::allocate_header();
-            fwd_hdr[c]->to_chip_multicast(
+            fwd_hdr[h]->to_chip_multicast(
                 tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(fwd_hops)});
-            fwd_hdr[c]->to_noc_fused_unicast_write_atomic_inc(
+            fwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
                 tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
         }
         if constexpr (bwd_hops > 0) {
-            bwd_hdr[c] = PacketHeaderPool::allocate_header();
-            bwd_hdr[c]->to_chip_multicast(
+            bwd_hdr[h]->to_chip_multicast(
                 tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(bwd_hops)});
-            bwd_hdr[c]->to_noc_fused_unicast_write_atomic_inc(
+            bwd_hdr[h]->to_noc_fused_unicast_write_atomic_inc(
                 tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem_noc, 1, true}, bytes);
         }
+    };
+    for (uint32_t h = 0; h < ring_hdrs; ++h) {
+        if constexpr (fwd_hops > 0) {
+            fwd_hdr[h] = PacketHeaderPool::allocate_header();
+        }
+        if constexpr (bwd_hops > 0) {
+            bwd_hdr[h] = PacketHeaderPool::allocate_header();
+        }
+        prepare(first_chunk + h * chunk_step, h);
     }
     fabric.open_finish();
     if constexpr (producers > 0) {
@@ -77,20 +89,26 @@ void kernel_main() {
         noc_async_write(partial_addr, get_noc_addr(slot_addr), payload);
     }
 
-    for (uint32_t c = first_chunk; c < chunks; c += chunk_step) {
+    uint32_t i = 0;
+    for (uint32_t c = first_chunk; c < chunks; c += chunk_step, ++i) {
         const uint32_t bytes = c + 1 < chunks ? chunk : payload - c * chunk;
         const uint32_t src = partial_addr + c * chunk;
+        const uint32_t h = i % ring_hdrs;
+        if (i >= ring_hdrs) {
+            noc_async_writes_flushed();  // the header's previous packet has left L1
+            prepare(c, h);
+        }
         if constexpr (fwd_hops > 0) {
             auto& conn = fabric.get_forward_connection();
             conn.wait_for_empty_write_slot();
             conn.send_payload_without_header_non_blocking_from_address(src, bytes);
-            conn.send_payload_flush_non_blocking_from_address((uint32_t)fwd_hdr[c], sizeof(PACKET_HEADER_TYPE));
+            conn.send_payload_flush_non_blocking_from_address((uint32_t)fwd_hdr[h], sizeof(PACKET_HEADER_TYPE));
         }
         if constexpr (bwd_hops > 0) {
             auto& conn = fabric.get_backward_connection();
             conn.wait_for_empty_write_slot();
             conn.send_payload_without_header_non_blocking_from_address(src, bytes);
-            conn.send_payload_flush_non_blocking_from_address((uint32_t)bwd_hdr[c], sizeof(PACKET_HEADER_TYPE));
+            conn.send_payload_flush_non_blocking_from_address((uint32_t)bwd_hdr[h], sizeof(PACKET_HEADER_TYPE));
         }
     }
 

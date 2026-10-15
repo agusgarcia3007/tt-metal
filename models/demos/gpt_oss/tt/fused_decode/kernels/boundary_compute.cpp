@@ -24,6 +24,7 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
 #include "api/compute/eltwise_unary/rsqrt.h"
+#include "api/compute/matmul.h"
 #include "api/compute/pack.h"
 #include "api/compute/reduce.h"
 #include "api/compute/tile_move_copy.h"
@@ -53,6 +54,136 @@ ALWI void rsqrt_scalar(uint32_t idst) {
         VectorMode::R));
 }
 
+// Multi-row RMSNorm on the row-tile layout: token row r of a [rows, 32] row tile lands in rows R = r (mod rows) of
+// the 32x32 container tiles the FPU sees (rows divides 16), so:
+//   y = residual' * gamma (gamma laid out per row, all pages, FP32 to cb_y);
+//   q = sum over pages of residual'^2 (one FP32 container tile); v = REDUCE_ROW(q) (per container row, column 0);
+//   s = P v with P[R][R'] = 1 iff R = R' (mod rows): each token's sum of squares in every row R of that token;
+//   rs = rsqrt(s / hidden + eps); x = y * rs (column broadcast).
+template <uint32_t pages, uint32_t rows>
+ALWI void rows_norm(
+    uint32_t cb_res_out,
+    uint32_t cb_gamma,
+    uint32_t cb_scaler,
+    uint32_t cb_sq,
+    uint32_t cb_rs,
+    uint32_t cb_x,
+    uint32_t cb_y,
+    uint32_t cb_p,
+    uint32_t cb_rsum,
+    uint32_t inv_n,
+    uint32_t eps) {
+    constexpr uint32_t step = 4;  // FP32 DST tiles per acquire
+    cb_wait_front(cb_res_out, pages);
+    cb_wait_front(cb_gamma, pages);
+    cb_reserve_back(cb_y, pages);
+    for (uint32_t p0 = 0; p0 < pages; p0 += step) {
+        const uint32_t n = pages - p0 < step ? pages - p0 : step;
+        tile_regs_acquire();
+        mul_init(cb_res_out, cb_gamma);
+        for (uint32_t t = 0; t < n; ++t) {
+            mul_tiles(cb_res_out, cb_gamma, p0 + t, p0 + t, t);
+        }
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_reconfig_data_format(cb_y);
+        for (uint32_t t = 0; t < n; ++t) {
+            pack_tile(t, cb_y);
+        }
+        tile_regs_release();
+    }
+    cb_push_back(cb_y, pages);
+    cb_pop_front(cb_gamma, pages);
+
+    // ELWMUL adds into DST (that is how its fidelity phases sum), so squaring every page into DST 0 sums them.
+    tile_regs_acquire();
+    mul_init(cb_res_out, cb_res_out);
+    for (uint32_t p = 0; p < pages; ++p) {
+        mul_tiles(cb_res_out, cb_res_out, p, p, 0);
+    }
+    tile_regs_commit();
+    cb_reserve_back(cb_sq, 1);
+    tile_regs_wait();
+    pack_reconfig_data_format(cb_sq);
+    pack_tile(0, cb_sq);
+    tile_regs_release();
+    cb_push_back(cb_sq, 1);
+
+    cb_wait_front(cb_sq, 1);
+    cb_wait_front(cb_scaler, 1);
+    compute_kernel_hw_startup(cb_scaler, cb_sq, cb_rsum);  // SUM REDUCE_ROW unpacks the scaler to SrcA, data to SrcB
+    tile_regs_acquire();
+    reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scaler, cb_rsum);
+    reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scaler, 0, 0, 0);
+    reduce_uninit(cb_sq);
+    tile_regs_commit();
+    cb_reserve_back(cb_rsum, 1);
+    tile_regs_wait();
+    pack_tile(0, cb_rsum);
+    tile_regs_release();
+    cb_push_back(cb_rsum, 1);
+    cb_pop_front(cb_sq, 1);
+    cb_pop_front(cb_scaler, 1);
+
+    cb_wait_front(cb_p, 1);
+    cb_wait_front(cb_rsum, 1);
+    compute_kernel_hw_startup(cb_rsum, cb_p, cb_rs);  // matmul unpacks in1 to SrcA, in0 to SrcB
+    tile_regs_acquire();
+    matmul_init(cb_p, cb_rsum);
+    matmul_tiles(cb_p, cb_rsum, 0, 0, 0);
+    binop_with_scalar_tile_init();
+    MATH(SFPU_UNARY_CALL(
+        DST_SYNC_MODE,
+        DST_ACCUM_MODE,
+        calculate_binop_with_scalar,
+        (APPROX, MUL_UNARY, 8, DST_ACCUM_MODE),
+        0,
+        VectorMode::RC,
+        inv_n));
+    MATH(SFPU_UNARY_CALL(
+        DST_SYNC_MODE,
+        DST_ACCUM_MODE,
+        calculate_binop_with_scalar,
+        (APPROX, ADD_UNARY, 8, DST_ACCUM_MODE),
+        0,
+        VectorMode::RC,
+        eps));
+    rsqrt_tile_init();
+    MATH(SFPU_UNARY_CALL(
+        DST_SYNC_MODE, DST_ACCUM_MODE, calculate_rsqrt, (APPROX, 8, DST_ACCUM_MODE, false), 0, VectorMode::RC));
+    tile_regs_commit();
+    cb_reserve_back(cb_rs, 1);
+    tile_regs_wait();
+    pack_tile(0, cb_rs);
+    tile_regs_release();
+    cb_push_back(cb_rs, 1);
+    cb_pop_front(cb_rsum, 1);
+    cb_pop_front(cb_p, 1);
+
+    cb_wait_front(cb_rs, 1);
+    cb_wait_front(cb_y, pages);
+    cb_reserve_back(cb_x, pages);
+    compute_kernel_hw_startup(cb_y, cb_rs, cb_x);
+    for (uint32_t p0 = 0; p0 < pages; p0 += step) {
+        const uint32_t n = pages - p0 < step ? pages - p0 : step;
+        tile_regs_acquire();
+        mul_bcast_cols_init(cb_y, cb_rs);
+        for (uint32_t t = 0; t < n; ++t) {
+            mul_tiles_bcast_cols(cb_y, cb_rs, p0 + t, 0, t);
+        }
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_reconfig_data_format(cb_x);
+        for (uint32_t t = 0; t < n; ++t) {
+            pack_tile(t, cb_x);
+        }
+        tile_regs_release();
+    }
+    cb_push_back(cb_x, pages);
+    cb_pop_front(cb_y, pages);
+    cb_pop_front(cb_rs, 1);
+}
+
 void kernel_main() {
     constexpr uint32_t cb_res = get_compile_time_arg_val(0);
     constexpr uint32_t cb_recv = get_compile_time_arg_val(1);
@@ -68,7 +199,12 @@ void kernel_main() {
     constexpr uint32_t eps = get_compile_time_arg_val(11);    // float bits
     constexpr uint32_t do_norm = get_compile_time_arg_val(12);
     constexpr uint32_t cb_y = get_compile_time_arg_val(13);
-    static_assert(tiles <= 3, "phase 2 / 3 hold the tiles plus one operand in the 4 FP32 DST tiles");
+    // rows > 1 (multi-row decode, e.g. the DFlash verify block): the buffers hold `rows` token rows in the row-tile
+    // layout of fused_decode/boundary.py (tiles = all pages); see rows_norm below.
+    constexpr uint32_t rows = get_compile_time_arg_val(14);
+    constexpr uint32_t cb_p = get_compile_time_arg_val(15);
+    constexpr uint32_t cb_rsum = get_compile_time_arg_val(16);
+    static_assert(rows > 1 || tiles <= 3, "phase 2 / 3 hold the tiles plus one operand in the 4 FP32 DST tiles");
 
     // 1. residual' = ((slot 0 + slot 1) + ...) + residual: the partial sums first (rounded at their own magnitude
     //    when DST feeds SrcA), the residual last (FPU, FP32 DST).
@@ -108,6 +244,10 @@ void kernel_main() {
         cb_pop_front(cb_recv, slots * tiles);
     }
     if constexpr (!do_norm) {
+        return;
+    }
+    if constexpr (rows > 1) {
+        rows_norm<tiles, rows>(cb_res_out, cb_gamma, cb_scaler, cb_sq, cb_rs, cb_x, cb_y, cb_p, cb_rsum, inv_n, eps);
         return;
     }
 

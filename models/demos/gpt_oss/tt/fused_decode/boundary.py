@@ -87,6 +87,30 @@ def flat_to_tile_rows(vec, pages):
     return t.permute(1, 3, 0, 2, 4).reshape(TILE, pages * TILE)
 
 
+def rowtile_pages(hidden, rows):
+    """Pages of a `rows`-token flat buffer in the row-tile layout (rows = 1: the flat vector)."""
+    return -(-(-(-hidden // TILE) * rows * 2 * TILE) // PAGE)
+
+
+def rows_to_rowtile(mat):
+    """Host helper: [rows, hidden] -> the [32, 32 * pages] matrix whose TILE-layout device bytes are the row-tile layout:
+    row tile j ([rows, 32], faces of [rows, 16]) holds values 32 j .. 32 j + 31 of every row, tiles back to back (rows = 1:
+    the flat vector)."""
+    rows, hidden = mat.shape
+    n = -(-hidden // TILE)
+    m = torch.zeros(rows, n * TILE, dtype=mat.dtype)
+    m[:, :hidden] = mat
+    t = m.reshape(rows, n, 2, 16).permute(1, 2, 0, 3).reshape(-1)  # tile j, face, row, col
+    return flat_to_tile_rows(t, rowtile_pages(hidden, rows))
+
+
+def rowtile_to_rows(container, rows, hidden):
+    """Host helper: inverse of rows_to_rowtile (a device tensor read back with to_torch -> [rows, hidden])."""
+    n = -(-hidden // TILE)
+    t = tile_rows_to_flat(container, n * rows * TILE)
+    return t.reshape(n, 2, rows, 16).permute(2, 0, 1, 3).reshape(rows, n * TILE)[:, :hidden]
+
+
 def tile_rows_to_flat(mat, hidden):
     """Host helper: inverse of flat_to_tile_rows (device tensor read back with to_torch -> flat vector)."""
     pages = mat.shape[-1] // TILE
@@ -119,27 +143,31 @@ class DecodeBoundary:
     shared by every layer: every boundary waits for every device's partial, so a device cannot write layer i+1's
     partial into a slot before every device has consumed layer i's (the two sites alternate)."""
 
-    def __init__(self, mesh_device, hidden, eps, cluster_axis, sites=("attn", "moe"), ccl=DECODE_BOUNDARY_CCL):
+    def __init__(self, mesh_device, hidden, eps, cluster_axis, sites=("attn", "moe"), ccl=DECODE_BOUNDARY_CCL, rows=1):
+        """rows > 1: `rows` tokens per call (multi-row decode, e.g. the DFlash verify block): every flat buffer holds
+        `rows` flat vectors back to back and the RMSNorm runs per vector."""
         assert ccl in ("fabric", "ttnn"), ccl
+        self.rows = rows
         self.ccl = ccl
         self.mesh_device = mesh_device
         self.hidden = hidden
         self.eps = eps
         self.cluster_axis = cluster_axis
-        self.tiles = flat_tiles(hidden)
+        self.tiles = flat_tiles(hidden)  # pages of one vector
+        self.all = rowtile_pages(hidden, rows)  # pages of a flat buffer (rows tokens in the row-tile layout)
         self.ring = mesh_device.shape[cluster_axis]
         self.fwd_hops = self.ring // 2
         self.bwd_hops = self.ring - 1 - self.fwd_hops
-        self.memory_config = flat_memory_config(mesh_device, hidden)
+        self.memory_config = flat_memory_config(mesh_device, hidden, self.all)
         self.core = self.memory_config.shard_spec.grid.bounding_box().start
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(self.core, self.core)])
         grid = mesh_device.compute_with_storage_grid_size()
         all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
-        recv_config = flat_memory_config(mesh_device, hidden, self.ring * self.tiles)
+        recv_config = flat_memory_config(mesh_device, hidden, self.ring * self.all)
         self.sites = {
             name: (
                 ttnn.empty(
-                    flat_shape(hidden, self.ring * self.tiles),
+                    flat_shape(hidden, self.ring * self.all),
                     dtype=ttnn.bfloat16,
                     layout=ttnn.TILE_LAYOUT,
                     device=mesh_device,
@@ -152,11 +180,11 @@ class DecodeBoundary:
         if ccl == "ttnn":
             # ttnn.experimental.all_reduce_async on the flat partial (elementwise, so layout-agnostic): one persistent
             # scratch + semaphore per site, ring, 1 link (a 1-core payload).
-            scratch_config = flat_memory_config(mesh_device, hidden, self.ring * self.tiles)
+            scratch_config = flat_memory_config(mesh_device, hidden, self.ring * self.all)
             self.ar_sites = {
                 name: (
                     ttnn.empty(
-                        flat_shape(hidden, self.ring * self.tiles),
+                        flat_shape(hidden, self.ring * self.all),
                         dtype=ttnn.bfloat16,
                         layout=ttnn.TILE_LAYOUT,
                         device=mesh_device,
@@ -166,7 +194,7 @@ class DecodeBoundary:
                 )
                 for name in sites
             }
-        self.payload = self.tiles * PAGE
+        self.payload = self.all * PAGE
         max_payload = int(ttnn.get_tt_fabric_max_payload_size_bytes())
         self.chunk = min(self.payload, max_payload // PAGE * PAGE)
         self.chunks = -(-self.payload // self.chunk)
@@ -178,10 +206,15 @@ class DecodeBoundary:
         self.residual_rows_config = residual_memory_config(mesh_device, hidden)
 
     def flat_gamma(self, norm):
-        """The RMSNorm weight as a flat BF16 [1, 1, 1, 32 * 32 * FLAT_TILES] row-major DRAM tensor (one page)."""
+        """The RMSNorm weight as a flat BF16 [1, 1, 1, 32 * 32 * pages] row-major DRAM tensor (one page); rows > 1: in
+        the row-tile layout, repeated for every row."""
         w = ttnn.to_torch(ttnn.get_device_tensors(norm.tt_weight)[0]).reshape(-1).float()
-        flat = torch.zeros(1, 1, 1, self.tiles * TILE * TILE)
-        flat[..., : self.hidden] = w[: self.hidden]
+        flat = torch.zeros(1, 1, 1, self.all * TILE * TILE)
+        if self.rows == 1:
+            flat[..., : self.hidden] = w[: self.hidden]
+        else:
+            c = rows_to_rowtile(w[: self.hidden][None].repeat(self.rows, 1))  # [32, 32 * pages] container
+            flat[0, 0, 0] = tile_rows_to_flat(c, self.all * TILE * TILE)
         return ttnn.from_torch(
             flat,
             dtype=ttnn.bfloat16,
@@ -193,7 +226,7 @@ class DecodeBoundary:
 
     def _empty_flat(self):
         return ttnn.empty(
-            flat_shape(self.hidden),
+            flat_shape(self.hidden, self.all),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=self.mesh_device,
@@ -313,29 +346,33 @@ class DecodeBoundary:
         expected = (self.ring - 1) * self.chunks + 1 if ccl else 0
         # CB indices clear of the streamed-matmul ops' (0-4, 16), which share programs with this part (consumer_parts).
         cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, cb_y = 8, 9, 10, 11, 24, 25, 26, 27, 28
-        T = self.tiles
+        cb_p, cb_rsum = 29, 30  # multi-row RMSNorm: row-sum matrix, per-row sums
+        T, A = self.tiles, self.all
         cbs = [
-            self._cb(cb_res, T * PAGE, tensor=None if entry else residual),
-            self._cb(cb_res_out, T * PAGE, tensor=out_res),
+            self._cb(cb_res, A * PAGE, tensor=None if entry else residual),
+            self._cb(cb_res_out, A * PAGE, tensor=out_res),
         ]
         if slots:
-            cbs.append(self._cb(cb_recv, slots * T * PAGE, tensor=recv))
+            cbs.append(self._cb(cb_recv, slots * A * PAGE, tensor=recv))
         if norm:
             cbs += [
-                self._cb(cb_gamma, T * PAGE),
+                self._cb(cb_gamma, A * PAGE),
                 self._cb(cb_scaler, PAGE),
                 self._cb(cb_sq, 4096, ttnn.float32),
                 self._cb(cb_rs, 4096, ttnn.float32),
-                self._cb(cb_x, T * PAGE, tensor=out_x),
-                self._cb(cb_y, T * 4096, ttnn.float32),
+                self._cb(cb_x, A * PAGE, tensor=out_x),
+                self._cb(cb_y, A * 4096, ttnn.float32),
             ]
+            if self.rows > 1:
+                cbs += [self._cb(cb_p, PAGE), self._cb(cb_rsum, 4096, ttnn.float32)]
         gamma_t = gamma if norm else out_res
-        reader_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, T, slots, expected]
-        reader_ct += [1 if entry else 0, self.hidden * 2, 1 if norm else 0]
+        reader_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, A, slots, expected]
+        reader_ct += [1 if entry else 0, self.hidden * 2, 1 if norm else 0, self.rows, cb_p]
         reader_ct += ttnn.TensorAccessorArgs(gamma_t).get_compile_time_args()
         reader_ct += ttnn.TensorAccessorArgs(residual).get_compile_time_args()
-        compute_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, T, slots]
-        compute_ct += [_f32_bits(1.0 / self.hidden), _f32_bits(self.eps), 1 if norm else 0, cb_y]
+        compute_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, A, slots]
+        compute_ct += [_f32_bits(1.0 / self.hidden), _f32_bits(self.eps), 1 if norm else 0, cb_y, self.rows]
+        compute_ct += [cb_p, cb_rsum]
         reader_rt = ttnn.RuntimeArgs()
         reader_rt[self.core.x][self.core.y] = [gamma_t.buffer_address(), sem_addr, residual.buffer_address()]
 
@@ -405,7 +442,7 @@ class DecodeBoundary:
         notifier = ttnn.KernelDescriptor(
             kernel_source=str(KERNEL_DIR / "boundary_notify.cpp"),
             core_ranges=self.cores,
-            compile_time_args=[cb_x, self.tiles, len(noc), 0],
+            compile_time_args=[cb_x, self.all, len(noc), 0],
             runtime_args=rt,
             config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0),
         )
