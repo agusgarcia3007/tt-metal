@@ -45,6 +45,7 @@ class MoEFused:
         rows,
         gate_up_readers=3,
         down_readers=3,
+        real_inter=None,
     ):
         """router: the verify pass's router LinearStream (out_mode 4, one core)."""
         self.mesh = mesh_device
@@ -54,7 +55,15 @@ class MoEFused:
         taken = [(rc.x, rc.y), (boundary.core.x, boundary.core.y)]
         taken += [(h.x, h.y) for h in getattr(boundary, "helpers", [])] if getattr(boundary, "mc", False) else []
         self.gate_up = ExpertGateUpUnion(
-            mesh_device, hidden, inter_pad, swiglu_limit, alpha, readers=gate_up_readers, rows=rows, exclude=taken
+            mesh_device,
+            hidden,
+            inter_pad,
+            swiglu_limit,
+            alpha,
+            readers=gate_up_readers,
+            rows=rows,
+            exclude=taken,
+            real_inter=real_inter,
         )
         taken += [(c.x, c.y) for c, *_ in self.gate_up.assignments]
         self.down = ExpertDownUnion(

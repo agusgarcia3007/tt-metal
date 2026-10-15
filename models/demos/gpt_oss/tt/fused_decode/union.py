@@ -103,8 +103,11 @@ class ExpertGateUpUnion(_BankStreamOp):
         max_experts=MAX_EXPERTS,
         weight_dtype=ttnn.bfloat4_b,
         exclude=(),
+        real_inter=None,
     ):
-        """dense_silu: plain silu(g) * u (a dense MLP run as one union expert, e.g. the DFlash drafter)."""
+        """dense_silu: plain silu(g) * u (a dense MLP run as one union expert, e.g. the DFlash drafter).
+        real_inter: the unpadded intermediate size; cores whose column pairs are all padding are dropped (their act
+        tiles stay zero, as do the matching down weights)."""
         super().__init__(mesh_device, readers, exclude=exclude)
         self.dense_silu = dense_silu
         self.max_experts = max_experts
@@ -121,6 +124,13 @@ class ExpertGateUpUnion(_BankStreamOp):
         self.col_bytes = self.kt * self.tile_bytes
         self.expert_stride = 2 * self.P * self.col_bytes
         self.page_bytes = _page_bytes(self.kt, self.tile_bytes)
+        if real_inter is not None:
+            keep = [a for a in self.assignments if (a[1] * self.P + a[2] * self.pairs) * TILE < real_inter]
+            if len(keep) < len(self.assignments):
+                self.assignments = keep
+                self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(keep[0][0], keep[0][0])])
+                for c, *_ in keep[1:]:
+                    self.cores = self.cores.merge(ttnn.CoreRangeSet([ttnn.CoreRange(c, c)]))
 
     def weight_rows(self, num_experts):
         return num_experts * 2 * self.P * self.kt * TILE

@@ -142,6 +142,7 @@ class FusedVerify:
                 M,
                 gate_up_readers=GATE_UP_STREAM_READERS,
                 down_readers=int(os.environ.get("DFLASH_DOWN_READERS", "3")),
+                real_inter=cfg.intermediate_size // tp if os.environ.get("DFLASH_SKIP_PAD", "0") == "1" else None,
             )
         term = model.decode_terminal
         self.vd = term.vd
