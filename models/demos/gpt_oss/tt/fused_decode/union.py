@@ -266,10 +266,13 @@ class ExpertDownUnion(_BankStreamOp):
         """
         M = self.rows
         cb_in0, cb_w, cb_idx, cb_scr, cb_out = 0, 1, 2, 3, 16
+        fused = any(d[0] == "MOE_FUSED" for d in (extra_defines or []))
+        in0_slots = min(4, self.max_experts) if fused and self.expert_outer else self.max_experts
         tiny = TINY_BYTES * M
         block = (self.cols if self.expert_outer else self.chunk) * self.seg_tiles
         cbs = [
-            self._cb(cb_in0, ttnn.bfloat16, tiny, self.max_experts * self.seg_tiles, tiny=True, rows=M),
+            # fused (MOE_FUSED): a ring of 4 activation slots; else every union slot at once
+            self._cb(cb_in0, ttnn.bfloat16, tiny, in0_slots * self.seg_tiles, tiny=True, rows=M),
             self._cb(cb_w, self.weight_dtype, self.tile_bytes, self.num_buffers * block),
             self._cb(cb_idx, ttnn.uint16, 256, 1),
             self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 64, 1),

@@ -101,8 +101,13 @@ void kernel_main() {
     }
 #endif
 
+#ifdef MOE_FUSED
+    // fused: cb_in0 is a ring of a few slots (compute pops each slot after use)
+    uint32_t in0 = 0;
+#else
     cb_reserve_back(cb_in0, num_sel * seg_tiles);
     const uint32_t in0 = get_write_ptr(cb_in0);
+#endif
     for (uint32_t e = 0; e < num_sel; ++e) {
 #ifdef MOE_FUSED
         // Slot e is complete once all gate|up cores counted it; push each slot as it arrives (compute waits per slot).
@@ -118,10 +123,14 @@ void kernel_main() {
             invalidate_l1_cache();
         } while (poll[0] < producers);
         DeviceTimestampedData("MOE_T", 310 + e);
+        cb_reserve_back(cb_in0, seg_tiles);
+        const uint32_t slot = get_write_ptr(cb_in0);
+#else
+        const uint32_t slot = in0 + e * seg_tiles * tiny_bytes;
 #endif
-        noc_async_read(s_act.get_noc_addr(order[e]), in0 + e * seg_tiles * tiny_bytes, act_page_bytes);
+        noc_async_read(s_act.get_noc_addr(order[e]), slot, act_page_bytes);
         volatile tt_l1_ptr uint16_t* aug =
-            reinterpret_cast<volatile tt_l1_ptr uint16_t*>(in0 + (e * seg_tiles + seg_tiles - 1) * tiny_bytes);
+            reinterpret_cast<volatile tt_l1_ptr uint16_t*>(slot + (seg_tiles - 1) * tiny_bytes);
         for (uint32_t i = 0; i < 32 * rows; ++i) {
             aug[i] = (i < 16 * rows && i % 16 < nbias) ? w[(i / 16) * 32 + order[e]] : 0;
         }

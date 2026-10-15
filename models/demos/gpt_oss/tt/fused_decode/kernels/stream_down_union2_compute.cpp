@@ -38,17 +38,23 @@ void kernel_main() {
     // union expert e (processing order) from weight CB wcb, accumulated into DST 0 .. cols - 1
     auto expert = [&](uint32_t e, uint32_t wcb) {
 #ifdef MOE_FUSED
-        cb_wait_front(cb_in0, (e + 1) * seg_tiles);  // slot e's activation (the writer pushes slot by slot)
+        cb_wait_front(cb_in0, seg_tiles);  // slot e's activation (a ring: the writer pushes slot by slot)
+        const uint32_t a0 = 0;
+#else
+        const uint32_t a0 = e * seg_tiles;
 #endif
         cb_wait_front(wcb, cols * seg_tiles);
         for (uint32_t c = 0; c < cols; ++c) {
             if (e + 1 == num_sel) {
-                custom_mm_block<true>(cb_in0, wcb, e * seg_tiles, c * seg_tiles, c, seg_tiles);
+                custom_mm_block<true>(cb_in0, wcb, a0, c * seg_tiles, c, seg_tiles);
             } else {
-                custom_mm_block<false>(cb_in0, wcb, e * seg_tiles, c * seg_tiles, c, seg_tiles);
+                custom_mm_block<false>(cb_in0, wcb, a0, c * seg_tiles, c, seg_tiles);
             }
         }
         cb_pop_front(wcb, cols * seg_tiles);
+#ifdef MOE_FUSED
+        cb_pop_front(cb_in0, seg_tiles);
+#endif
     };
     uint32_t e = 0;
 #ifdef MOE_PRED
@@ -78,6 +84,8 @@ void kernel_main() {
         cb_push_back(cb_out, 1);
     }
     tile_regs_release();
+#ifndef MOE_FUSED
     cb_pop_front(cb_in0, num_sel * seg_tiles);
+#endif
     custom_mm_block_uninit<dense_packing>();
 }
