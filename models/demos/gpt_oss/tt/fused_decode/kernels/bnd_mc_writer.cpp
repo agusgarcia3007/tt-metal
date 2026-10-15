@@ -30,6 +30,8 @@ void kernel_main() {
     // 1: also multicast the normed pages into the same offset of the x mirror on every worker core (runtime args
     // 6 + 2 helpers ..: mirror address, noc x0, y0, x1, y1 of the worker grid, cores), so consumers read x locally.
     constexpr uint32_t mirror = get_compile_time_arg_val(7);
+    // 1: x stays in this helper's shard of the normed output (cb_x backed by it); consumers read it from here
+    constexpr uint32_t x_on_helpers = get_compile_time_arg_val(8);
     constexpr uint32_t v_bytes = 4096;  // FP32 tile
     constexpr uint32_t page = 2048;
 
@@ -48,7 +50,9 @@ void kernel_main() {
     cb_pop_front(cb_v, 1);
 
     cb_wait_front(cb_x, PH);
-    noc_async_write(get_read_ptr(cb_x), get_noc_addr(bx, by, x_addr + page0 * page), valid * page);
+    if constexpr (!x_on_helpers) {
+        noc_async_write(get_read_ptr(cb_x), get_noc_addr(bx, by, x_addr + page0 * page), valid * page);
+    }
     if constexpr (mirror) {
         constexpr uint32_t m = 6 + 2 * helpers;
         const uint32_t mirror_addr = get_arg_val<uint32_t>(m);

@@ -424,7 +424,10 @@ class DecodeBoundary:
         if res_mode == 2:
             residual = gamma  # accessor placeholder, never read
         out_res = self._empty_flat(residual=True)
-        out_x = self._empty_flat()
+        # DFLASH_X_ON_HELPERS: the normed output stays sharded over the helpers (consumers read 4 slices instead of
+        # all pulling from the boundary core)
+        x_on_helpers = os.environ.get("DFLASH_X_ON_HELPERS", "1") == "1" and self.x_mirror is None
+        out_x = self._empty_flat(residual=True) if x_on_helpers else self._empty_flat()
         recv, sem = self.sites[site] if slots else (None, None)
         sem_addr = ttnn.get_global_semaphore_address(sem) if slots else 0
         PH, Hn, A = self.PH, self.H, self.all
@@ -453,7 +456,7 @@ class DecodeBoundary:
             cb(cb_scaler, PAGE),
             cb(cb_sq, 4096, f32),
             cb(cb_rs, 4096, f32),
-            cb(cb_x, PH * PAGE),
+            cb(cb_x, PH * PAGE, tensor=out_x if x_on_helpers else None),
             cb(cb_y, PH * 4096, f32),
             cb(cb_p, PAGE),
             cb(cb_rsum, 4096, f32),
@@ -469,6 +472,7 @@ class DecodeBoundary:
         compute_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, PH, slots]
         compute_ct += [_f32_bits(1.0 / self.hidden), _f32_bits(self.eps), cb_y, cb_p, cb_rsum, cb_v, cb_xchg, Hn]
         writer_ct = [cb_v, cb_xchg, cb_x, PH, Hn, self.XCHG_SEM, self.RELAY_SEM, 1 if self.x_mirror is not None else 0]
+        writer_ct.append(1 if x_on_helpers else 0)
         hnoc = [v for p in self.helper_noc for v in (p.x, p.y)]
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for h, c in enumerate(self.helpers):

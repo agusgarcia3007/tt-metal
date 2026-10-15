@@ -358,7 +358,11 @@ void kernel_main() {
 #ifdef X_LOCAL
         noc_async_read(get_noc_addr(x_addr), x_l1, kx * tiny_bytes);  // the boundary's x mirror in this core's L1
 #else
-        noc_async_read(s_x.get_noc_addr(0), x_l1, kx * tiny_bytes);
+        // page by page: x may be sharded over the boundary helpers (fused_decode/boundary.py)
+        for (uint32_t p = 0; p * 2048 < kx * tiny_bytes; ++p) {
+            const uint32_t n = kx * tiny_bytes - p * 2048 < 2048 ? kx * tiny_bytes - p * 2048 : 2048;
+            noc_async_read(s_x.get_noc_addr(p), x_l1 + p * 2048, n);
+        }
 #endif
     }
 #endif
