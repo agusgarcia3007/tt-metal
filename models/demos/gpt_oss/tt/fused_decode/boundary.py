@@ -240,6 +240,7 @@ class DecodeBoundary:
                 (h.x, h.y) for h in self.helpers
             ], "helpers in row-major order (shard order)"
             self.mc_config = self._helper_config(self.PH)
+            self.direct_notify = os.environ.get("DFLASH_BND_DIRECT", "1") == "1"  # helpers notify consumers directly
             # x mirror (DFLASH_X_MIRROR): the normed output at the same L1 address on every worker core (the helpers
             # multicast their pages into it), so consumers read x from their own L1 instead of the boundary core
             self.x_mirror = None
@@ -672,12 +673,25 @@ class DecodeBoundary:
         if self.mc:
             pending.residual_out, pending.x = out_res, out_x
             semaphores = [ttnn.SemaphoreDescriptor(0, ttnn.CoreType.WORKER, consumer_cores.merge(self.cores), 0)]
-            return (
-                kernels(self.coords[0]) + [self._relay_kernel(consumer_cores)],
-                cbs,
-                semaphores + self.mc_semaphores(),
-                io,
-            )
+            ks = kernels(self.coords[0])
+            if self.direct_notify:
+                # the helpers notify the consumers themselves (no relay hop); consumers wait for H increments
+                consumers = [
+                    self.mesh_device.worker_core_from_logical_core(c)
+                    for c in ttnn.corerange_to_cores(consumer_cores, row_wise=True)
+                ]
+                w = ks[2]
+                n_rt = len(w.runtime_args[self.helpers[0].x][self.helpers[0].y])
+                for h in self.helpers:
+                    w.runtime_args[h.x][h.y] = list(w.runtime_args[h.x][h.y]) + [
+                        v for p in consumers for v in (p.x, p.y)
+                    ]
+                w.defines = list(w.defines or []) + [
+                    ("BND_DIRECT_N", str(len(consumers))),
+                    ("BND_DIRECT_ARG", str(n_rt)),
+                ]
+                return ks, cbs, semaphores + self.mc_semaphores(), io
+            return ks + [self._relay_kernel(consumer_cores)], cbs, semaphores + self.mc_semaphores(), io
         rt = ttnn.RuntimeArgs()
         consumer_list = ttnn.corerange_to_cores(consumer_cores, row_wise=True)
         noc = [self.mesh_device.worker_core_from_logical_core(c) for c in consumer_list]

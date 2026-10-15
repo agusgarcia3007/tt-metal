@@ -18,6 +18,11 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
+
+// the fused boundary's x-ready count: 1 (one notifier) or the multi-core boundary's helper count (direct notify)
+#ifndef BND_WAIT_N
+#define BND_WAIT_N 1
+#endif
 #include "ckernel.h"
 #include "ckernel_defs.h"
 #ifdef MOE_PRED
@@ -83,7 +88,7 @@ void kernel_main() {
 #ifdef MOE_FUSED
     // Fused MoE program (dflash/moe_fused.py): x once the boundary packed it (program semaphore 0), the union and
     // weights once the router wrote them (semaphore 1).
-    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), 1);
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), BND_WAIT_N);
     DeviceTimestampedData("MOE_T", 201);
 #endif
 #ifdef X_LOCAL

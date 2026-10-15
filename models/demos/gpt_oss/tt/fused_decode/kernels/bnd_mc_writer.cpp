@@ -65,7 +65,20 @@ void kernel_main() {
         noc_async_write_multicast_loopback_src(get_read_ptr(cb_x), dst, valid * page, get_arg_val<uint32_t>(m + 5));
     }
     noc_async_write_barrier();
+#ifdef BND_DIRECT_N
+    // direct notify: semaphore 0 on every consumer core (runtime args BND_DIRECT_ARG ..: noc x, y); the consumers wait
+    // for one increment per helper
+    for (uint32_t i = 0; i < BND_DIRECT_N; ++i) {
+        noc_semaphore_inc(
+            get_noc_addr(
+                get_arg_val<uint32_t>(BND_DIRECT_ARG + 2 * i),
+                get_arg_val<uint32_t>(BND_DIRECT_ARG + 2 * i + 1),
+                get_semaphore(0)),
+            1);
+    }
+#else
     noc_semaphore_inc(get_noc_addr(bx, by, get_semaphore(relay_sem)), 1);
+#endif
     noc_async_atomic_barrier();
     cb_pop_front(cb_x, PH);
 }

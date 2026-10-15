@@ -45,6 +45,11 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
+
+// the fused boundary's x-ready count: 1 (one notifier) or the multi-core boundary's helper count (direct notify)
+#ifndef BND_WAIT_N
+#define BND_WAIT_N 1
+#endif
 #include "router_topk.hpp"
 
 #ifndef ROWS
@@ -334,7 +339,7 @@ void kernel_main() {
     cb_reserve_back(cb_x, kx + 1);
     const uint32_t x_l1 = get_write_ptr(cb_x);
     if constexpr (wait_x) {
-        noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), 1);
+        noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), BND_WAIT_N);
     }
 #ifdef MOE_FUSED
     DeviceTimestampedData("MOE_T", 101);

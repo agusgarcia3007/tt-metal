@@ -28,6 +28,11 @@ from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion
 MOE = [("MOE_FUSED", "1")]
 
 
+def _wait_n(b):
+    """Consumer x-ready count with the multi-core boundary's direct notify (one increment per helper)."""
+    return [("BND_WAIT_N", str(b.H))] if getattr(b, "mc", False) and b.direct_notify else []
+
+
 def _noc(mesh_device, cores):
     return [mesh_device.worker_core_from_logical_core(c) for c in ttnn.corerange_to_cores(cores, row_wise=True)]
 
@@ -142,7 +147,7 @@ class MoEFused:
             gate_up_ws,
             act,
             build_only=True,
-            extra_defines=MOE + pdef,
+            extra_defines=MOE + pdef + _wait_n(b),
             extra_writer_rt=[ctr, rx, ry] + ([pred_addr] if P else []),
             extra_reader_rt=[rx, ry, pred_addr] if P else None,
             pred_p=P,
@@ -244,7 +249,7 @@ class DenseMLPFused:
             gate_up_ws,
             act,
             build_only=True,
-            extra_defines=self.defines,
+            extra_defines=self.defines + _wait_n(b),
             extra_writer_rt=[0, hx, hy],
             x_local_addr=b.x_mirror.buffer_address() if getattr(b, "x_mirror", None) is not None else None,
         )

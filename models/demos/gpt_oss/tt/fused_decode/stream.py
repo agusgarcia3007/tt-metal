@@ -24,6 +24,7 @@ scaled by the routing score) and ExpertDownStream (routed down + bias, summed ov
 partial sum).
 """
 
+import os
 import struct
 from pathlib import Path
 
@@ -195,6 +196,9 @@ class _BankStreamOp:
         self.banks = mesh_device.dram_grid_size().x
         self.readers = readers
         bank_workers = mesh_device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0)
+        shift = int(os.environ.get("DFLASH_BANK_X_SHIFT", "0")) if exclude else 0  # experiment: fused MoE only
+        if shift:
+            bank_workers = [ttnn.CoreCoord(c.x + shift, c.y) if c.x > 3 else c for c in bank_workers]
         assert len(bank_workers) == self.banks
         bank_workers = bank_workers[: active_banks or self.banks]
         grid = mesh_device.compute_with_storage_grid_size()
@@ -617,6 +621,9 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("X_GATHER_SPLIT", "1")]
         if x_local:
             defines = (defines or []) + [("X_LOCAL", "1")]
+        b_ = pending.boundary if pending is not None else None
+        if b_ is not None and getattr(b_, "mc", False) and b_.direct_notify:
+            defines = (defines or []) + [("BND_WAIT_N", str(b_.H))]
         if extra_defines:
             defines = (defines or []) + list(extra_defines)
 
