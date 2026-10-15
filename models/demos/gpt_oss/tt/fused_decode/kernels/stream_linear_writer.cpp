@@ -336,6 +336,9 @@ void kernel_main() {
     if constexpr (wait_x) {
         noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), 1);
     }
+#ifdef MOE_FUSED
+    DeviceTimestampedData("MOE_T", 101);
+#endif
     uint32_t x_stage = 0;
     if constexpr (x_stage_pages > 0) {
         // DRAM source: 32-byte reads must be 64-byte aligned there, so stage the whole tiles in L1 first and pick
@@ -381,6 +384,9 @@ void kernel_main() {
     }
     noc_async_read_barrier();
     cb_push_back(cb_x, kx + 1);
+#ifdef MOE_FUSED
+    DeviceTimestampedData("MOE_T", 102);
+#endif
 
     uint32_t best_key[rows];
     uint32_t best_idx[rows];
@@ -397,6 +403,9 @@ void kernel_main() {
     }
     for (uint32_t c = 0; c < cols; ++c) {
         cb_wait_front(cb_out, 1);
+#ifdef MOE_FUSED
+        DeviceTimestampedData("MOE_T", 103);
+#endif
 #ifdef QKV_ROPE_KV
         const uint32_t n = slot_column(c);
 #else
@@ -415,45 +424,14 @@ void kernel_main() {
                 // out (UINT16, 64 entries): [U, id_0 .. id_{U-1}, 0 ..]; k_addr (BF16 [rows, 32] row-major): row r,
                 // entry i = row r's softmax weight of union expert i (0 when row r did not route to it).
 
-                volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks);
-                volatile tt_l1_ptr uint16_t* wts = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks + 128);
-                volatile tt_l1_ptr uint16_t* logit = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(src);
-                uint16_t row_ids[rows][8];
-                uint16_t row_w[rows][8];
-                uint32_t mask = 0;
                 invalidate_l1_cache();
-                for (uint32_t r = 0; r < rows; ++r) {
-                    uint16_t lg[32];
-                    for (uint32_t i = 0; i < 16; ++i) {
-                        lg[i] = logit[r * 16 + i];
-                        lg[16 + i] = logit[rows * 16 + r * 16 + i];
-                    }
-                    router_topk::topk_softmax_local<q_cols, k_cols>(lg, row_ids[r], row_w[r]);
-                    for (uint32_t j = 0; j < q_cols; ++j) {
-                        mask |= 1u << row_ids[r][j];
-                    }
-                }
-                uint32_t slot[32];
-                uint32_t u = 0;
-                for (uint32_t e = 0; e < 32; ++e) {
-                    if ((mask >> e) & 1) {
-                        slot[e] = u;
-                        uni[1 + u] = e;
-                        ++u;
-                    }
-                }
-                uni[0] = u;
-                for (uint32_t i = 1 + u; i < 64; ++i) {
-                    uni[i] = 0;
-                }
-                for (uint32_t i = 0; i < 32 * rows; ++i) {
-                    wts[i] = 0;
-                }
-                for (uint32_t r = 0; r < rows; ++r) {
-                    for (uint32_t j = 0; j < q_cols; ++j) {
-                        wts[r * 32 + slot[row_ids[r][j]]] = row_w[r][j];
-                    }
-                }
+                router_topk::rows_union<q_cols, rows>(
+                    reinterpret_cast<const uint32_t*>(src),
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks),
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks + 128));
+#ifdef MOE_FUSED
+                DeviceTimestampedData("MOE_T", 104);
+#endif
                 noc_async_write(exp_chunks, s_out.get_noc_addr(0), 128);
                 noc_async_write(exp_chunks + 128, s_k.get_noc_addr(0), 64 * rows);
             } else if constexpr (out_mode == 6) {
@@ -581,10 +559,12 @@ void kernel_main() {
     // this core's L1, runtime arg 5), then release the gate|up and down cores (program semaphore 1; runtime args 6:
     // their count, 7..: noc x, y). The union / weights writes above are complete (barrier).
     {
+        DeviceTimestampedData("MOE_T", 106);
         volatile tt_l1_ptr uint32_t* ctr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_val<uint32_t>(5));
         for (uint32_t i = 0; i < 32 * 4; ++i) {
             ctr[i] = 0;
         }
+        DeviceTimestampedData("MOE_T", 107);
         const uint32_t n = get_arg_val<uint32_t>(6);
         const uint32_t sem = get_semaphore(1);
         for (uint32_t i = 0; i < n; ++i) {
@@ -592,6 +572,9 @@ void kernel_main() {
         }
         noc_async_atomic_barrier();
     }
+#ifdef MOE_FUSED
+    DeviceTimestampedData("MOE_T", 105);
+#endif
 #endif
     if constexpr (notify) {
         // Fused all-reduce send (fused_decode/boundary.py: DecodeBoundary.sending_program): this core's columns of the
