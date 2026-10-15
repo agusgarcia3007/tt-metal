@@ -386,7 +386,7 @@ void kernel_main() {
     uint32_t best_idx[rows];
     if constexpr (out_mode == 6) {
         for (uint32_t r = 0; r < rows; ++r) {
-            best_key[r] = 0;
+            best_key[r] = static_cast<uint32_t>(INT32_MIN);  // below every key (keys are 16-bit signed)
             best_idx[r] = 0xFFFFFFFFu;
         }
     }
@@ -461,22 +461,33 @@ void kernel_main() {
                 noc_async_write(exp_chunks, s_out.get_noc_addr(0), 128);
                 noc_async_write(exp_chunks + 128, s_k.get_noc_addr(0), 64 * rows);
             } else if constexpr (out_mode == 6) {
+                // BF16 b -> signed order key: s = (int16) b; key = s ^ ((s >> 31) & 0x7FFF) (monotonic in the
+                // value, as signed ints). Word loads (two values), values in index order (strict > keeps the lowest).
                 invalidate_l1_cache();
-                volatile tt_l1_ptr uint16_t* val = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(src);
+                const uint32_t* words = reinterpret_cast<const uint32_t*>(src);
                 for (uint32_t r = 0; r < rows; ++r) {
-                    uint32_t bk = best_key[r], bi = best_idx[r];
+                    int32_t bk = static_cast<int32_t>(best_key[r]);
+                    uint32_t bi = best_idx[r];
                     for (uint32_t f = 0; f < 2; ++f) {
-                        volatile tt_l1_ptr uint16_t* v = val + f * 16 * rows + r * 16;
-                        for (uint32_t i = 0; i < 16; ++i) {
-                            const uint32_t b = v[i];
-                            const uint32_t key = (b & 0x8000) ? (~b & 0xFFFFu) : (b | 0x8000u);
-                            if (key > bk) {
-                                bk = key;
-                                bi = n * 32 + f * 16 + i;
+                        const uint32_t* w = words + (f * row_face + r * half_row) / 4;
+                        const uint32_t base = n * 32 + f * 16;
+                        for (uint32_t i = 0; i < 8; ++i) {
+                            const uint32_t v = w[i];
+                            int32_t lo = static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFF));
+                            int32_t hi = static_cast<int32_t>(v) >> 16;
+                            lo ^= (lo >> 31) & 0x7FFF;
+                            hi ^= (hi >> 31) & 0x7FFF;
+                            if (lo > bk) {
+                                bk = lo;
+                                bi = base + 2 * i;
+                            }
+                            if (hi > bk) {
+                                bk = hi;
+                                bi = base + 2 * i + 1;
                             }
                         }
                     }
-                    best_key[r] = bk;
+                    best_key[r] = static_cast<uint32_t>(bk);
                     best_idx[r] = bi;
                 }
             } else if constexpr (out_mode == 5) {

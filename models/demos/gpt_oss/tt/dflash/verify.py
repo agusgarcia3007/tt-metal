@@ -159,7 +159,7 @@ class FusedVerify:
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=mesh,
-            memory_config=dram,
+            memory_config=l1,
             mesh_mapper=rep,
         )
         self.pos = ttnn.from_torch(
@@ -174,6 +174,34 @@ class FusedVerify:
         self.features = {}
         self.fused = True
         self.debug = None  # list: (tag, host [M, hidden]) after every boundary (debugging)
+
+    def enable_device_argmax(self):
+        """Merge the LM head's argmax lists on device (dflash/argmax.py): result = [block tokens, 8 argmaxes] (UINT32
+        [1, 2 M], read by read_result)."""
+        from .argmax import ArgmaxGather
+
+        self.argmax_gather = ArgmaxGather(self.mesh, self.M, len(self.lm_head.assignments), self.vd, kind=1)
+        self.result = ttnn.from_torch(
+            torch.zeros(1, 2 * self.M, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
+    def read_result(self):
+        """Host: (block tokens, target argmaxes) from device 0's result buffer."""
+        r = ttnn.to_torch(ttnn.get_device_tensors(self.result)[0]).reshape(-1).long().tolist()
+        return r[: self.M], r[self.M :]
+
+    def set_positions(self, start):
+        p = ttnn.from_torch(
+            torch.arange(start, start + self.M, dtype=torch.int32),
+            dtype=ttnn.int32,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        ttnn.copy_host_to_device_tensor(p, self.pos)
 
     def set_inputs(self, tokens, start):
         """Host -> device: the M block tokens and positions start .. start + M - 1."""
@@ -226,6 +254,8 @@ class FusedVerify:
             gamma = self.gamma_final if last else self.gamma_in[i + 1]
             pending = PendingBoundary(b, res, gamma, self.partial, "moe", sent=True)
         self.lm_head(pending, self.lm_weights, self.lists)
+        if getattr(self, "argmax_gather", None) is not None:
+            self.argmax_gather(self.lists, self.tokens, self.result)
         pending.x.deallocate(True)
         pending.residual.deallocate(True)
         pending.residual_out.deallocate(True)

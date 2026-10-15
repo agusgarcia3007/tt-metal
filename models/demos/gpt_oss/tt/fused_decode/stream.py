@@ -675,12 +675,13 @@ def _rope_rotation_tiles(mesh_device):
 def merge_argmax(device_lists, rows, vocab_per_device):
     """device_lists: per device a flat int64 tensor [cores * rows * 2] of (key, local index) -> [rows] global argmax
     ids (ties to the lower id)."""
-    best = [(-1, 0)] * rows
+    best = [(-(1 << 40), 0)] * rows
     for d, lst in enumerate(device_lists):
         t = lst.reshape(-1, rows, 2)
         for c in range(t.shape[0]):
             for r in range(rows):
                 key, idx = int(t[c, r, 0]), int(t[c, r, 1])
+                key = key - (1 << 32) if key >= (1 << 31) else key  # signed order key
                 gid = d * vocab_per_device + idx
                 if key > best[r][0] or (key == best[r][0] and gid < best[r][1]):
                     best[r] = (key, gid)

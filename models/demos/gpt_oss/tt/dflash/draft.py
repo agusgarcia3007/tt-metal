@@ -687,8 +687,18 @@ class DFlashDraft:
         h.deallocate(True)
         self.lm(xb, self.lm_weights, self.lists)
         xb.deallocate(True)
+        if getattr(self, "argmax_gather", None) is not None:
+            # [last token, 7 drafts] straight into the verify pass's token input
+            self.argmax_gather(self.lists, self.t_toks, self.verify_tokens)
         for t in rot:
             t.deallocate(True)
+
+    def feed_verify(self, verify_tokens):
+        """Drafts go on device into the verify pass's token input ([1, 8] UINT32) instead of to the host."""
+        from .argmax import ArgmaxGather
+
+        self.verify_tokens = verify_tokens
+        self.argmax_gather = ArgmaxGather(self.mesh_device, self.block, len(self.lm.assignments), self.vd, kind=0)
 
     def _drafts_from_lists(self):
         from ..fused_decode.stream import merge_argmax, read_lists

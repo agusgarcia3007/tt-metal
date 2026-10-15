@@ -177,6 +177,8 @@ class FastDFlashRunner:
         self.verify = FusedVerify(model, page_table, kv, rows=draft.block, capture_layers=draft.target_layer_ids)
         draft.enable_trace()
         self.verify.set_context_target(draft.t_ctx)
+        self.verify.enable_device_argmax()
+        draft.feed_verify(self.verify.tokens)
         self.verify_trace = None
 
     def _verify(self, block, start):
@@ -218,12 +220,22 @@ class FastDFlashRunner:
         t_prefill = time.perf_counter() - t0
         accept, rounds = [], []
         B = self.draft.block
+        mesh = self.model.mesh_device
         while len(ids) - L < max_new_tokens and not (set(ids[L:]) & self.eos_ids):
             t = time.perf_counter()
             start = len(ids) - 1
-            d = self.draft.draft_traced(ids[-1], start)
+            # draft -> (on device) verify block -> verify -> one host read of [block, target argmaxes]
+            self.draft.set_draft_inputs(ids[-1], start)
+            self.verify.set_positions(start)
+            if self.verify_trace is None:
+                self.draft._draft_device()
+                self.verify.forward()
+            else:
+                ttnn.execute_trace(mesh, self.draft.trace_draft, cq_id=0, blocking=False)
+                ttnn.execute_trace(mesh, self.verify_trace, cq_id=0, blocking=False)
             t1 = time.perf_counter()
-            post = self._verify([ids[-1]] + d, start)
+            block, post = self.verify.read_result()
+            d = block[1:]
             t2 = time.perf_counter()
             k = 0
             while k < B - 1 and d[k] == post[k]:
