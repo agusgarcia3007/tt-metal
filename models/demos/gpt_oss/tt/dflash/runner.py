@@ -317,7 +317,8 @@ class FastDFlashRunner:
             warmup_prefill=False,
         )
         # 256-row chunks: the verify pass's persistent L1 buffers leave less room for the matmul's circular buffers.
-        self.draft.add_prompt_context(self.capture.prefill_features(L), chunk=256)
+        chunk = int(os.environ.get("DFLASH_PROMPT_CHUNK", "256"))
+        self.draft.add_prompt_context(self.capture.prefill_features(L), chunk=chunk)
         return int(logits.reshape(-1)[: self.V].float().argmax())
 
     def generate(self, prompt_ids, max_new_tokens, first=None):
