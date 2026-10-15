@@ -685,3 +685,9 @@ def merge_argmax(device_lists, rows, vocab_per_device):
                 if key > best[r][0] or (key == best[r][0] and gid < best[r][1]):
                     best[r] = (key, gid)
     return [b[1] for b in best]
+
+
+def read_lists(lists, mesh_device):
+    """Host: the per-device out_mode 6 lists of a [1, n] UINT32 mesh tensor in one readback."""
+    t = ttnn.to_torch(lists, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=0))
+    return [row.reshape(-1).long() & 0xFFFFFFFF for row in t.reshape(mesh_device.get_num_devices(), -1)]

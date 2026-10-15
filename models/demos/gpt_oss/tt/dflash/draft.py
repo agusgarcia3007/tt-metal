@@ -530,11 +530,14 @@ class DFlashDraft:
         self.t_bound = dev(torch.full((ROWS,), -1, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         self.t_cpos = dev(torch.full((ROWS,), -1, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         self.t_crot = dev(torch.zeros(1, ROWS, dtype=torch.int32), ttnn.uint32)
-        self.t_ctx = dev(
+        # Written on device by the verify pass (FusedVerify.set_context_target), or by the host (set_context_inputs).
+        self.t_ctx = ttnn.from_torch(
             torch.zeros(1, 1, ROWS, self.ctx_in),
-            ttnn.bfloat16,
-            ttnn.TILE_LAYOUT,
-            ttnn.ShardTensorToMesh(mesh, dim=-1),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=mesh,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=-1),
         )
         self.kv_write = DraftKVWrite(mesh, B, self.nkv, self.hd, self.block_size)
         term = self.target.decode_terminal
@@ -580,6 +583,14 @@ class DFlashDraft:
         ttnn.copy_host_to_device_tensor(self._host_rows(pos, ttnn.int32), self.t_pos)
         ttnn.copy_host_to_device_tensor(self._host_rows(rot, ttnn.uint32, (1, ROWS)), self.t_rot)
         ttnn.copy_host_to_device_tensor(self._host_rows(bound, ttnn.int32), self.t_bound)
+
+    def set_context_positions(self, positions):
+        """The context rows' positions (their features are already in t_ctx, written on device)."""
+        n = len(positions)
+        pos = list(positions) + [-1] * (ROWS - n)
+        rot = list(positions) + [0] * (ROWS - n)
+        ttnn.copy_host_to_device_tensor(self._host_rows(pos, ttnn.int32), self.t_cpos)
+        ttnn.copy_host_to_device_tensor(self._host_rows(rot, ttnn.uint32, (1, ROWS)), self.t_crot)
 
     def set_context_inputs(self, features, positions):
         """features: host [n <= 8, 5 * hidden]; positions: their n consecutive positions."""
@@ -680,10 +691,9 @@ class DFlashDraft:
             t.deallocate(True)
 
     def _drafts_from_lists(self):
-        from ..fused_decode.stream import merge_argmax
+        from ..fused_decode.stream import merge_argmax, read_lists
 
-        lists = [ttnn.to_torch(t).reshape(-1).long() & 0xFFFFFFFF for t in ttnn.get_device_tensors(self.lists)]
-        return merge_argmax(lists, self.block, self.vd)[1:]
+        return merge_argmax(read_lists(self.lists, self.mesh_device), self.block, self.vd)[1:]
 
     def capture_traces(self):
         """Capture the context and draft traces (call once eager-compiled: after one eager add_context_traced /
@@ -697,7 +707,11 @@ class DFlashDraft:
         ttnn.end_trace_capture(mesh, self.trace_draft, cq_id=0)
 
     def add_context_traced(self, features, positions):
-        self.set_context_inputs(features, positions)
+        """features None: already in t_ctx (written by the verify pass on device)."""
+        if features is None:
+            self.set_context_positions(positions)
+        else:
+            self.set_context_inputs(features, positions)
         if self.trace_ctx is None:
             self._context_device()
         else:

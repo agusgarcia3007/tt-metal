@@ -176,6 +176,7 @@ class FastDFlashRunner:
         kv = kv_cache[0] if isinstance(kv_cache[0][0], list) else kv_cache
         self.verify = FusedVerify(model, page_table, kv, rows=draft.block, capture_layers=draft.target_layer_ids)
         draft.enable_trace()
+        self.verify.set_context_target(draft.t_ctx)
         self.verify_trace = None
 
     def _verify(self, block, start):
@@ -228,8 +229,7 @@ class FastDFlashRunner:
             while k < B - 1 and d[k] == post[k]:
                 k += 1
             ids += d[:k] + [post[k]]
-            feats = self.verify.host_features(k + 1)
-            self.draft.add_context_traced(feats, range(start, start + k + 1))
+            self.draft.add_context_traced(None, range(start, start + k + 1))
             t3 = time.perf_counter()
             accept.append(k + 1)
             rounds.append((t1 - t, t2 - t1, t3 - t2))

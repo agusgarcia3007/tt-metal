@@ -41,7 +41,7 @@ from ..fused_decode.config import (
     ROUTER_DECODE_WEIGHT_DTYPE,
     sdpa_decode_program_config,
 )
-from ..fused_decode.stream import LinearStream, QKVRopeCache, merge_argmax, rope_rotation_tiles
+from ..fused_decode.stream import LinearStream, QKVRopeCache, merge_argmax, read_lists, rope_rotation_tiles
 from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion, act_buffer, union_buffers
 
 TILE = ttnn.TILE_SIZE
@@ -230,7 +230,42 @@ class FusedVerify:
         pending.residual.deallocate(True)
         pending.residual_out.deallocate(True)
 
+    def set_context_target(self, ctx_input):
+        """Capture straight into the drafter's context input ([1, 1, 32, 5 * hidden] BF16 tile tensor, L1
+        interleaved, width-sharded over the mesh columns; DFlashDraft.t_ctx) instead of self.features."""
+        self.ctx_input = ctx_input
+
+    def _capture_to_ctx(self, L, res):
+        from ..fused_decode.boundary import KERNEL_DIR
+
+        slot = self.capture_layers.index(L)
+        mesh, b, H, M = self.mesh, self.boundary, self.H, self.M
+        shard = self.ctx_input.shape[-1]  # per-device width (a mesh tensor's shape is the device shard's)
+        lo, hi = slot * H, (slot + 1) * H
+        mesh_program = ttnn.MeshProgramDescriptor()
+        ct = [M, H, lo] + ttnn.TensorAccessorArgs(self.ctx_input).get_compile_time_args()
+        for coord in b.coords:
+            d = coord[1]
+            c0, c1 = max(lo, d * shard), min(hi, (d + 1) * shard)
+            rt = ttnn.RuntimeArgs()
+            rt[b.core.x][b.core.y] = [res.buffer_address(), self.ctx_input.buffer_address(), c0, max(c0, c1), d * shard]
+            kernel = ttnn.KernelDescriptor(
+                kernel_source=str(KERNEL_DIR / "rowtile_to_ctx.cpp"),
+                core_ranges=b.cores,
+                compile_time_args=ct,
+                runtime_args=rt,
+                config=ttnn.DataMovementConfigDescriptor(
+                    processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0
+                ),
+            )
+            mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = ttnn.ProgramDescriptor(
+                kernels=[kernel], semaphores=[], cbs=[]
+            )
+        ttnn.generic_op([res, self.ctx_input], mesh_program)
+
     def _capture(self, L, res):
+        if getattr(self, "ctx_input", None) is not None:
+            return self._capture_to_ctx(L, res)
         old = self.features.get(L)
         if old is not None:
             old.deallocate(True)
@@ -305,8 +340,7 @@ class FusedVerify:
 
     def argmax(self):
         """Host: the target's argmax token for each of the M rows."""
-        lists = [ttnn.to_torch(t).reshape(-1).long() & 0xFFFFFFFF for t in ttnn.get_device_tensors(self.lists)]
-        return merge_argmax(lists, self.M, self.vd)
+        return merge_argmax(read_lists(self.lists, self.mesh), self.M, self.vd)
 
     def host_features(self, n):
         """Host: [n, 5 * hidden] drafter context features of the first n rows (layer order of capture_layers)."""
