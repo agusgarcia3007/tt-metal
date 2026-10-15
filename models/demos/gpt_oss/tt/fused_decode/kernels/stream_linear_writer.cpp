@@ -29,6 +29,16 @@
 //    column is converted to BFP8 into row (position % block) of its cache tile, which is written back. The weight slots
 //    are in K / V-first order (qkv_column_order): slot c's output column is runtime arg 12 + c.
 //
+// 5. ROWS = M > 1 (DFlash verify, M token rows): activation / output tiles are [M, 32] (faces [M, 16]: row r of
+//    face f at byte f * 32 M + 32 r). x_pages = 0: the source is the boundary's row-tile layout
+//    (fused_decode/boundary.py: [M, 32] tiles back to back, read in one piece); otherwise row r of tile j is row (j /
+//    x_pages) of tile page (r * x_pages + j % x_pages) of an [M users, 32, 32 x_pages] source (the SDPA output, one
+//    user per token row). out_mode 5 writes tile n to bytes [n * 64 M, (n + 1) * 64 M) of the row-tile partial;
+//    out_mode 3 writes row r of column n into the [M users, 32 heads, head_tiles * 32] head tensors (tile page r *
+//    head_tiles + t). out_mode 6 (LM head argmax): no logits are written; this core keeps each row's largest output
+//    (BF16 order key, ties to the lower output index 32 n + lane) and finally writes [key, index] (2 x UINT32) per row
+//    at byte 8 rows * list_idx of `out` (list_idx: runtime arg 5); the host merges the cores' / devices' lists.
+//
 // runtime args: [x_addr, out_addr, col0, k_addr, v_addr, lists_addr, list_idx]; QKV_ROPE_KV: [x_addr, out_addr, col0,
 //                k_addr, v_addr, rot, cos, sin, pos, page_table, k_cache, v_cache addresses, slot columns...]
 
@@ -36,6 +46,10 @@
 
 #include "api/dataflow/dataflow_api.h"
 #include "router_topk.hpp"
+
+#ifndef ROWS
+#define ROWS 1
+#endif
 
 #ifdef QKV_ROPE_KV
 // One BF16 value (bits b) as a BFP8_b byte under shared exponent `shared`: sign | 7-bit magnitude = the 8-bit
@@ -59,13 +73,14 @@ inline uint32_t bfp8_byte(uint32_t b, uint32_t shared) {
 // Writes 32 BF16 values (1x32 tile at src: values 0-15 then 16-31) into row rr of the BFP8_b 32x32 tile at tile
 // (L1): per 16-value face row the shared exponent is the largest exponent. Layout: 64 exponent bytes (face-major, then
 // row), then 4 x 256 mantissa bytes (face-major, row-major). Word loads / stores: this core is slow at byte accesses.
-inline void bfp8_write_row(uint32_t tile, uint32_t src, uint32_t rr) {
-    volatile tt_l1_ptr uint32_t* in = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src);
+// lo / hi: the 16 BF16 values of the row's first / second half.
+inline void bfp8_write_row(uint32_t tile, uint32_t lo, uint32_t hi, uint32_t rr) {
     for (uint32_t hh = 0; hh < 2; ++hh) {
+        volatile tt_l1_ptr uint32_t* in = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(hh == 0 ? lo : hi);
         uint32_t v[16];
         uint32_t shared = 0;
         for (uint32_t i = 0; i < 8; ++i) {
-            const uint32_t w = in[hh * 8 + i];
+            const uint32_t w = in[i];
             v[2 * i] = w & 0xFFFF;
             v[2 * i + 1] = w >> 16;
             const uint32_t e0 = (w >> 7) & 0xFF;
@@ -161,7 +176,11 @@ void kernel_main() {
         }
     }
 
-    constexpr uint32_t tiny_bytes = 64;
+    constexpr uint32_t rows = ROWS;
+    static_assert(rows == 1 || topk == 0, "multi-row: no LM-head top-k yet");
+    static_assert(out_mode != 4 || rows == 1 || (k_cols == 32 && q_cols <= 8), "router: 32 experts, top-k <= 8");
+    constexpr uint32_t tiny_bytes = 64 * rows;  // one [rows, 32] BF16 tile
+    constexpr uint32_t row_face = 32 * rows;    // one [rows, 16] face
     constexpr uint32_t half_row = 32;
     constexpr uint32_t face_bytes = 512;
     constexpr uint32_t chunk = 16;
@@ -171,7 +190,7 @@ void kernel_main() {
     const auto s_k = TensorAccessor(k_args, k_addr, out_page_bytes);
     const auto s_v = TensorAccessor(v_args, v_addr, out_page_bytes);
 
-#ifdef QKV_ROPE_KV
+#if defined(QKV_ROPE_KV) && ROWS == 1
     // Before the activation (none of this depends on it, and a fused boundary is still running): RoPE inputs for
     // compute: [I, T] and the position's cos / sin rows (row 0 of the first user's [32, head_dim] shard: 16 values in
     // face 0, 16 in face 1 of each 32-wide tile).
@@ -223,6 +242,93 @@ void kernel_main() {
     invalidate_l1_cache();
     cb_push_back(cb_rot, 2);
     cb_push_back(cb_cs, 2 * head_tiles);
+#elif defined(QKV_ROPE_KV)
+    // rows token rows at positions pos[0..rows) (consecutive, one user: DFlash verify). cos / sin: row-major tables,
+    // one page per position; row r of [rows, 32] tile t gets values 32 t .. 32 t + 31 of row pos[r]. The rows' K / V
+    // land in at most two cache tiles per column (group 0: the first row's 32-row tile, group 1: the last row's).
+    constexpr uint32_t rope_row = head_tiles * 64;
+    const auto s_ctab = TensorAccessor(cos_args, get_arg_val<uint32_t>(6), rope_row);
+    const auto s_stab = TensorAccessor(sin_args, get_arg_val<uint32_t>(7), rope_row);
+    constexpr uint32_t scr_pages = 3;
+    constexpr uint32_t off_cs = 192;  // [pos page | page-table chunk 0 | chunk 1 | cos rows | sin rows]
+    static_assert(off_cs + 2 * rows * rope_row <= scr_pages * kv_tile_bytes, "rope scratch");
+    static_assert(rows <= 32 && rows <= block_size, "rows span at most two 32-row cache tiles");
+    cb_reserve_back(cb_rot, 2);
+    const uint32_t rot_l1 = get_write_ptr(cb_rot);
+    noc_async_read(s_rot.get_noc_addr(0), rot_l1, kv_tile_bytes);
+    noc_async_read(s_rot.get_noc_addr(1), rot_l1 + kv_tile_bytes, kv_tile_bytes);
+    cb_reserve_back(cb_kv, scr_pages + 2 * cols);
+    const uint32_t kv_l1 = get_write_ptr(cb_kv);
+    noc_async_read(s_pos.get_noc_addr(0), kv_l1, 64);
+    noc_async_read_barrier();
+    invalidate_l1_cache();
+    uint32_t row_pos[rows];
+    for (uint32_t i = 0; i < rows; ++i) {
+        row_pos[i] = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kv_l1)[i];
+    }
+    const uint32_t bi0 = row_pos[0] / block_size, bi1 = row_pos[rows - 1] / block_size;
+    uint32_t blk0 = 0, blk1 = 0;
+    if constexpr (paged) {
+        noc_async_read(s_pt.get_noc_addr(0) + ((bi0 * 4) & ~63u), kv_l1 + 64, 64);
+        noc_async_read(s_pt.get_noc_addr(0) + ((bi1 * 4) & ~63u), kv_l1 + 128, 64);
+    }
+    for (uint32_t i = 0; i < rows; ++i) {
+        noc_async_read(s_ctab.get_noc_addr(row_pos[i]), kv_l1 + off_cs + i * rope_row, rope_row);
+        noc_async_read(s_stab.get_noc_addr(row_pos[i]), kv_l1 + off_cs + (rows + i) * rope_row, rope_row);
+    }
+    noc_async_read_barrier();
+    invalidate_l1_cache();
+    if constexpr (paged) {
+        blk0 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kv_l1 + 64)[bi0 & 15];
+        blk1 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kv_l1 + 128)[bi1 & 15];
+    }
+    const uint32_t tr0 = (row_pos[0] % block_size) / 32, tr1 = (row_pos[rows - 1] % block_size) / 32;
+    const bool two_groups = bi0 != bi1 || tr0 != tr1;
+    auto row_group = [&](uint32_t i) -> uint32_t {
+        return (row_pos[i] / block_size == bi0 && (row_pos[i] % block_size) / 32 == tr0) ? 0 : 1;
+    };
+    // cos / sin rows -> [rows, 32] tiles: cos_t at cs page t, sin_t at page head_tiles + t.
+    cb_reserve_back(cb_cs, 2 * head_tiles);
+    const uint32_t cs_l1 = get_write_ptr(cb_cs);
+    for (uint32_t tab = 0; tab < 2; ++tab) {
+        for (uint32_t i = 0; i < rows; ++i) {
+            volatile tt_l1_ptr uint32_t* src =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kv_l1 + off_cs + (tab * rows + i) * rope_row);
+            for (uint32_t t = 0; t < head_tiles; ++t) {
+                for (uint32_t f = 0; f < 2; ++f) {
+                    volatile tt_l1_ptr uint32_t* dst = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                        cs_l1 + (tab * head_tiles + t) * tiny_bytes + f * row_face + i * half_row);
+                    for (uint32_t w = 0; w < 8; ++w) {
+                        dst[w] = src[t * 16 + f * 8 + w];
+                    }
+                }
+            }
+        }
+    }
+    // Cache tile of K / V output column n in group g.
+    auto kv_cache_addr_g = [&](uint32_t n, uint32_t g) -> uint64_t {
+        const bool is_k = n < q_cols + k_cols;
+        const uint32_t m = is_k ? n - q_cols : n - q_cols - k_cols;
+        const uint32_t blk = g == 0 ? blk0 : blk1;
+        const uint32_t tr = g == 0 ? tr0 : tr1;
+        const uint32_t tile =
+            ((blk * num_kv_heads + m / head_tiles) * (block_size / 32) + tr) * head_tiles + m % head_tiles;
+        return is_k ? s_kc.get_noc_addr(tile) : s_vc.get_noc_addr(tile);
+    };
+    for (uint32_t c = 0; c < cols; ++c) {
+        const uint32_t n = slot_column(c);
+        if (n >= q_cols && n < n_tiles) {
+            const uint32_t t0 = kv_l1 + (scr_pages + 2 * c) * kv_tile_bytes;
+            noc_async_read(kv_cache_addr_g(n, 0), t0, kv_tile_bytes);
+            if (two_groups) {
+                noc_async_read(kv_cache_addr_g(n, 1), t0 + kv_tile_bytes, kv_tile_bytes);
+            }
+        }
+    }
+    noc_async_read_barrier();
+    invalidate_l1_cache();
+    cb_push_back(cb_rot, 2);
+    cb_push_back(cb_cs, 2 * head_tiles);
 #endif
 
     cb_reserve_back(cb_x, kx + 1);
@@ -236,7 +342,7 @@ void kernel_main() {
         // the rows out of the local copy.
         cb_reserve_back(cb_stage, x_stage_pages);
         x_stage = get_write_ptr(cb_stage);
-        for (uint32_t p = 0; p < x_stage_pages; ++p) {
+        for (uint32_t p = 0; p < x_stage_pages; ++p) {  // x_stage_pages = rows * x_pages
             noc_async_read(s_x.get_noc_addr(p), x_stage + p * 2048, 2048);
         }
         noc_async_read_barrier();
@@ -248,18 +354,29 @@ void kernel_main() {
     for (uint32_t j = 0; x_pages > 0 && j < kx; ++j) {
         const uint32_t row = j / gather_pages;
         const uint32_t off = row < 16 ? row * half_row : 2 * face_bytes + (row - 16) * half_row;  // faces 0/1, 2/3
-        const uint64_t src =
-            x_stage_pages > 0 ? get_noc_addr(x_stage + (j % gather_pages) * 2048) : s_x.get_noc_addr(j % gather_pages);
-        noc_async_read(src + off, x_l1 + j * tiny_bytes, half_row);
-        noc_async_read(src + off + face_bytes, x_l1 + j * tiny_bytes + half_row, half_row);
+        for (uint32_t r = 0; r < rows; ++r) {
+            const uint32_t page = r * gather_pages + j % gather_pages;
+            const uint64_t src = x_stage_pages > 0 ? get_noc_addr(x_stage + page * 2048) : s_x.get_noc_addr(page);
+            noc_async_read(src + off, x_l1 + j * tiny_bytes + r * half_row, half_row);
+            noc_async_read(src + off + face_bytes, x_l1 + j * tiny_bytes + row_face + r * half_row, half_row);
+        }
     }
+    // Bias multipliers: `nbias` ones at the start of every row (face 0), zeros elsewhere.
     volatile tt_l1_ptr uint16_t* ones = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(x_l1 + kx * tiny_bytes);
-    for (uint32_t i = 0; i < 32; ++i) {
-        ones[i] = i < nbias ? 0x3F80 : 0;  // BF16 1.0
+    for (uint32_t i = 0; i < 32 * rows; ++i) {
+        ones[i] = (i < 16 * rows && i % 16 < nbias) ? 0x3F80 : 0;  // BF16 1.0
     }
     noc_async_read_barrier();
     cb_push_back(cb_x, kx + 1);
 
+    uint32_t best_key[rows];
+    uint32_t best_idx[rows];
+    if constexpr (out_mode == 6) {
+        for (uint32_t r = 0; r < rows; ++r) {
+            best_key[r] = 0;
+            best_idx[r] = 0xFFFFFFFFu;
+        }
+    }
     uint32_t exp_chunks = 0;
     if constexpr (out_mode == 4) {
         cb_reserve_back(cb_scr, 1);
@@ -274,33 +391,122 @@ void kernel_main() {
 #endif
         if (n < n_tiles) {
             const uint32_t src = get_read_ptr(cb_out);
-            if constexpr (out_mode == 4) {
+            if constexpr (out_mode == 4 && rows == 1) {
                 router_topk::topk_softmax<q_cols, k_cols>(
                     reinterpret_cast<volatile tt_l1_ptr uint16_t*>(src),
                     reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks));
                 noc_async_write(exp_chunks, s_out.get_noc_addr(0), chunk);
                 noc_async_write(exp_chunks + chunk, s_k.get_noc_addr(0), chunk);
+            } else if constexpr (out_mode == 4) {
+                // Multi-row: per row top-k + softmax, then the union of the rows' experts (ascending id):
+                // out (UINT16, 64 entries): [U, id_0 .. id_{U-1}, 0 ..]; k_addr (BF16 [rows, 32] row-major): row r,
+                // entry i = row r's softmax weight of union expert i (0 when row r did not route to it).
+
+                volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks);
+                volatile tt_l1_ptr uint16_t* wts = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks + 128);
+                volatile tt_l1_ptr uint16_t* lg =
+                    reinterpret_cast<volatile tt_l1_ptr uint16_t*>(exp_chunks + 128 + 64 * rows);
+                volatile tt_l1_ptr uint16_t* stage = lg + 32;
+                volatile tt_l1_ptr uint16_t* logit = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(src);
+                uint16_t row_ids[rows][8];
+                uint16_t row_w[rows][8];
+                uint32_t mask = 0;
+                invalidate_l1_cache();
+                for (uint32_t r = 0; r < rows; ++r) {
+                    for (uint32_t i = 0; i < 16; ++i) {
+                        lg[i] = logit[r * 16 + i];
+                        lg[16 + i] = logit[rows * 16 + r * 16 + i];
+                    }
+                    router_topk::topk_softmax<q_cols, k_cols>(lg, stage);
+                    for (uint32_t j = 0; j < q_cols; ++j) {
+                        row_ids[r][j] = stage[j];
+                        row_w[r][j] = stage[8 + j];
+                        mask |= 1u << stage[j];
+                    }
+                }
+                uint32_t slot[32];
+                uint32_t u = 0;
+                for (uint32_t e = 0; e < 32; ++e) {
+                    if ((mask >> e) & 1) {
+                        slot[e] = u;
+                        uni[1 + u] = e;
+                        ++u;
+                    }
+                }
+                uni[0] = u;
+                for (uint32_t i = 1 + u; i < 64; ++i) {
+                    uni[i] = 0;
+                }
+                for (uint32_t i = 0; i < 32 * rows; ++i) {
+                    wts[i] = 0;
+                }
+                for (uint32_t r = 0; r < rows; ++r) {
+                    for (uint32_t j = 0; j < q_cols; ++j) {
+                        wts[r * 32 + slot[row_ids[r][j]]] = row_w[r][j];
+                    }
+                }
+                noc_async_write(exp_chunks, s_out.get_noc_addr(0), 128);
+                noc_async_write(exp_chunks + 128, s_k.get_noc_addr(0), 64 * rows);
+            } else if constexpr (out_mode == 6) {
+                invalidate_l1_cache();
+                volatile tt_l1_ptr uint16_t* val = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(src);
+                for (uint32_t r = 0; r < rows; ++r) {
+                    uint32_t bk = best_key[r], bi = best_idx[r];
+                    for (uint32_t f = 0; f < 2; ++f) {
+                        volatile tt_l1_ptr uint16_t* v = val + f * 16 * rows + r * 16;
+                        for (uint32_t i = 0; i < 16; ++i) {
+                            const uint32_t b = v[i];
+                            const uint32_t key = (b & 0x8000) ? (~b & 0xFFFFu) : (b | 0x8000u);
+                            if (key > bk) {
+                                bk = key;
+                                bi = n * 32 + f * 16 + i;
+                            }
+                        }
+                    }
+                    best_key[r] = bk;
+                    best_idx[r] = bi;
+                }
             } else if constexpr (out_mode == 5) {
-                noc_async_write(src, s_out.get_noc_addr(n / 32, (n % 32) * tiny_bytes), tiny_bytes);
+                noc_async_write(src, s_out.get_noc_addr(n * tiny_bytes / 2048, (n * tiny_bytes) % 2048), tiny_bytes);
             }
-#ifdef QKV_ROPE_KV
+#if defined(QKV_ROPE_KV) && ROWS == 1
             else if (n >= q_cols) {
                 // K (rotated) / V row -> row r of its prefetched paged cache tile, written back.
                 const uint32_t tile_l1 = kv_l1 + (1 + c) * kv_tile_bytes;
                 invalidate_l1_cache();  // src was written by the packer
-                bfp8_write_row(tile_l1, src, r % 32);
+                bfp8_write_row(tile_l1, src, src + 32, r % 32);
                 noc_async_write(tile_l1, kv_cache_addr(n), kv_tile_bytes);
+            }
+#elif defined(QKV_ROPE_KV)
+            else if (n >= q_cols) {
+                // K (rotated) / V rows -> their prefetched cache tiles (row pos % 32), written back.
+                const uint32_t t0 = kv_l1 + (scr_pages + 2 * c) * kv_tile_bytes;
+                invalidate_l1_cache();  // src was written by the packer
+                for (uint32_t i = 0; i < rows; ++i) {
+                    bfp8_write_row(
+                        t0 + row_group(i) * kv_tile_bytes,
+                        src + i * half_row,
+                        src + row_face + i * half_row,
+                        row_pos[i] % 32);
+                }
+                noc_async_write(t0, kv_cache_addr_g(n, 0), kv_tile_bytes);
+                if (two_groups) {
+                    noc_async_write(t0 + kv_tile_bytes, kv_cache_addr_g(n, 1), kv_tile_bytes);
+                }
             }
 #endif
             else {
                 const uint32_t m = n < q_cols ? n : (n < q_cols + k_cols ? n - q_cols : n - q_cols - k_cols);
                 const uint32_t h = m / head_tiles;
                 const uint32_t off = h < 16 ? h * half_row : 2 * face_bytes + (h - 16) * half_row;
-                const uint64_t dst = n < q_cols            ? s_out.get_noc_addr(m % head_tiles, off)
-                                     : n < q_cols + k_cols ? s_k.get_noc_addr(m % head_tiles, off)
-                                                           : s_v.get_noc_addr(m % head_tiles, off);
-                noc_async_write(src, dst, half_row);
-                noc_async_write(src + half_row, dst + face_bytes, half_row);
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const uint32_t page = r * head_tiles + m % head_tiles;
+                    const uint64_t dst = n < q_cols            ? s_out.get_noc_addr(page, off)
+                                         : n < q_cols + k_cols ? s_k.get_noc_addr(page, off)
+                                                               : s_v.get_noc_addr(page, off);
+                    noc_async_write(src + r * half_row, dst, half_row);
+                    noc_async_write(src + row_face + r * half_row, dst + face_bytes, half_row);
+                }
                 if constexpr (topk) {
                     // Running top-K of this core's outputs (columns arrive in index order, so a value equal to the
                     // current K-th one has a larger index and does not enter).
@@ -324,6 +530,16 @@ void kernel_main() {
             noc_async_writes_flushed();
         }
         cb_pop_front(cb_out, 1);
+    }
+    if constexpr (out_mode == 6) {
+        // Through the (now drained) activation staging of cb_x.
+        volatile tt_l1_ptr uint32_t* list = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(x_l1);
+        for (uint32_t r = 0; r < rows; ++r) {
+            list[2 * r] = best_key[r];
+            list[2 * r + 1] = best_idx[r];
+        }
+        const uint32_t list_idx = get_arg_val<uint32_t>(5);
+        noc_async_write(x_l1, s_out.get_noc_addr(0, list_idx * 8 * rows), 8 * rows);
     }
     if constexpr (topk) {
         // The list goes out through the (now drained) weight-gather staging of cb_x: K keys then K indices.

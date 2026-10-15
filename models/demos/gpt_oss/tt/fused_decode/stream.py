@@ -221,10 +221,11 @@ class _BankStreamOp:
         for c, *_ in self.assignments[1:]:
             self.cores = self.cores.merge(ttnn.CoreRangeSet([ttnn.CoreRange(c, c)]))
 
-    def _cb(self, index, dtype, page, pages, tiny=False):
+    def _cb(self, index, dtype, page, pages, tiny=False, rows=1):
+        """tiny: [rows, 32] tiles (page = 64 rows bytes for BF16)."""
         kwargs = dict(buffer_index=index, data_format=dtype, page_size=page)
         if tiny:
-            kwargs["tile"] = ttnn.TileDescriptor(ttnn.Tile([1, TILE]))
+            kwargs["tile"] = ttnn.TileDescriptor(ttnn.Tile([rows, TILE]))
         return ttnn.CBDescriptor(
             total_size=page * pages, core_ranges=self.cores, format_descriptors=[ttnn.CBFormatDescriptor(**kwargs)]
         )
@@ -416,7 +417,14 @@ class LinearStream(_BankStreamOp):
       3: attention heads, out = (Q, K, V) BF16 [heads, head_tiles * 32] tile tensors, head h in row h,
          heads = (q_cols, k_cols) output tiles of Q and K;
       4: router top-k + softmax, out = (ids, scores) [1, 32] UINT16 / BF16 row-major buffers, heads = (k, n_experts);
+         rows > 1: per-row top-k, out = (union, weights): UINT16 [1, 64] = [U, the U union expert ids ascending],
+         BF16 [1, 32 M]: row r's weight of union expert i at entry 32 r + i (0 if not routed);
       5: out = the flat BF16 partial sum the boundary all-reduces (output column n -> bytes [64 n, 64 n + 64)).
+      6: (rows > 1, LM head) per-row argmax: out = a UINT32 buffer receiving, per worker core i, [key, index] per row
+         at byte 8 M i (key: BF16 order key of the row's largest output on that core; argmax_lists merges them).
+    rows = M > 1 (DFlash verify): M token rows per op, in [M, 32] activation / output tiles (kernels/
+    stream_linear_writer.cpp item 5): x is the boundary's row-tile layout (x_pages = 0) or an [M, 32, 32 x_pages]
+    source (one token row per user), out_mode 5 writes the row-tile partial, out_mode 3 [M, 32, head_tiles * 32] heads.
     """
 
     def __init__(
@@ -432,6 +440,7 @@ class LinearStream(_BankStreamOp):
         heads=(0, 0),
         head_tiles=2,
         prefetch_cols=None,
+        rows=1,
     ):
         n_tiles = -(-n // TILE)
         banks = mesh_device.dram_grid_size().x
@@ -443,12 +452,15 @@ class LinearStream(_BankStreamOp):
         self.kx = k_tiles
         self.kt = k_tiles + 1
         self.x_pages = 0 if x_pages is None else x_pages
-        assert out_mode in (3, 4, 5), f"out_mode {out_mode}"
+        assert out_mode in (3, 4, 5, 6), f"out_mode {out_mode}"
         self.out_mode = out_mode
         self.out_page_bytes = out_page_bytes
         self.heads = heads
         self.head_tiles = head_tiles
         self.prefetch_cols = prefetch_cols
+        self.rows = rows
+        assert rows in (1, 2, 4, 8), "custom_mm in0 tiles are [1, 2, 4 or 8] x 32"
+        assert out_mode != 6 or rows > 1, "out_mode 6 (per-row argmax) is the multi-row LM head"
         self.weight_dtype = weight_dtype
         self.tile_bytes = TILE_BYTES[weight_dtype]
         self.col_bytes = self.kt * self.tile_bytes
@@ -478,12 +490,15 @@ class LinearStream(_BankStreamOp):
             x = pending.x
         if self.out_mode == 3:
             outs = tuple(out)
+        elif self.out_mode == 6:
+            outs = (out,) * 3
         elif self.out_mode == 4:
             outs = (out[0], out[1], out[1])
         else:
             outs = (out,) * 3
         cb_x, cb_w, cb_scr, cb_stage, cb_out = 0, 1, 3, 4, 16
-        stage = self.x_pages if x.memory_config().buffer_type == ttnn.BufferType.DRAM else 0
+        M = self.rows
+        stage = self.x_pages * M if x.memory_config().buffer_type == ttnn.BufferType.DRAM else 0
         # A fused boundary's consumer can buffer all its weight columns: the readers stream them while the boundary
         # runs (fused_decode.config.DECODE_BOUNDARY_PREFETCH_ALL).
         w_cols = max(3, self.cols) if pending is not None and DECODE_BOUNDARY_PREFETCH_ALL else 3
@@ -491,23 +506,27 @@ class LinearStream(_BankStreamOp):
             # Large columns (the LM head's ~97 KB): cap the ring at what L1 holds.
             w_cols = min(w_cols, max(3, self.prefetch_cols))
         cbs = [
-            self._cb(cb_x, ttnn.bfloat16, TINY_BYTES, self.kt, tiny=True),
+            self._cb(cb_x, ttnn.bfloat16, TINY_BYTES * M, self.kt, tiny=True, rows=M),
             self._cb(cb_w, self.weight_dtype, self.tile_bytes, w_cols * self.kt),
-            self._cb(cb_scr, ttnn.bfloat16, 64, 1),
+            # router scratch (multi-row: union ids, [M, 32] weights, one logit row, top-k stage)
+            self._cb(cb_scr, ttnn.bfloat16, 64 if M == 1 else 128 + 64 * M + 128, 1),
         ]
         if stage:
             cbs.append(self._cb(cb_stage, ttnn.bfloat16, 2048, stage))
-        cbs.append(self._cb(cb_out, ttnn.bfloat16, TINY_BYTES, 4, tiny=True))
+        cbs.append(self._cb(cb_out, ttnn.bfloat16, TINY_BYTES * M, 4, tiny=True, rows=M))
         cb_y, cb_rot, cb_cs, cb_kv = 5, 6, 7, 12
         order = None
         if rope_kv is not None:
             assert self.out_mode == 3 and exchange is None
+            assert (M > 1) == rope_kv.rows_mode, "multi-row QKV takes QKVRopeCache.rows (cos / sin tables)"
             order = qkv_column_order(self.n_tiles, self.heads[0], self.banks)
+            # scratch + this core's cache tiles (multi-row: 3 scratch pages, up to two tiles per K / V column)
+            kv_pages = 1 + self.cols if M == 1 else 3 + 2 * self.cols
             cbs += [
-                self._cb(cb_y, ttnn.bfloat16, TINY_BYTES, 2, tiny=True),
+                self._cb(cb_y, ttnn.bfloat16, TINY_BYTES * M, 2, tiny=True, rows=M),
                 self._cb(cb_rot, ttnn.bfloat8_b, BFP8_TILE_BYTES, 2),
-                self._cb(cb_cs, ttnn.bfloat16, TINY_BYTES, 2 * self.head_tiles, tiny=True),
-                self._cb(cb_kv, ttnn.bfloat8_b, BFP8_TILE_BYTES, 1 + self.cols),  # scratch + this core's cache tiles
+                self._cb(cb_cs, ttnn.bfloat16, TINY_BYTES * M, 2 * self.head_tiles, tiny=True, rows=M),
+                self._cb(cb_kv, ttnn.bfloat8_b, BFP8_TILE_BYTES, kv_pages),
             ]
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for i, (core, bank, r, vc) in enumerate(self.assignments):
@@ -519,6 +538,8 @@ class LinearStream(_BankStreamOp):
                 outs[1].buffer_address(),
                 outs[2].buffer_address(),
             ] + (exchange.writer_runtime_args(i) if exchange is not None else [])
+            if self.out_mode == 6:
+                writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [i]
             if rope_kv is not None:
                 writer_rt[core.x][core.y] = (
                     list(writer_rt[core.x][core.y]) + rope_kv.writer_runtime_args() + self._slot_columns(bank, r, order)
@@ -541,6 +562,8 @@ class LinearStream(_BankStreamOp):
             for core, bank, r, vc in self.assignments:
                 compute_rt[core.x][core.y] = self._slot_columns(bank, r, order)
             defines = [("QKV_ROPE_KV", "1")]
+        if M > 1:
+            defines = (defines or []) + [("ROWS", str(M))]
 
         def build():
             program = self._program(
@@ -588,6 +611,7 @@ class QKVRopeCache:
     head_dim]; the one user's rows are block 0 with block_size = positions)."""
 
     def __init__(self, rot, cos, sin, pos, page_table, k_cache, v_cache):
+        self.rows_mode = False
         self.paged = page_table is not None
         self.num_kv_heads, self.block_size = k_cache.shape[1], k_cache.shape[2]
         # Unpaged: the page-table accessor slot holds the position tensor (never read).
@@ -601,6 +625,15 @@ class QKVRopeCache:
 
     def writer_runtime_args(self):
         return [t.buffer_address() for t in self.io]
+
+    @classmethod
+    def rows(cls, rot, cos_table, sin_table, pos, page_table, k_cache, v_cache):
+        """Multi-row QKV (LinearStream rows = M, one user, DFlash verify): pos is the [M] INT32 position tensor of the
+        rows (consecutive); cos_table / sin_table the row-major [.., positions, head_dim] BF16 RoPE tables (one page per
+        position, RotarySetup.cos_matrix / sin_matrix)."""
+        obj = cls(rot, cos_table, sin_table, pos, page_table, k_cache, v_cache)
+        obj.rows_mode = True
+        return obj
 
 
 _ROPE_ROTATION_TILES = {}
@@ -627,3 +660,18 @@ def _rope_rotation_tiles(mesh_device):
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
     )
+
+
+def merge_argmax(device_lists, rows, vocab_per_device):
+    """device_lists: per device a flat int64 tensor [cores * rows * 2] of (key, local index) -> [rows] global argmax
+    ids (ties to the lower id)."""
+    best = [(-1, 0)] * rows
+    for d, lst in enumerate(device_lists):
+        t = lst.reshape(-1, rows, 2)
+        for c in range(t.shape[0]):
+            for r in range(rows):
+                key, idx = int(t[c, r, 0]), int(t[c, r, 1])
+                gid = d * vocab_per_device + idx
+                if key > best[r][0] or (key == best[r][0] and gid < best[r][1]):
+                    best[r] = (key, gid)
+    return [b[1] for b in best]

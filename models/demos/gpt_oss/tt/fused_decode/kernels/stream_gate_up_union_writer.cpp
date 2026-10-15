@@ -1,0 +1,109 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+// Activation gather + SwiGLU output scatter (BRISC, NOC1) for the union-of-experts gate|up stream (multi-row decode
+// MoE, DFlash verify; fused_decode/union.py ExpertGateUpUnion).
+//
+// 1. U (the router's union buffer [U, ids..]) goes to the three compute threads through the TRISC mailboxes.
+// 2. x: the boundary's normed hidden in the row-tile layout ([rows, 32] tiles back to back, fused_decode/boundary.py),
+//    read in one piece, plus a bias tile with `nbias` ones at the start of every row.
+// 3. Routing weights: the router's [rows, 32] BF16 matrix (row r, entry i: row r's weight of union expert i) becomes
+//    U [rows, 32] tiles, tile i holding w[r][i] in all 32 entries of row r (compute multiplies the SwiGLU rows by it
+//    through a matmul with the identity tile, also loaded here).
+// 4. Output tile (slot i, pair p) -> tile (act_tile0 + p) of slot i of the activation buffer (slot page: the expert's
+//    [rows, I_pad] activation as [rows, 32] tiles back to back, the down stream's in0 segment).
+//
+// runtime args: [x_addr, act_addr, act_tile0, weights_addr, union_addr, ident_addr]
+
+#include <stdint.h>
+
+#include "api/dataflow/dataflow_api.h"
+#include "ckernel.h"
+#include "ckernel_defs.h"
+
+void kernel_main() {
+    const uint32_t x_addr = get_arg_val<uint32_t>(0);
+    const uint32_t act_addr = get_arg_val<uint32_t>(1);
+    const uint32_t act_tile0 = get_arg_val<uint32_t>(2);
+    const uint32_t w_addr = get_arg_val<uint32_t>(3);
+    const uint32_t uni_addr = get_arg_val<uint32_t>(4);
+    const uint32_t ident_addr = get_arg_val<uint32_t>(5);
+
+    constexpr uint32_t cb_x = get_compile_time_arg_val(0);
+    constexpr uint32_t cb_act = get_compile_time_arg_val(1);
+    constexpr uint32_t kx = get_compile_time_arg_val(2);
+    constexpr uint32_t nbias = get_compile_time_arg_val(3);
+    constexpr uint32_t pairs = get_compile_time_arg_val(4);
+    constexpr uint32_t rows = get_compile_time_arg_val(5);
+    constexpr uint32_t act_page_bytes = get_compile_time_arg_val(6);
+    constexpr uint32_t cb_sc = get_compile_time_arg_val(7);
+    constexpr uint32_t cb_id = get_compile_time_arg_val(8);
+    constexpr uint32_t cb_scr = get_compile_time_arg_val(9);
+    constexpr uint32_t ident_bytes = get_compile_time_arg_val(10);
+    constexpr auto x_args = TensorAccessorArgs<11>();
+    constexpr auto act_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
+    constexpr auto w_args = TensorAccessorArgs<act_args.next_compile_time_args_offset()>();
+    constexpr auto uni_args = TensorAccessorArgs<w_args.next_compile_time_args_offset()>();
+    constexpr auto id_args = TensorAccessorArgs<uni_args.next_compile_time_args_offset()>();
+
+    constexpr uint32_t tiny_bytes = 64 * rows;
+    constexpr uint32_t row_face = 32 * rows;
+
+    const auto s_x = TensorAccessor(x_args, x_addr, 2048);
+    const auto s_act = TensorAccessor(act_args, act_addr, act_page_bytes);
+    const auto s_w = TensorAccessor(w_args, w_addr, 64 * rows);
+    const auto s_uni = TensorAccessor(uni_args, uni_addr, 128);
+    const auto s_id = TensorAccessor(id_args, ident_addr, ident_bytes);
+
+    // scratch: [union (128 B) | weights (64 rows B)]
+    cb_reserve_back(cb_scr, 1);
+    const uint32_t scr = get_write_ptr(cb_scr);
+    noc_async_read(s_uni.get_noc_addr(0), scr, 128);
+    noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
+    cb_reserve_back(cb_id, 1);
+    noc_async_read(s_id.get_noc_addr(0), get_write_ptr(cb_id), ident_bytes);
+    cb_reserve_back(cb_x, kx + 1);
+    const uint32_t x_l1 = get_write_ptr(cb_x);
+    noc_async_read(s_x.get_noc_addr(0), x_l1, kx * tiny_bytes);
+    volatile tt_l1_ptr uint16_t* ones = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(x_l1 + kx * tiny_bytes);
+    for (uint32_t i = 0; i < 32 * rows; ++i) {
+        ones[i] = (i < 16 * rows && i % 16 < nbias) ? 0x3F80 : 0;  // BF16 1.0
+    }
+    noc_async_read_barrier();
+    invalidate_l1_cache();
+    cb_push_back(cb_x, kx + 1);
+    cb_push_back(cb_id, 1);
+
+    volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr);
+    const uint32_t num_sel = uni[0];
+    ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, num_sel);
+    ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, num_sel);
+    ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, num_sel);
+
+    volatile tt_l1_ptr uint16_t* w = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr + 128);
+    cb_reserve_back(cb_sc, num_sel);
+    const uint32_t sc_l1 = get_write_ptr(cb_sc);
+    for (uint32_t i = 0; i < num_sel; ++i) {
+        volatile tt_l1_ptr uint32_t* t = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc_l1 + i * tiny_bytes);
+        for (uint32_t r = 0; r < rows; ++r) {
+            const uint32_t v = w[r * 32 + i];
+            const uint32_t pair = v | (v << 16);
+            for (uint32_t q = 0; q < 8; ++q) {
+                t[r * 8 + q] = pair;                    // face 0, row r
+                t[(row_face + r * 32) / 4 + q] = pair;  // face 1, row r
+            }
+        }
+    }
+    cb_push_back(cb_sc, num_sel);
+
+    for (uint32_t e = 0; e < num_sel; ++e) {
+        for (uint32_t p = 0; p < pairs; ++p) {
+            cb_wait_front(cb_act, 1);
+            const uint32_t src = get_read_ptr(cb_act);
+            noc_async_write(src, s_act.get_noc_addr(e, (act_tile0 + p) * tiny_bytes), tiny_bytes);
+            noc_async_writes_flushed();
+            cb_pop_front(cb_act, 1);
+        }
+    }
+    noc_async_write_barrier();
+}
