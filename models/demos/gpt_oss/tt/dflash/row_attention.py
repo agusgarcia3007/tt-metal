@@ -46,6 +46,13 @@ class RowAttention:
     def __call__(self, q, k_cache, v_cache, pos, page_table, sinks, scale, window=0):
         """q: [1, M, heads, 64] BF16 tiles (row r's heads in tile row r); pos: INT32 [M]; page_table: INT32 [*, blocks]
         (row 0 used); sinks: the heads' [heads, 32] BF16 sink tile (column 0 = sink / scale)."""
+        kernels, cbs, io = self.parts(q, k_cache, v_cache, pos, page_table, sinks, scale, window)
+        ttnn.generic_op(io, ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs))
+        return self.out
+
+    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, window=0, wait=None):
+        """(kernels, cbs, io) of the op; wait = (semaphore id, count): fused after the QKV op that writes q and the
+        block's K / V rows (the reader reads the older chunks first, Q and the block's chunks after the count)."""
         NK = self.max_chunks
         cb_q, cb_k, cb_v, cb_aux, cb_scr, cb_qs, cb_s, cb_m, cb_p, cb_l, cb_o, cb_out, cb_scr2, cb_sr = range(14)
         kv_dtype = k_cache.dtype
@@ -106,6 +113,7 @@ class RowAttention:
                 compile_time_args=reader_ct,
                 runtime_args=reader_rt,
                 config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_0),
+                defines=[] if wait is None else [("RA_WAIT_SEM", str(wait[0])), ("RA_WAIT_N", str(wait[1]))],
             ),
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / "row_attn_writer.cpp"),
@@ -127,6 +135,7 @@ class RowAttention:
                 ),
             ),
         ]
-        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
-        ttnn.generic_op([q, k_cache, v_cache, pos, page_table, sinks, self.out], program)
-        return self.out
+        return kernels, cbs, [q, k_cache, v_cache, pos, page_table, sinks, self.out]
+
+    def noc_cores(self):
+        return [self.mesh.worker_core_from_logical_core(c) for c in self.core_list]

@@ -512,8 +512,12 @@ class LinearStream(_BankStreamOp):
         consumer_cores=None,
         extra_defines=None,
         extra_writer_rt=None,
+        fuse=None,
     ):
-        """send = (boundary, site), out_mode 5: fuse the boundary all-reduce's fabric send (fused_decode/boundary.py
+        """fuse = (kernels, cbs, io, noc_cores, sem_id): another op's parts on other cores added to this program; the
+        writers increment program semaphore sem_id on noc_cores once all their outputs are written (QKV + row
+        attention, dflash/verify.py).
+        send = (boundary, site), out_mode 5: fuse the boundary all-reduce's fabric send (fused_decode/boundary.py
         sending_program). x may be a fused_decode.boundary.PendingBoundary: the boundary producing x then runs inside
         this op (DecodeBoundary.consumer_parts) while the weight readers stream ahead. exchange (out_mode 3): an object
         whose writer_args() / program() add the fused decode LM head's top-k candidate merge and exchange
@@ -600,6 +604,9 @@ class LinearStream(_BankStreamOp):
                 )
             if extra_writer_rt is not None:
                 writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + list(extra_writer_rt)
+            if fuse is not None:
+                notify_arg = len(writer_rt[core.x][core.y])
+                writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [v for p in fuse[3] for v in (p.x, p.y)]
         reader_ct = [cb_w, self.kt, self.cols, self.tile_bytes, self.page_bytes, w_cols]
         writer_ct = [cb_x, cb_out, cb_scr, self.kx, self.x_pages, NBIAS, self.cols, self.n_tiles, self.out_mode]
         writer_ct += [self.out_page_bytes, stage, cb_stage, self.heads[0], self.heads[1], self.head_tiles]
@@ -631,6 +638,12 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("BND_WAIT_N", str(b_.H))]
         if extra_defines:
             defines = (defines or []) + list(extra_defines)
+        if fuse is not None:
+            defines = (defines or []) + [
+                ("QKV_NOTIFY_N", str(len(fuse[3]))),
+                ("QKV_NOTIFY_SEM", str(fuse[4])),
+                ("QKV_NOTIFY_ARG", str(notify_arg)),
+            ]
         if os.environ.get("LIN_T") and rope_kv is not None:  # (profiling: the QKV writer's per-column timeline)
             defines = (defines or []) + [("LIN_T", "1")]
         # DFLASH_KV_SPLIT=1 (multi-row QKV with the K / V cache write): the reader converts half the rows of the first
@@ -671,6 +684,15 @@ class LinearStream(_BankStreamOp):
                 program.semaphores = list(program.semaphores) + [
                     ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, self.cores, 0)
                 ]
+            if fuse is not None:
+                f_kernels, f_cbs, _, f_noc, f_sem = fuse
+                assert all(sd.id != f_sem for sd in program.semaphores)
+                program.kernels = list(program.kernels) + list(f_kernels)
+                program.cbs = list(program.cbs) + list(f_cbs)
+                f_cores = f_kernels[0].core_ranges
+                program.semaphores = list(program.semaphores) + [
+                    ttnn.SemaphoreDescriptor(f_sem, ttnn.CoreType.WORKER, f_cores, 0)
+                ]
             return program
 
         assert not (send and pending), "an op is either a boundary producer or its consumer"
@@ -686,6 +708,10 @@ class LinearStream(_BankStreamOp):
             extra += [t for t in exchange.io if all(t is not u for u in (x, *unique, *extra))]
         if rope_kv is not None:
             for t in rope_kv.io:
+                if all(t is not u for u in (x, *unique, *extra)):
+                    extra.append(t)
+        if fuse is not None:
+            for t in fuse[2]:
                 if all(t is not u for u in (x, *unique, *extra)):
                     extra.append(t)
         if build_only:

@@ -59,8 +59,10 @@ void kernel_main() {
     noc_async_read(s_pos.get_noc_addr(0), scr, pos_page_bytes);
     noc_async_read(s_pt.get_noc_addr(0), scr + 256, pt_page_bytes);
     cb_reserve_back(cb_q, 2);
+#ifndef RA_WAIT_SEM
     noc_async_read(s_q.get_noc_addr(2 * r), get_write_ptr(cb_q), tile);
     noc_async_read(s_q.get_noc_addr(2 * r + 1), get_write_ptr(cb_q) + tile, tile);
+#endif
     cb_reserve_back(cb_aux, 7);
     const uint32_t aux = get_write_ptr(cb_aux);
     noc_async_read(s_sink.get_noc_addr(0), aux + 5 * tile, tile);
@@ -72,7 +74,9 @@ void kernel_main() {
     }
     noc_async_read_barrier();
     invalidate_l1_cache();
+#ifndef RA_WAIT_SEM
     cb_push_back(cb_q, 2);  // compute scales Q while the rest is prepared
+#endif
     const int32_t p = reinterpret_cast<volatile tt_l1_ptr int32_t*>(scr)[r];
     const int32_t lo_ = window ? p + 1 - static_cast<int32_t>(window) : 0;
     const uint32_t lo = lo_ > 0 ? static_cast<uint32_t>(lo_) : 0;
@@ -84,12 +88,24 @@ void kernel_main() {
     const uint32_t first_cut = lo - c0;                              // masked columns at the start of chunk 0
     const uint32_t last_keep = (static_cast<uint32_t>(p) & 31) + 1;  // valid columns of the last chunk
 
-    // K / V chunks: every read issued now (one barrier below)
+    // K / V chunks (one barrier below)
     volatile tt_l1_ptr int32_t* pt = reinterpret_cast<volatile tt_l1_ptr int32_t*>(scr + 256);
     cb_reserve_back(cb_k, 2 * nk);
     cb_reserve_back(cb_v, 2 * nk);
     const uint32_t kl1 = get_write_ptr(cb_k), vl1 = get_write_ptr(cb_v);
-    for (uint32_t j = 0; j < nk; ++j) {
+#ifdef RA_WAIT_SEM
+    // fused into the QKV program (dflash/verify.py): the chunks entirely before the block's first position are in the
+    // cache already (read now, while QKV runs); Q and the chunks holding the block's rows come after the QKV writers
+    // signal (RA_WAIT_N increments of program semaphore RA_WAIT_SEM)
+    const uint32_t start = static_cast<uint32_t>(reinterpret_cast<volatile tt_l1_ptr int32_t*>(scr)[0]);
+    uint32_t j_new = 0;
+    while (j_new < nk && c0 + 32 * j_new + 31 < start) {
+        ++j_new;
+    }
+#else
+    const uint32_t j_new = nk;  // unfused: every chunk now
+#endif
+    auto read_chunk = [&](uint32_t j) {
         const uint32_t pos = c0 + 32 * j;
         const uint32_t blk = static_cast<uint32_t>(pt[pos / block]);
         const uint32_t t0 = ((blk * nkv + g) * tpb + (pos % block) / 32) * 2;
@@ -97,6 +113,9 @@ void kernel_main() {
             noc_async_read(s_k.get_noc_addr(t0 + d), kl1 + (2 * j + d) * kv_tile_bytes, kv_tile_bytes);
             noc_async_read(s_v.get_noc_addr(t0 + d), vl1 + (2 * j + d) * kv_tile_bytes, kv_tile_bytes);
         }
+    };
+    for (uint32_t j = 0; j < j_new; ++j) {
+        read_chunk(j);
     }
 
     volatile tt_l1_ptr uint16_t* sc = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(aux);
@@ -147,8 +166,19 @@ void kernel_main() {
         }
     }
     mask(4, 0, 1);  // keep column 0 (the sink logit)
+#ifdef RA_WAIT_SEM
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(RA_WAIT_SEM)), RA_WAIT_N);
+    noc_async_read(s_q.get_noc_addr(2 * r), get_write_ptr(cb_q), tile);
+    noc_async_read(s_q.get_noc_addr(2 * r + 1), get_write_ptr(cb_q) + tile, tile);
+#endif
+    for (uint32_t j = j_new; j < nk; ++j) {
+        read_chunk(j);
+    }
     cb_push_back(cb_aux, 7);
     noc_async_read_barrier();
+#ifdef RA_WAIT_SEM
+    cb_push_back(cb_q, 2);
+#endif
     cb_push_back(cb_k, 2 * nk);
     cb_push_back(cb_v, 2 * nk);
 }

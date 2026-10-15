@@ -133,8 +133,24 @@ class FusedVerify:
         if ra_max:
             from .row_attention import RowAttention
 
+            # DFLASH_RA_FUSE=1: row attention runs inside the QKV program (reads the older K / V chunks while QKV waits
+            # for its boundary): its 8 x 2 cores must be free of the QKV / boundary cores
+            self.ra_fuse = os.environ.get("DFLASH_RA_FUSE", "1") == "1" and self.boundary.ccl == "fabric"
+            start = (0, 5)
+            if self.ra_fuse:
+                taken = {(c.x, c.y) for c in ttnn.corerange_to_cores(self.qkv.cores, row_wise=True)}
+                taken |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.boundary.cores, row_wise=True)}
+                taken |= {(h.x, h.y) for h in getattr(self.boundary, "helpers", [])}
+                grid = mesh.compute_with_storage_grid_size()
+                free = [
+                    (x0, y0)
+                    for y0 in range(grid.y - 1)
+                    for x0 in range(grid.x - 7)
+                    if not any((x0 + i % 8, y0 + i // 8) in taken for i in range(M * self.nkv))
+                ]
+                start = (0, 5) if (0, 5) in free else free[0]
             self.row_attn = RowAttention(
-                mesh, M, self.nq, self.nkv, self.hd, 64, max_chunks=ra_max // TILE, cores_start=(0, 5)
+                mesh, M, self.nq, self.nkv, self.hd, 64, max_chunks=ra_max // TILE, cores_start=start
             )
             self.row_attn_max = ra_max
             self.use_row_attn = True
@@ -336,13 +352,29 @@ class FusedVerify:
             rk = QKVRopeCache.rows(
                 self.rot, self.cos_table, self.sin_table, self.pos, self.page_table, k_cache, v_cache
             )
-            self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk)
+            fuse = None
+            ra_here = self.row_attn is not None and (self.use_row_attn or attn.config.sliding_window)
+            if ra_here and getattr(self, "ra_fuse", False):
+                k_cache, v_cache = self.kv_cache[i]
+                kern, cbs, io = self.row_attn.parts(
+                    self.q,
+                    k_cache,
+                    v_cache,
+                    self.pos,
+                    self.page_table,
+                    attn.weights.decode_sinks,
+                    attn.config.scaling,
+                    window=attn.config.sliding_window or 0,
+                    wait=(3, len(self.qkv.assignments)),
+                )
+                fuse = (kern, cbs, io, self.row_attn.noc_cores(), 3)
+            self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse)
             res = pending.residual_out
             pending.x.deallocate(True)
             pending.residual.deallocate(True)
             if i - 1 in self.capture_layers:  # layer i - 1's output = this layer's input residual
                 self._capture(i - 1, res)
-            sdpa = self._sdpa(i)
+            sdpa = self.row_attn.out if fuse is not None else self._sdpa(i)
             self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial, send=(b, "attn"))
             if self.row_attn is None or sdpa is not self.row_attn.out:
                 sdpa.deallocate(True)
