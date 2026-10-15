@@ -33,6 +33,7 @@ partial; B produces that partial only from the output of its previous "attn" bou
 use of a site must keep this alternation (no two sends to the same site without an all-device wait in between).
 """
 
+import os
 import struct
 from pathlib import Path
 
@@ -239,6 +240,30 @@ class DecodeBoundary:
                 (h.x, h.y) for h in self.helpers
             ], "helpers in row-major order (shard order)"
             self.mc_config = self._helper_config(self.PH)
+            # x mirror (DFLASH_X_MIRROR): the normed output at the same L1 address on every worker core (the helpers
+            # multicast their pages into it), so consumers read x from their own L1 instead of the boundary core
+            self.x_mirror = None
+            if os.environ.get("DFLASH_X_MIRROR", "0") == "1":
+                grid = mesh_device.compute_with_storage_grid_size()
+                every = ttnn.CoreRangeSet(
+                    [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
+                )
+                n = grid.x * grid.y
+                self.x_mirror = ttnn.from_torch(
+                    torch.zeros(1, 1, n * TILE, self.all_pad * TILE),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=mesh_device,
+                    memory_config=ttnn.MemoryConfig(
+                        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                        ttnn.BufferType.L1,
+                        ttnn.ShardSpec(every, (TILE, self.all_pad * TILE), ttnn.ShardOrientation.ROW_MAJOR),
+                    ),
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+                )
+                p0 = mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
+                p1 = mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(grid.x - 1, grid.y - 1))
+                self.mirror_args = [self.x_mirror.buffer_address(), p0.x, p0.y, p1.x, p1.y, n]
             for name in sites:  # receive slots on the helpers: [slot][PH pages] each, zero (pad pages stay zero)
                 self.sites[name] = (
                     ttnn.from_torch(
@@ -443,7 +468,7 @@ class DecodeBoundary:
         reader_ct += ttnn.TensorAccessorArgs(residual).get_compile_time_args()
         compute_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, PH, slots]
         compute_ct += [_f32_bits(1.0 / self.hidden), _f32_bits(self.eps), cb_y, cb_p, cb_rsum, cb_v, cb_xchg, Hn]
-        writer_ct = [cb_v, cb_xchg, cb_x, PH, Hn, self.XCHG_SEM, self.RELAY_SEM]
+        writer_ct = [cb_v, cb_xchg, cb_x, PH, Hn, self.XCHG_SEM, self.RELAY_SEM, 1 if self.x_mirror is not None else 0]
         hnoc = [v for p in self.helper_noc for v in (p.x, p.y)]
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for h, c in enumerate(self.helpers):
@@ -451,6 +476,8 @@ class DecodeBoundary:
             reader_rt[c.x][c.y] = [gamma.buffer_address(), sem_addr, residual.buffer_address(), page0]
             writer_rt[c.x][c.y] = [out_x.buffer_address(), self.noc_xy[0], self.noc_xy[1], page0]
             writer_rt[c.x][c.y] = list(writer_rt[c.x][c.y]) + [max(0, min(PH, A - page0)), h] + hnoc
+            if self.x_mirror is not None:
+                writer_rt[c.x][c.y] = list(writer_rt[c.x][c.y]) + self.mirror_args
         dm = ttnn.DataMovementConfigDescriptor
 
         def kernels(coord):

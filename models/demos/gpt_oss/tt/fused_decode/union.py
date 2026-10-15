@@ -137,6 +137,7 @@ class ExpertGateUpUnion(_BankStreamOp):
         extra_writer_rt=None,
         extra_reader_rt=None,
         pred_p=0,
+        x_local_addr=None,
     ):
         """pred_p > 0 (fused MoE with prediction, MOE_PRED): a CB (index 6) for the prefetched columns of pred_p
         experts."""
@@ -165,7 +166,7 @@ class ExpertGateUpUnion(_BankStreamOp):
                 r * 2 * self.pairs * self.col_bytes,
             ] + list(extra_reader_rt or [])
             writer_rt[core.x][core.y] = [
-                x.buffer_address(),
+                x_local_addr if x_local_addr is not None else x.buffer_address(),
                 act.buffer_address(),
                 bank * self.P + r * self.pairs,
                 weights.buffer_address(),
@@ -190,7 +191,10 @@ class ExpertGateUpUnion(_BankStreamOp):
             writer_rt,
             compute_ct,
             "gate_up_union",
-            defines=[("ROWS", str(M))] + ([("DENSE_SILU", "1")] if self.dense_silu else []) + list(extra_defines or []),
+            defines=[("ROWS", str(M))]
+            + ([("DENSE_SILU", "1")] if self.dense_silu else [])
+            + ([("X_LOCAL", "1")] if x_local_addr is not None else [])
+            + list(extra_defines or []),
         )
         if build_only:
             return program, [w_stream, x, union, weights, ident, act]

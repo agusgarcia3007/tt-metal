@@ -355,7 +355,11 @@ void kernel_main() {
         constexpr uint32_t gather_pages = x_pages > 0 ? x_pages : 1;
 #if !defined(X_TILE_ROWS)
     if constexpr (x_pages == 0) {
+#ifdef X_LOCAL
+        noc_async_read(get_noc_addr(x_addr), x_l1, kx * tiny_bytes);  // the boundary's x mirror in this core's L1
+#else
         noc_async_read(s_x.get_noc_addr(0), x_l1, kx * tiny_bytes);
+#endif
     }
 #endif
 #if defined(X_TILE_ROWS)

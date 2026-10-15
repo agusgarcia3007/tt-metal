@@ -137,6 +137,7 @@ class MoEFused:
             extra_writer_rt=[ctr, rx, ry] + ([pred_addr] if P else []),
             extra_reader_rt=[rx, ry, pred_addr] if P else None,
             pred_p=P,
+            x_local_addr=b.x_mirror.buffer_address() if getattr(b, "x_mirror", None) is not None else None,
         )
         dprog, dio = self.down(
             act,
@@ -227,7 +228,15 @@ class DenseMLPFused:
         bk, bcbs, bsems, bio = b.consumer_parts(pending, self.G, notify_in_reader=True)
         x = pending.x
         gprog, gio = self.gate_up(
-            x, union, weights, gate_up_ws, act, build_only=True, extra_defines=self.defines, extra_writer_rt=[0, hx, hy]
+            x,
+            union,
+            weights,
+            gate_up_ws,
+            act,
+            build_only=True,
+            extra_defines=self.defines,
+            extra_writer_rt=[0, hx, hy],
+            x_local_addr=b.x_mirror.buffer_address() if getattr(b, "x_mirror", None) is not None else None,
         )
         dprog, dio = self.down(
             act,

@@ -86,7 +86,11 @@ void kernel_main() {
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), 1);
     DeviceTimestampedData("MOE_T", 201);
 #endif
+#ifdef X_LOCAL
+    noc_async_read(get_noc_addr(x_addr), x_l1, kx * tiny_bytes);  // the boundary's x mirror in this core's L1
+#else
     noc_async_read(s_x.get_noc_addr(0), x_l1, kx * tiny_bytes);
+#endif
     volatile tt_l1_ptr uint16_t* ones = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(x_l1 + kx * tiny_bytes);
     for (uint32_t i = 0; i < 32 * rows; ++i) {
         ones[i] = (i < 16 * rows && i % 16 < nbias) ? 0x3F80 : 0;  // BF16 1.0

@@ -519,6 +519,9 @@ class LinearStream(_BankStreamOp):
                 pending, consumer_cores or self.cores, notify_in_reader=consumer_cores is not None
             )
             x = pending.x
+        # the boundary's x mirror: read x from this core's L1 (kernels/stream_linear_writer.cpp X_LOCAL)
+        mirror = getattr(pending.boundary, "x_mirror", None) if pending is not None else None
+        x_local = mirror is not None and self.x_pages == 0 and not self.x_tile_rows
         if self.out_mode == 3:
             outs = tuple(out)
         elif self.out_mode == 6:
@@ -572,7 +575,7 @@ class LinearStream(_BankStreamOp):
         for i, (core, bank, r, vc) in enumerate(self.assignments):
             reader_rt[core.x][core.y] = [weights.buffer_address(), bank, vc, r * self.cols * self.col_bytes]
             writer_rt[core.x][core.y] = [
-                x.buffer_address(),
+                mirror.buffer_address() if x_local else x.buffer_address(),
                 outs[0].buffer_address(),
                 bank * self.C + r * self.cols,
                 outs[1].buffer_address(),
@@ -612,6 +615,8 @@ class LinearStream(_BankStreamOp):
             defines = defines + [("X_TILE_ROWS", "1")]
         if self.gather_split:
             defines = (defines or []) + [("X_GATHER_SPLIT", "1")]
+        if x_local:
+            defines = (defines or []) + [("X_LOCAL", "1")]
         if extra_defines:
             defines = (defines or []) + list(extra_defines)
 
