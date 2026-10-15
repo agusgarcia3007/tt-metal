@@ -84,6 +84,48 @@ class _AllReduce:
         return flat
 
 
+class _DramShardedLinear:
+    """[32, k] x [k, n] as a DRAM-sharded matmul (the weight streamed from every DRAM bank, as batched_decode.BatchedQKV):
+    the input width-sharded on `in0_memory_config` (k / cores per core), the output width-sharded on the same cores."""
+
+    def __init__(self, mesh_device, weight, in0_memory_config, compute_kernel_config, workers=1):
+        from ..batched_decode import dram_width_sharded_memory_config
+
+        k, n = weight.shape[-2], weight.shape[-1]
+        self.weight = ttnn.to_memory_config(weight, dram_width_sharded_memory_config(mesh_device, k, n))
+        self.in0_memory_config = in0_memory_config
+        grid = in0_memory_config.shard_spec.grid
+        cores = grid.num_cores()
+        k_tiles = in0_memory_config.shard_spec.shape[1] // TILE
+        assert k_tiles * cores * TILE == k, f"k {k} does not split into {cores} input shards"
+        per_core_n = -(-n // (TILE * cores))
+        self.out_memory_config = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(grid, (ROWS, per_core_n * TILE), ttnn.ShardOrientation.ROW_MAJOR),
+        )
+        self.program_config = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+            in0_block_w=max(d for d in range(1, min(k_tiles, 16) + 1) if k_tiles % d == 0),
+            per_core_M=ROWS // TILE,
+            per_core_N=per_core_n,
+            fused_activation=None,
+            num_workers_per_dram_bank=workers,
+        )
+        self.compute_kernel_config = compute_kernel_config
+
+    def __call__(self, x):
+        if x.memory_config() != self.in0_memory_config:
+            x = ttnn.to_memory_config(x, self.in0_memory_config)
+        return ttnn.matmul(
+            x,
+            self.weight,
+            program_config=self.program_config,
+            memory_config=self.out_memory_config,
+            dtype=ttnn.bfloat16,
+            compute_kernel_config=self.compute_kernel_config,
+        )
+
+
 class DFlashDraft:
     def __init__(
         self, mesh_device, target, max_positions, path=None, weight_dtype=ttnn.bfloat16, block_size=64, users=1
@@ -582,6 +624,19 @@ class DFlashDraft:
                 memory_config=self.res_mc,
                 mesh_mapper=rep,
             )
+        # QKV as a DRAM-sharded matmul on the normed residual's own shards (RESIDUAL_CORES x 3 tiles of K = 90):
+        # 44 -> 32 us; o_proj / gate|up / down measured slower that way (26 / 2 x 47 / 48 vs 19 / 55 / 43 us).
+        for L in self.L:
+            L["ds_qkv"] = _DramShardedLinear(mesh, L["qkv"], self.res_mc, self.mm_ck)
+        self.qkv_heads_mc = ttnn.create_sharded_memory_config(
+            (ROWS, self.hd),
+            ttnn.num_cores_to_corerangeset(
+                self.nq + 2 * self.nkv, mesh.compute_with_storage_grid_size(), row_wise=True
+            ),
+            ttnn.ShardStrategy.WIDTH,
+            ttnn.ShardOrientation.ROW_MAJOR,
+            use_height_and_width_as_shard_shape=True,
+        )
         self.trace_draft = self.trace_ctx = None
 
     def _host_rows(self, values, dtype, shape=None):
@@ -633,11 +688,11 @@ class DFlashDraft:
     def _context_device(self):
         partial = ttnn.linear(self.t_ctx, self.fc, dtype=ttnn.bfloat16, compute_kernel_config=self.mm_ck)
         summed = self.all_reduce(partial, sharded=True)
-        ctx = self._norm(summed, self.hidden_norm)
+        ctx = self._norm(summed, self.hidden_norm, sharded=True)
         summed.deallocate(True)
         rot = self.rope.get_rot_mats(self.t_crot)
         for i in range(self.layers):
-            q, k, v = self._heads(ctx, i)
+            q, k, v = self._heads_ds(ctx, i)
             q.deallocate(True)
             k = self._norm_rope(k, self.L[i]["k_norm"], rot)
             kc, vc = self.caches[i]
@@ -648,8 +703,9 @@ class DFlashDraft:
         for t in rot:
             t.deallocate(True)
 
-    def _norm(self, h, w):
-        """Sharded RMSNorm of the width-sharded residual -> BF16 DRAM interleaved rows (the matmul input)."""
+    def _norm(self, h, w, sharded=False):
+        """Sharded RMSNorm of the width-sharded residual -> BF16 rows: sharded (the DRAM-sharded matmuls' input) or
+        DRAM interleaved."""
         x = ttnn.rms_norm(
             h,
             weight=w,
@@ -658,9 +714,26 @@ class DFlashDraft:
             memory_config=self.res_mc,
             compute_kernel_config=self.ck,
         )
-        xd = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16)
+        if sharded:
+            xb = ttnn.typecast(x, ttnn.bfloat16)
+        else:
+            xb = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.bfloat16)
         x.deallocate(True)
-        return xd
+        return xb
+
+    def _heads_ds(self, x, layer):
+        """QKV (DRAM-sharded matmul + bias) -> q, k, v heads (height-sharded per user row)."""
+        L = self.L[layer]
+        xqkv = L["ds_qkv"](x)
+        xqkv = ttnn.add(xqkv, L["qkv_b"], output_tensor=xqkv)
+        heads_in = ttnn.to_memory_config(xqkv, self.qkv_heads_mc)  # may be xqkv itself (same shards)
+        if heads_in.buffer_address() != xqkv.buffer_address():
+            xqkv.deallocate(True)
+        q, k, v = ttnn.experimental.nlp_create_qkv_heads_decode(
+            heads_in, num_heads=self.nq, num_kv_heads=self.nkv, memory_config=self.head_mc
+        )
+        heads_in.deallocate(True)
+        return q, k, v
 
     def _draft_device(self):
         emb = ttnn.embedding(self.t_toks, self.target.embedding_weight, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
@@ -669,8 +742,8 @@ class DFlashDraft:
         rot = self.rope.get_rot_mats(self.t_rot)
         for i in range(self.layers):
             L = self.L[i]
-            x = self._norm(h, L["ln1"])
-            q, k, v = self._heads(x, i)
+            x = self._norm(h, L["ln1"], sharded=True)
+            q, k, v = self._heads_ds(x, i)
             x.deallocate(True)
             q = self._norm_rope(q, L["q_norm"], rot)
             k = self._norm_rope(k, L["k_norm"], rot)
