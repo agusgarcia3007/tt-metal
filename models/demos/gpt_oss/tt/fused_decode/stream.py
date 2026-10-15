@@ -517,8 +517,11 @@ class LinearStream(_BankStreamOp):
         fuse=None,
         x_wait=None,
         notify=None,
+        spec_tt=None,
     ):
-        """fuse = (kernels, cbs, io, noc_cores, sem_id): another op's parts on other cores added to this program; the
+        """spec_tt = Tt (rows > 1): x (x_pages > 0) is / Q (out_mode 3) goes to the shared-KV attention's packed layout
+        (dflash/shared_kv_attention.py, Tt packed row-tiles per kv head) instead of [M, heads, head_dim].
+        fuse = (kernels, cbs, io, noc_cores, sem_id): another op's parts on other cores added to this program; the
         writers increment program semaphore sem_id on noc_cores once all their outputs are written (QKV + row
         attention, dflash/verify.py).
         send = (boundary, site), out_mode 5: fuse the boundary all-reduce's fabric send (fused_decode/boundary.py
@@ -554,6 +557,8 @@ class LinearStream(_BankStreamOp):
             if x.memory_config().buffer_type == ttnn.BufferType.DRAM
             else 0
         )
+        if spec_tt and self.x_pages and stage:  # the packed source: (heads / 8) kv heads x spec_tt row-tiles
+            stage = (self.kx // self.x_pages // 8) * spec_tt * self.x_pages
         # A fused boundary's consumer can buffer all its weight columns: the readers stream them while the boundary
         # runs (fused_decode.config.DECODE_BOUNDARY_PREFETCH_ALL).
         w_cols = (
@@ -645,6 +650,8 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("BND_WAIT_N", str(b_.H))]
         if extra_defines:
             defines = (defines or []) + list(extra_defines)
+        if spec_tt:
+            defines = (defines or []) + [("X_SPEC_TT" if self.x_pages else "Q_SPEC_TT", str(spec_tt))]
         if x_wait is not None:  # (semaphore id, count): x is written in the same program
             defines = (defines or []) + [("LIN_X_WAIT_SEM", str(x_wait[0])), ("LIN_X_WAIT_N", str(x_wait[1]))]
         if fuse is not None:

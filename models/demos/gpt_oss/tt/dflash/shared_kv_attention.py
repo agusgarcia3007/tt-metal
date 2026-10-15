@@ -59,12 +59,16 @@ class SharedKVAttention:
                 *[int(v) for v in os.environ.get("SKV_GRID", "11,10").split(",")]
             ),
             q_chunk_size=0,
-            k_chunk_size=int(os.environ.get("SKV_K", "256")),
+            k_chunk_size=int(os.environ.get("SKV_K", "128")),
             exp_approx_mode=False,
             max_cores_per_head_batch=int(os.environ.get("SKV_CORES", "55")),
         )
         self.block, self.window, self.uniform = block_size, window, uniform
         self.Tt = rows // 4  # packed Q row-tiles per kv head
+        # SKV_SPLIT=1: every packed row-tile is its own spec batch row (nkv * Tt rows, 1 tile each: the same memory
+        # layout): each core's work per K chunk halves, the cache is read Tt times instead of once
+        self.split = os.environ.get("SKV_SPLIT", "1") == "1"
+        self.B = n_kv * self.Tt if self.split else n_kv
         rep = ttnn.ReplicateTensorToMesh(mesh_device)
         dram = ttnn.DRAM_MEMORY_CONFIG
         pt = page_table.reshape(1, -1).int()
@@ -72,13 +76,13 @@ class SharedKVAttention:
         if window:
             # positions < W + block (+ the block's rows), in whole 64-byte rows (the kernel's NOC writes)
             self.pt_n = -(-(window // block_size + 2) // 16) * 16
-            spec_pt = torch.zeros(n_kv, self.pt_n, dtype=torch.int32)
+            spec_pt = torch.zeros(self.B, self.pt_n, dtype=torch.int32)
         else:
             self.pt_n = pt.shape[-1]
-            spec_pt = torch.cat([pt * n_kv + h for h in range(n_kv)])
+            spec_pt = torch.cat([pt * n_kv + b * n_kv // self.B for b in range(self.B)])
         self.page_table = ttnn.from_torch(spec_pt, dtype=ttnn.int32, device=mesh_device, mesh_mapper=rep)
         self.q = ttnn.from_torch(
-            torch.zeros(1, n_kv, self.Tt * TILE, head_dim),
+            torch.zeros(1, self.B, n_kv * self.Tt * TILE // self.B, head_dim),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=mesh_device,
@@ -124,26 +128,34 @@ class SharedKVAttention:
             )
 
     def _copy(self, mode, io, ct_extra=()):
-        if mode == "SPEC_POS":
-            scr = 256 + ((self.pt_n + 32) * 4 + 63) // 64 * 64 * (self.nkv + 1)
+        """SPEC_POS: one core (spec_attn_copy.cpp); SPEC_Q / SPEC_OUT: one core per kv head moving its 256-byte row
+        segments with the NOC (spec_attn_copy_noc.cpp)."""
+        noc = mode != "SPEC_POS"
+        if noc:
+            cores = [ttnn.CoreCoord(h, 0) for h in range(self.nkv)]
+            scr = 2 * self.Tt * 2048
         else:
-            scr = (2 * self.M + 2 * self.nkv * self.Tt) * 2048
+            cores = [CORE]
+            scr = 256 + ((self.pt_n + 32) * 4 + 63) // 64 * 64 * (self.B + 1)
+        crs = ttnn.CoreRangeSet([ttnn.CoreRange(cores[0], cores[-1])])
         ct = [self.M, self.nkv, 0, *ct_extra]
         for t in io:
             ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         rta = ttnn.RuntimeArgs()
-        rta[CORE.x][CORE.y] = [t.buffer_address() for t in io]
+        for h, c in enumerate(cores):
+            rta[c.x][c.y] = [t.buffer_address() for t in io] + ([h] if noc else [])
         k = ttnn.KernelDescriptor(
-            kernel_source=str(KERNEL_DIR / "spec_attn_copy.cpp"),
-            core_ranges=self.cores,
+            kernel_source=str(KERNEL_DIR / ("spec_attn_copy_noc.cpp" if noc else "spec_attn_copy.cpp")),
+            core_ranges=crs,
             compile_time_args=ct,
             runtime_args=rta,
             config=ttnn.DataMovementConfigDescriptor(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0),
-            defines=[(mode, "1")] + ([("SPEC_UNIFORM", "1")] if self.uniform and mode == "SPEC_POS" else []),
+            defines=[(mode, "1"), ("SPEC_B", str(self.B))]
+            + ([("SPEC_UNIFORM", "1")] if self.uniform and mode == "SPEC_POS" else []),
         )
         cb = ttnn.CBDescriptor(
             total_size=scr,
-            core_ranges=self.cores,
+            core_ranges=crs,
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.uint32, page_size=scr)],
         )
         ttnn.generic_op(list(io), ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[cb]))
@@ -155,11 +167,15 @@ class SharedKVAttention:
         ct = [self.window, self.block, self.pt_n, self.pt_bytes, pos.shape[-1] * 4]
         self._copy("SPEC_POS", (pos, self.pos, base_page_table, self.page_table), ct)
 
-    def __call__(self, q, k_cache, v_cache, sinks, scale, compute_kernel_config=None):
-        """q: [1, >= M, heads, 64] BF16 tiles (rows 0 .. M - 1 used); sinks: the layer's sink tensor (prepared) or
-        None -> self.out [1, M, heads, 64]."""
+    def load_q(self, q):
+        """q [1, >= M, heads, 64] BF16 tiles -> the packed Q (a producer that writes the packed layout itself, e.g. the
+        verify pass's QKV with spec_tt, skips this)."""
         self._copy("SPEC_Q", (q, self.q))
-        o = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+
+    def attend(self, k_cache, v_cache, sinks, scale, compute_kernel_config=None):
+        """The attention of the packed Q -> the packed output [1, nkv, Tt * 32, 64] (DRAM; the o_proj stream reads it
+        with spec_tt; the caller deallocates it)."""
+        return ttnn.transformer.paged_scaled_dot_product_attention_decode(
             self.q,
             self.views[k_cache.buffer_address()],
             self.views[v_cache.buffer_address()],
@@ -170,9 +186,14 @@ class SharedKVAttention:
             program_config=self.pc,
             compute_kernel_config=compute_kernel_config,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            spec_multi_pos_tiles=self.Tt,
+            spec_multi_pos_tiles=self.nkv * self.Tt // self.B,
             spec_rows_per_candidate=32 if self.uniform else 8,
         )
+
+    def __call__(self, q, k_cache, v_cache, sinks, scale, compute_kernel_config=None):
+        """Q copy in, attention, output copy out -> self.out [1, M, heads, 64] (standalone use / tests)."""
+        self.load_q(q)
+        o = self.attend(k_cache, v_cache, sinks, scale, compute_kernel_config)
         self._copy("SPEC_OUT", (o, self.out))
         o.deallocate(True)
         return self.out

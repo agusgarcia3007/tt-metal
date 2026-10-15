@@ -178,7 +178,7 @@ class FusedVerify:
         # DFLASH_SHARED_KV=1: the full-attention layers past row attention's range read the K / V cache once for the
         # M rows (dflash/shared_kv_attention.py: SDPA's spec_multi_pos_tiles mode) instead of once per row
         self.shared_kv = None
-        self.use_shared = False  # set per traced variant (FastDFlashRunner: positions past DFLASH_SKV_MIN)
+        self.use_shared = False  # set per traced variant (FastDFlashRunner)
         if os.environ.get("DFLASH_SHARED_KV", "1") == "1":
             from .shared_kv_attention import SharedKVAttention
 
@@ -416,6 +416,7 @@ class FusedVerify:
                     notify=(o_noc, 7) if o_f is not None else None,
                 )
                 fuse = (kern, cbs, io, self.row_attn.noc_cores(), 3)
+            shared = self.shared_kv is not None and self.use_shared and not attn.config.sliding_window
             if o_f is not None:
                 # QKV + row attention + o_proj + the attn-site boundary send: one program per device
                 qprog, qio = self.qkv(
@@ -454,6 +455,9 @@ class FusedVerify:
                     if all(t is not u for u in io):
                         io.append(t)
                 ttnn.generic_op(io, mesh_program)
+            elif shared:  # Q straight into the shared-KV attention's packed layout
+                sq = self.shared_kv.q
+                self.qkv(pending, attn.weights.wqkv_stream, (sq, sq, sq), rope_kv=rk, spec_tt=self.shared_kv.Tt)
             else:
                 self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse)
             res = pending.residual_out
@@ -461,9 +465,26 @@ class FusedVerify:
             pending.residual.deallocate(True)
             if i - 1 in self.capture_layers:  # layer i - 1's output = this layer's input residual
                 self._capture(i - 1, res)
-            sdpa = self.row_attn.out if fuse is not None else self._sdpa(i)
+            if fuse is not None:
+                sdpa = self.row_attn.out
+            elif shared:
+                sdpa = self.shared_kv.attend(
+                    k_cache,
+                    v_cache,
+                    attn.weights.decode_sinks,
+                    attn.config.scaling,
+                    attn.program_config.get_compute_kernel_config(),
+                )
+            else:
+                sdpa = self._sdpa(i)
             if o_f is None:
-                self.o_proj(sdpa, attn.weights.o_proj_stream, self.partial, send=(b, "attn"))
+                self.o_proj(
+                    sdpa,
+                    attn.weights.o_proj_stream,
+                    self.partial,
+                    send=(b, "attn"),
+                    spec_tt=self.shared_kv.Tt if shared else None,
+                )
             if not self._persistent(sdpa):
                 sdpa.deallocate(True)
             pending = PendingBoundary(b, res, self.gamma_post[i], self.partial, "attn", sent=True)
@@ -630,15 +651,6 @@ class FusedVerify:
     def _sdpa(self, i):
         attn = self.layers[i].self_attn
         k_cache, v_cache = self.kv_cache[i]
-        if self.shared_kv is not None and self.use_shared and not attn.config.sliding_window:
-            return self.shared_kv(
-                self.q,
-                k_cache,
-                v_cache,
-                attn.weights.decode_sinks,
-                attn.config.scaling,
-                attn.program_config.get_compute_kernel_config(),
-            )
         if self.row_attn is not None and (self.use_row_attn or attn.config.sliding_window):
             # short-context row attention (dflash/row_attention.py); the output buffer is reused by every layer (o_proj
             # consumes it before the next layer's attention)

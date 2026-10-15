@@ -356,16 +356,32 @@ void generate_mask_spec_multi_pos(uint32_t Sk_chunk_t, uint32_t chunk_start_pos,
                 fill_tile<tile_bytes>(cb_mask_in, tile_id, NEG_INF);
             } else {
 #ifdef SPEC_ROWS_PER_CAND
+                // per row group g (rows g R .. g R + R - 1, one bound): the 8-word row pattern of each 16-column half
+                // (2 BF16 values per word), stored to the group's rows
                 CircularBuffer cb(cb_mask_in);
-                volatile tt_l1_ptr uint16_t* m =
-                    reinterpret_cast<volatile tt_l1_ptr uint16_t*>(cb.get_write_ptr() + tile_id * tile_bytes);
-                const uint16_t neg = NEG_INF >> 16;
-                for (uint32_t row = 0; row < 32; ++row) {
-                    const int32_t row_bound = static_cast<int32_t>(bound) - static_cast<int32_t>(32 / R - 1 - row / R);
-                    const int32_t keep = row_bound - static_cast<int32_t>(tile_first_pos);  // columns <= keep visible
-                    for (uint32_t col = 0; col < 32; ++col) {
-                        m[((row >> 4) * 2 + (col >> 4)) * 256 + (row & 15) * 16 + (col & 15)] =
-                            static_cast<int32_t>(col) <= keep ? 0 : neg;
+                volatile tt_l1_ptr uint32_t* m =
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cb.get_write_ptr() + tile_id * tile_bytes);
+                for (uint32_t g = 0; g < 32 / R; ++g) {
+                    const int32_t row_bound = static_cast<int32_t>(bound) - static_cast<int32_t>(32 / R - 1 - g);
+                    const int32_t vis = row_bound - static_cast<int32_t>(tile_first_pos) + 1;  // visible columns
+                    for (uint32_t f = 0; f < 2; ++f) {
+                        uint32_t w[8];
+                        for (uint32_t k = 0; k < 8; ++k) {
+                            const int32_t c0 = static_cast<int32_t>(16 * f + 2 * k);
+                            w[k] =
+                                (c0 < vis ? 0u : (NEG_INF & 0xFFFFu)) | (c0 + 1 < vis ? 0u : (NEG_INF & 0xFFFF0000u));
+                        }
+                        for (uint32_t row = g * R; row < g * R + R; ++row) {
+                            volatile tt_l1_ptr uint32_t* d = m + ((row >> 4) * 2 + f) * 128 + (row & 15) * 8;
+                            d[0] = w[0];
+                            d[1] = w[1];
+                            d[2] = w[2];
+                            d[3] = w[3];
+                            d[4] = w[4];
+                            d[5] = w[5];
+                            d[6] = w[6];
+                            d[7] = w[7];
+                        }
                     }
                 }
 #else

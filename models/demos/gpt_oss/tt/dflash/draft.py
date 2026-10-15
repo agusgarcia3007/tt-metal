@@ -836,10 +836,10 @@ class DFlashDraft:
         self.trace_draft = ttnn.begin_trace_capture(mesh, cq_id=0)
         self._draft_device()
         ttnn.end_trace_capture(mesh, self.trace_draft, cq_id=0)
-        # the draft pass with the shared-KV attention (dflash/shared_kv_attention.py), for long contexts
+        # the draft pass with the shared-KV attention (dflash/shared_kv_attention.py), for long histories
         self.trace_draft_x = None
         f = getattr(self, "fused", None)
-        if f is not None and getattr(f, "shared", None) is not None and f.shared_ok():
+        if f is not None and getattr(f, "shared", None) is not None and f.shared_allowed():
             f.use_shared = True
             self.trace_draft_x = ttnn.begin_trace_capture(mesh, cq_id=0)
             self._draft_device()

@@ -375,9 +375,19 @@ void kernel_main() {
 #endif
     for (uint32_t j = j0; x_pages > 0 && j < j1; ++j) {
         const uint32_t row = j / gather_pages;
+#ifndef X_SPEC_TT
         const uint32_t off = row < 16 ? row * half_row : 2 * face_bytes + (row - 16) * half_row;  // faces 0/1, 2/3
+#endif
         for (uint32_t r = 0; r < rows; ++r) {
+#ifdef X_SPEC_TT
+            // the shared-KV attention's packed output (dflash/shared_kv_attention.py): row r, head `row` is tile row
+            // 8 (r % 4) + row % 8 of tile ((row / 8) * X_SPEC_TT + r / 4) * x_pages + d
+            const uint32_t page = ((row / 8) * X_SPEC_TT + r / 4) * gather_pages + j % gather_pages;
+            const uint32_t prow = 8 * (r % 4) + row % 8;
+            const uint32_t off = prow < 16 ? prow * half_row : 2 * face_bytes + (prow - 16) * half_row;
+#else
             const uint32_t page = r * gather_pages + j % gather_pages;
+#endif
             const uint64_t src = x_stage_pages > 0 ? get_noc_addr(x_stage + page * 2048) : s_x.get_noc_addr(page);
             noc_async_read(src + off, x_l1 + j * tiny_bytes + r * half_row, half_row);
             noc_async_read(src + off + face_bytes, x_l1 + j * tiny_bytes + row_face + r * half_row, half_row);
@@ -620,9 +630,19 @@ void kernel_main() {
             else {
                 const uint32_t m = n < q_cols ? n : (n < q_cols + k_cols ? n - q_cols : n - q_cols - k_cols);
                 const uint32_t h = m / head_tiles;
+#ifndef Q_SPEC_TT
                 const uint32_t off = h < 16 ? h * half_row : 2 * face_bytes + (h - 16) * half_row;
+#endif
                 for (uint32_t r = 0; r < rows; ++r) {
+#ifdef Q_SPEC_TT
+                    // Q in the shared-KV attention's packed layout (dflash/shared_kv_attention.py): row r, head h at
+                    // tile row 8 (r % 4) + h % 8 of tile ((h / 8) * Q_SPEC_TT + r / 4) * head_tiles + t
+                    const uint32_t page = ((h / 8) * Q_SPEC_TT + r / 4) * head_tiles + m % head_tiles;
+                    const uint32_t prow = 8 * (r % 4) + h % 8;
+                    const uint32_t off = prow < 16 ? prow * half_row : 2 * face_bytes + (prow - 16) * half_row;
+#else
                     const uint32_t page = r * head_tiles + m % head_tiles;
+#endif
                     const uint64_t dst = n < q_cols            ? s_out.get_noc_addr(page, off)
                                          : n < q_cols + k_cols ? s_k.get_noc_addr(page, off)
                                                                : s_v.get_noc_addr(page, off);

@@ -224,8 +224,8 @@ class FastDFlashRunner:
                 v.forward()
                 ttnn.end_trace_capture(mesh, tid, cq_id=0)
                 traces[kind, r] = tid
-        variant("short", hi)
-        self.verify_trace = traces["short", hi]
+        variant(kinds[-1], hi)
+        self.verify_trace = traces[kinds[-1], hi]  # the main trace (x with the shared-KV attention, else short)
         self.verify_trace_long = traces.get(("long", hi))
         self.verify_trace_x = traces.get(("x", hi))
         self.low_traces = {kind: traces[kind, self.rows_low] for kind in kinds} if self.rows_low else {}
@@ -239,15 +239,14 @@ class FastDFlashRunner:
         # accepted fewer than DFLASH_VERIFY_ADAPT tokens (low acceptance: the capped rows rarely matter)
         self.rows_low = int(os.environ.get("DFLASH_VERIFY_ROWS_LOW", "0"))
         self.adapt = int(os.environ.get("DFLASH_VERIFY_ADAPT", "4"))
-        # DFLASH_SKV_MIN=n: blocks past position n use the shared-KV attention (dflash/shared_kv_attention.py: one
-        # K / V read for the block's rows) in the verify pass's full-attention layers and in the draft pass
-        self.skv_min = int(os.environ.get("DFLASH_SKV_MIN", "16384"))
-        # short: row attention everywhere; long: full-attention layers on ttnn SDPA, one K / V read per row (row
-        # attention holds row_attn_max positions; the sliding-window layers keep row attention, 128-position window);
-        # x: long with the shared-KV attention
-        kinds = (["long"] if v.row_attn is not None else []) + ["short"]
+        # x (DFLASH_SHARED_KV=1, every block position): the full-attention layers use the shared-KV attention
+        # (dflash/shared_kv_attention.py: one K / V read for the block's rows), the sliding-window layers row attention
+        # (128-position window). Without it: short (row attention everywhere; it holds row_attn_max positions) and long
+        # (full-attention layers on ttnn SDPA with one K / V read per block row) past row_attn_max.
         if v.shared_kv is not None:
-            kinds.append("x")
+            kinds = ["x"]
+        else:
+            kinds = (["long"] if v.row_attn is not None else []) + ["short"]
         hi = v.active_rows
         rows = [hi] + ([self.rows_low] if self.rows_low else [])
 
@@ -261,11 +260,11 @@ class FastDFlashRunner:
                 variant(kind, r)
                 v.forward()
         f = getattr(self.draft, "fused", None)
-        if f is not None and getattr(f, "shared", None) is not None and f.shared_ok():  # the shared-KV draft pass
+        if f is not None and getattr(f, "shared", None) is not None and f.shared_allowed():  # the shared draft pass
             f.use_shared = True
             self.draft._draft_device()
             f.use_shared = False
-        variant("short", hi)
+        variant(kinds[-1], hi)
         return kinds, rows, hi, variant
 
     def set_draft_window(self, w):
@@ -304,7 +303,7 @@ class FastDFlashRunner:
 
     def _kind(self, start):
         v = self.verify
-        if getattr(self, "verify_trace_x", None) is not None and start + v.M > self.skv_min:
+        if getattr(self, "verify_trace_x", None) is not None:
             return "x"
         return "long" if v.row_attn is not None and start + v.M > v.row_attn_max else "short"
 
@@ -315,9 +314,8 @@ class FastDFlashRunner:
         return {"x": self.verify_trace_x, "long": self.verify_trace_long, "short": self.verify_trace}[kind]
 
     def _draft_trace_for(self, start):
-        d = self.draft
-        x = getattr(d, "trace_draft_x", None)
-        return x if x is not None and self._kind(start) == "x" else d.trace_draft
+        x = getattr(self.draft, "trace_draft_x", None)
+        return x if x is not None and self._kind(start) == "x" else self.draft.trace_draft
 
     def prefill(self, prompt_ids):
         """The target's prefill + the drafter's prompt context; returns the target's next token. A prompt shape seen

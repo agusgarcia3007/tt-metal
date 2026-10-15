@@ -77,11 +77,12 @@ void kernel_main() {
         const uint32_t out = ptscr + (((skip + pt_n) * 4 + 63) & ~63u);
         volatile tt_l1_ptr int32_t* o = reinterpret_cast<volatile tt_l1_ptr int32_t*>(out);
         const uint32_t avail = nbytes / 4 - skip;
-        for (uint32_t h = 0; h < nkv; ++h) {
+        for (uint32_t b = 0; b < SPEC_B; ++b) {  // spec batch row b: kv head b / (SPEC_B / nkv)
+            const int32_t h = static_cast<int32_t>(b / (SPEC_B / nkv));
             for (uint32_t j = 0; j < pt_n; ++j) {
-                o[h * pt_n + j] = static_cast<int32_t>(nkv) * src[j < avail ? j : avail - 1] + static_cast<int32_t>(h);
+                o[b * pt_n + j] = static_cast<int32_t>(nkv) * src[j < avail ? j : avail - 1] + h;
             }
-            noc_async_write(out + h * pt_n * 4, s_pts.get_noc_addr(h), pt_n * 4);
+            noc_async_write(out + b * pt_n * 4, s_pts.get_noc_addr(b), pt_n * 4);
         }
     }
     volatile tt_l1_ptr int32_t* q = reinterpret_cast<volatile tt_l1_ptr int32_t*>(pscr + 128);

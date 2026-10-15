@@ -182,7 +182,7 @@ class FusedDraft:
         # DFLASH_SHARED_KV=1: the draft pass's attention reads each layer's K / V cache once for the M rows
         # (dflash/shared_kv_attention.py; with a drafter window: the last W .. W + 63 positions) instead of once per row
         self.shared = None
-        self.use_shared = False  # set per traced variant (FastDFlashRunner: positions past DFLASH_SKV_MIN)
+        self.use_shared = False  # set per traced variant (FastDFlashRunner)
         if os.environ.get("DFLASH_SHARED_KV", "1") == "1":
             from .shared_kv_attention import SharedKVAttention
 
@@ -201,8 +201,12 @@ class FusedDraft:
             )
             self.shared.prepare([c for kv in draft.caches for c in kv], [])
 
-    def shared_ok(self):
-        return self.shared is not None
+    def shared_allowed(self):
+        """The draft pass reads its whole history once (shared) only without a drafter window: with one, each row
+        reads just its last W positions, cheaper than the shared op's fixed cost (DFLASH_DRAFT_SHARED=1 / 0 forces
+        it on / off)."""
+        forced = os.environ.get("DFLASH_DRAFT_SHARED")
+        return self.shared is not None and (forced == "1" if forced is not None else not self.d.window)
 
     def set_window(self, w):
         # the shared-KV attention for drafter window w (0: none); call with no traces captured
@@ -458,7 +462,7 @@ class FusedDraft:
         fab = b.ccl == "fabric"  # else: ttnn all-reduce + boundary as ops of their own
         pending = PendingBoundary(b, emb, self.g_ln1[0], entry=True)
         rot = d.rope.get_rot_mats(d.t_rot) if self.prep is None else []
-        shared = self.shared is not None and self.use_shared
+        shared = self.use_shared and self.shared_allowed()
         if shared:
             self.shared.begin(d.t_bound, d.page_table)
         for i in range(d.layers):
@@ -484,7 +488,8 @@ class FusedDraft:
             kr.deallocate(True)
             vs.deallocate(True)
             if shared:
-                attn = self.shared(qr, kc, vc, None, d.hd**-0.5, d.ck)
+                self.shared.load_q(qr)
+                attn = self.shared.attend(kc, vc, None, d.hd**-0.5, d.ck)
             else:
                 attn = ttnn.transformer.paged_scaled_dot_product_attention_decode(
                     qr,
@@ -499,9 +504,14 @@ class FusedDraft:
                     memory_config=self.inter_mc,
                 )
             qr.deallocate(True)
-            self.o(attn, self.w_o[i], v.partial, send=(b, "attn") if fab else None)
-            if not shared:
-                attn.deallocate(True)
+            self.o(
+                attn,
+                self.w_o[i],
+                v.partial,
+                send=(b, "attn") if fab else None,
+                spec_tt=self.shared.Tt if shared else None,
+            )
+            attn.deallocate(True)
             pending = PendingBoundary(b, res, self.g_ln2[i], v.partial, "attn", sent=fab)
             if self.mlp_fused is not None:
                 self.mlp_fused(pending, self.union, self.weights, self.w_gu[i], self.act, self.w_down[i], v.partial)
