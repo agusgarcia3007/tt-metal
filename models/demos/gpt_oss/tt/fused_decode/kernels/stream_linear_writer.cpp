@@ -58,51 +58,14 @@
 #endif
 
 #ifdef QKV_ROPE_KV
-// One BF16 value (bits b) as a BFP8_b byte under shared exponent `shared`: sign | 7-bit magnitude = the 8-bit
-// significand (hidden bit included) shifted right by shared - exponent + 1, rounded to nearest even and saturated (the
-// rounding of tt_metal's host BFP8 packer); zero / denormal inputs and magnitudes that round to 0 give 0.
-inline uint32_t bfp8_byte(uint32_t b, uint32_t shared) {
-    const uint32_t e = (b >> 7) & 0xFF;
-    const uint32_t shift = shared - e + 1;
-    if (e == 0 || shift > 8) {
-        return 0;
-    }
-    const uint32_t sig = 0x80 | (b & 0x7F);
-    uint32_t q = sig >> shift;
-    const uint32_t rem = sig & ((1u << shift) - 1);
-    const uint32_t half = 1u << (shift - 1);
-    q += (rem > half || (rem == half && (q & 1))) ? 1 : 0;
-    q = q > 127 ? 127 : q;
-    return q == 0 ? 0 : ((b >> 15) << 7) | q;
-}
-
 // Writes 32 BF16 values (1x32 tile at src: values 0-15 then 16-31) into row rr of the BFP8_b 32x32 tile at tile
-// (L1): per 16-value face row the shared exponent is the largest exponent. Layout: 64 exponent bytes (face-major, then
-// row), then 4 x 256 mantissa bytes (face-major, row-major). Word loads / stores: this core is slow at byte accesses.
-// lo / hi: the 16 BF16 values of the row's first / second half.
+// (L1): per 16-value face row the shared exponent is the largest exponent (bfp8_row.hpp). lo / hi: the 16 BF16 values
+// of the row's first / second half.
 inline void bfp8_write_row(uint32_t tile, uint32_t lo, uint32_t hi, uint32_t rr) {
     for (uint32_t hh = 0; hh < 2; ++hh) {
-        volatile tt_l1_ptr uint32_t* in = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(hh == 0 ? lo : hi);
-        uint32_t v[16];
-        uint32_t shared = 0;
-        for (uint32_t i = 0; i < 8; ++i) {
-            const uint32_t w = in[i];
-            v[2 * i] = w & 0xFFFF;
-            v[2 * i + 1] = w >> 16;
-            const uint32_t e0 = (w >> 7) & 0xFF;
-            const uint32_t e1 = (w >> 23) & 0xFF;
-            shared = e0 > shared ? e0 : shared;
-            shared = e1 > shared ? e1 : shared;
-        }
-        const uint32_t face = (rr >> 4) * 2 + hh;
-        const uint32_t frow = rr & 15;
-        reinterpret_cast<volatile tt_l1_ptr uint8_t*>(tile)[face * 16 + frow] = shared;
-        volatile tt_l1_ptr uint32_t* man =
-            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(tile + 64 + face * 256 + frow * 16);
-        for (uint32_t q = 0; q < 4; ++q) {
-            man[q] = bfp8_byte(v[4 * q], shared) | (bfp8_byte(v[4 * q + 1], shared) << 8) |
-                     (bfp8_byte(v[4 * q + 2], shared) << 16) | (bfp8_byte(v[4 * q + 3], shared) << 24);
-        }
+        uint32_t shared, man[4];
+        bfp8_row::half_row(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(hh == 0 ? lo : hi), shared, man);
+        bfp8_row::put(tile, rr, hh, shared, man);
     }
 }
 #endif

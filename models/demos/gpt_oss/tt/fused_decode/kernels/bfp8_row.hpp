@@ -13,18 +13,16 @@ namespace bfp8_row {
 // significand (hidden bit included) shifted right by shared - exponent + 1, rounded to nearest even and saturated (the
 // rounding of tt_metal's host BFP8 packer); zero / denormal inputs and magnitudes that round to 0 give 0.
 inline uint32_t byte(uint32_t b, uint32_t shared) {
+    // branchless: round to nearest even as (sig + half - 1 + lsb) >> shift (exhaustively equal to the branchy form)
     const uint32_t e = (b >> 7) & 0xFF;
-    const uint32_t shift = shared - e + 1;
-    if (e == 0 || shift > 8) {
-        return 0;
-    }
+    const uint32_t shift_ = shared - e + 1;
+    const uint32_t valid = (e != 0) & (shift_ <= 8);
+    const uint32_t shift = valid ? shift_ : 8;
     const uint32_t sig = 0x80 | (b & 0x7F);
-    uint32_t q = sig >> shift;
-    const uint32_t rem = sig & ((1u << shift) - 1);
-    const uint32_t half = 1u << (shift - 1);
-    q += (rem > half || (rem == half && (q & 1))) ? 1 : 0;
-    q = q > 127 ? 127 : q;
-    return q == 0 ? 0 : ((b >> 15) << 7) | q;
+    uint32_t q = (sig + (1u << (shift - 1)) - 1 + ((sig >> shift) & 1)) >> shift;
+    q -= q >> 7;  // 128 -> 127 (saturate)
+    q = valid ? q : 0;
+    return q ? (((b >> 15) << 7) | q) : 0;
 }
 
 // 16 BF16 values (8 words at in) -> the shared exponent and 4 mantissa words
