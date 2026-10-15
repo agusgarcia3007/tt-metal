@@ -132,7 +132,12 @@ void kernel_main() {
             invalidate_l1_cache();
             const int32_t start = reinterpret_cast<volatile tt_l1_ptr int32_t*>(a)[0];
             uint32_t k = 0;
-            while (k + 1 < rows && o[1 + k] == best_id[k]) {
+#ifdef ACCEPT_ROWS
+            constexpr uint32_t verified = ACCEPT_ROWS;  // only rows [0, ACCEPT_ROWS) were verified
+#else
+            constexpr uint32_t verified = rows;
+#endif
+            while (k + 1 < verified && o[1 + k] == best_id[k]) {
                 ++k;
             }
             const int32_t s2 = start + static_cast<int32_t>(k) + 1;

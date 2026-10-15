@@ -9,6 +9,14 @@
 
 #include <stdint.h>
 
+// MOE_ACTIVE_ROWS (DFlash verify width): only rows [0, MOE_ACTIVE_ROWS) route; the others get no experts (zero
+// weights, not in the union), so the union (the MoE's weight traffic) covers the verified rows only.
+#ifdef MOE_ACTIVE_ROWS
+constexpr uint32_t active_rows = MOE_ACTIVE_ROWS;
+#else
+constexpr uint32_t active_rows = 32;
+#endif
+
 namespace router_topk {
 // BF16 bits -> Q16.16 fixed point (|x| < 2^14).
 inline int32_t bf16_to_q16(uint16_t b) {
@@ -177,7 +185,9 @@ inline void rows_union(const uint32_t* words, volatile tt_l1_ptr uint32_t* uni_w
         for (uint32_t j = 0; j < topk; ++j) {
             ids[r][j] = bi[j];
             wq[r][j] = (e[j] << 15) / (sum >> 1);  // Q16 weight (as topk_softmax)
-            mask |= 1u << bi[j];
+            if (r < active_rows) {
+                mask |= 1u << bi[j];
+            }
         }
     }
 
@@ -202,7 +212,7 @@ inline void rows_union(const uint32_t* words, volatile tt_l1_ptr uint32_t* uni_w
         for (uint32_t i = 0; i < 32; ++i) {
             wt[i] = 0;
         }
-        for (uint32_t j = 0; j < topk; ++j) {
+        for (uint32_t j = 0; j < topk && r < active_rows; ++j) {
             wt[slot[ids[r][j]]] = q16_to_bf16(wq[r][j]);
         }
         for (uint32_t i = 0; i < 16; ++i) {
@@ -306,7 +316,7 @@ inline void rows_finish(
     volatile tt_l1_ptr uint32_t* uni_w,
     volatile tt_l1_ptr uint32_t* wts_w) {
     uint32_t mask = 0;
-    for (uint32_t i = 0; i < rows * topk; ++i) {
+    for (uint32_t i = 0; i < (active_rows < rows ? active_rows : rows) * topk; ++i) {
         mask |= 1u << ids[i];
     }
     uint32_t slot[32];
@@ -330,7 +340,7 @@ inline void rows_finish(
         for (uint32_t i = 0; i < 32; ++i) {
             wt[i] = 0;
         }
-        for (uint32_t j = 0; j < topk; ++j) {
+        for (uint32_t j = 0; j < topk && r < active_rows; ++j) {
             wt[slot[ids[r * topk + j]]] = static_cast<uint16_t>(wq[r * topk + j]);
         }
         for (uint32_t i = 0; i < 16; ++i) {

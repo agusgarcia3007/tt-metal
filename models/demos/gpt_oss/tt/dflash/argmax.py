@@ -57,7 +57,7 @@ class ArgmaxGather:
         )
         return ttnn.ProgramDescriptor(kernels=[k], semaphores=[], cbs=[cb])
 
-    def __call__(self, lists, tokens_src, out, accept=None):
+    def __call__(self, lists, tokens_src, out, accept=None, rows_cap=0):
         """lists: the LM head's [1, n_lists * rows * 2] UINT32 lists; tokens_src: kind 0 the drafter's token input
         (element 0 = the block's first token), kind 1 the verify block tokens; out: kind 0 the verify token input
         [1, rows] UINT32, kind 1 a [1, 2 * rows] UINT32 result buffer."""
@@ -94,5 +94,7 @@ class ArgmaxGather:
             rt1 += [t.buffer_address() for t in ts]
             io += list(ts)
             defines = [("ACCEPT", "1"), ("ACCEPT_MASK_ID", str(mask_id))]
+            if rows_cap:  # only rows [0, rows_cap) were verified: accepted drafts <= rows_cap - 1
+                defines.append(("ACCEPT_ROWS", str(rows_cap)))
         prog = self._kernel(ct1, rt1, n_dev * 4096 + max(src_page, 64) + 1024, defines)
         ttnn.generic_op(io, prog)

@@ -232,6 +232,10 @@ class FusedVerify:
         # (mask id, next-round input tensors): the device computes the round's acceptance and writes the next round's
         # inputs (dflash/argmax.py ACCEPT; FastDFlashRunner device rounds)
         self.accept = None
+        # verified rows (dflash/moe_fused.py VERIFY_ROWS; 0: all): set per captured trace by FastDFlashRunner
+        from .moe_fused import VERIFY_ROWS
+
+        self.active_rows = VERIFY_ROWS
 
     def enable_device_argmax(self):
         """Merge the LM head's argmax lists on device (dflash/argmax.py): result = [block tokens, 8 argmaxes] (UINT32
@@ -321,6 +325,7 @@ class FusedVerify:
                     dw.down_stream,
                     self.partial,
                     layer=i,
+                    active_rows=self.active_rows,
                 )
                 res = pending.residual_out
                 pending.residual.deallocate(True)
@@ -345,7 +350,7 @@ class FusedVerify:
             pending = PendingBoundary(b, res, gamma, self.partial, "moe", sent=True)
         self.lm_head(pending, self.lm_weights, self.lists)
         if getattr(self, "argmax_gather", None) is not None:
-            self.argmax_gather(self.lists, self.tokens, self.result, accept=self.accept)
+            self.argmax_gather(self.lists, self.tokens, self.result, accept=self.accept, rows_cap=self.active_rows)
         pending.x.deallocate(True)
         pending.residual.deallocate(True)
         pending.residual_out.deallocate(True)

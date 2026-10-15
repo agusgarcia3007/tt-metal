@@ -26,6 +26,9 @@ import ttnn
 from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion
 
 MOE = [("MOE_FUSED", "1")]
+# DFLASH_VERIFY_ROWS=R (< block): only the first R block rows are verified (route to experts; the accept count is
+# capped at R): the union of experts, and with it the MoE's weight traffic, covers R rows (0: all rows)
+VERIFY_ROWS = int(os.environ.get("DFLASH_VERIFY_ROWS", "0"))
 
 
 def _wait_n(b):
@@ -116,9 +119,11 @@ class MoEFused:
             flush=True,
         )
 
-    def __call__(self, pending, router_ws, union, weights, gate_up_ws, act, down_ws, partial, layer=0):
+    def __call__(self, pending, router_ws, union, weights, gate_up_ws, act, down_ws, partial, layer=0, active_rows=0):
         """pending: the attn-site PendingBoundary (its partial sent by o_proj); runs the boundary, router, gate|up and
-        down and sends the down partial to the moe site. Sets pending.residual_out / pending.x."""
+        down and sends the down partial to the moe site. Sets pending.residual_out / pending.x. active_rows: only rows
+        [0, active_rows) route to experts (0: all)."""
+        MOE_ = MOE + ([("MOE_ACTIVE_ROWS", str(active_rows))] if active_rows else [])
         b, mesh = self.boundary, self.mesh
         ctr = self.counters.buffer_address()
         rx, ry = self.router_noc.x, self.router_noc.y
@@ -135,7 +140,7 @@ class MoEFused:
             (union, weights),
             build_only=True,
             consumer_cores=self.R.merge(self.G),
-            extra_defines=MOE + self.split_defines + pdef,
+            extra_defines=MOE_ + self.split_defines + pdef,
             extra_writer_rt=router_rt,
         )
         x = pending.x
@@ -147,7 +152,7 @@ class MoEFused:
             gate_up_ws,
             act,
             build_only=True,
-            extra_defines=MOE + pdef + _wait_n(b),
+            extra_defines=MOE_ + pdef + _wait_n(b),
             extra_writer_rt=[ctr, rx, ry] + ([pred_addr] if P else []),
             extra_reader_rt=[rx, ry, pred_addr] if P else None,
             pred_p=P,
@@ -160,7 +165,7 @@ class MoEFused:
             down_ws,
             partial,
             build_only=True,
-            extra_defines=MOE + pdef,
+            extra_defines=MOE_ + pdef,
             extra_writer_rt=[ctr, rx, ry, n_g] + ([pred_addr] if P else []),
             notify_args=[1, b.noc_xy[0], b.noc_xy[1], 2],
             extra_reader_rt=[rx, ry, pred_addr] if P else None,

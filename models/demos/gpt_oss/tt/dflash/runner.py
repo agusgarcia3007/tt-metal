@@ -221,13 +221,31 @@ class FastDFlashRunner:
         self.verify_trace = ttnn.begin_trace_capture(mesh, cq_id=0)
         v.forward()
         ttnn.end_trace_capture(mesh, self.verify_trace, cq_id=0)
+        # DFLASH_VERIFY_ROWS_LOW=r: also traces verifying only the first r rows, used for the round after one that
+        # accepted fewer than DFLASH_VERIFY_ADAPT tokens (low acceptance: the capped rows rarely matter)
+        self.rows_low = int(os.environ.get("DFLASH_VERIFY_ROWS_LOW", "0"))
+        self.adapt = int(os.environ.get("DFLASH_VERIFY_ADAPT", "4"))
+        self.low_traces = {}
+        if self.rows_low:
+            hi = v.active_rows
+            v.active_rows = self.rows_low
+            for long in ([True] if v.row_attn is not None else []) + [False]:
+                v.use_row_attn = not long
+                v.forward()
+                tid = ttnn.begin_trace_capture(mesh, cq_id=0)
+                v.forward()
+                ttnn.end_trace_capture(mesh, tid, cq_id=0)
+                self.low_traces[long] = tid
+            v.active_rows = hi
+            v.use_row_attn = v.row_attn is not None
         self.draft.capture_traces()
 
-    def _verify_trace_for(self, start):
+    def _verify_trace_for(self, start, low=False):
         v = self.verify
-        if v.row_attn is not None and start + v.M > v.row_attn_max:
-            return self.verify_trace_long
-        return self.verify_trace
+        long = v.row_attn is not None and start + v.M > v.row_attn_max
+        if low and self.low_traces:
+            return self.low_traces[long]
+        return self.verify_trace_long if long else self.verify_trace
 
     def prefill(self, prompt_ids):
         L = len(prompt_ids)
@@ -253,6 +271,8 @@ class FastDFlashRunner:
         t_prefill = time.perf_counter() - t0
         accept, rounds = [], []
         B = self.draft.block
+        R_hi = self.verify.active_rows or B  # verified rows (accepted drafts <= R - 1)
+        low = False
         mesh = self.model.mesh_device
         while len(ids) - L < max_new_tokens and not (set(ids[L:]) & self.eos_ids):
             t = time.perf_counter()
@@ -269,13 +289,14 @@ class FastDFlashRunner:
                 self.verify.forward()
             else:
                 ttnn.execute_trace(mesh, self.draft.trace_draft, cq_id=0, blocking=False)
-                ttnn.execute_trace(mesh, self._verify_trace_for(start), cq_id=0, blocking=False)
+                ttnn.execute_trace(mesh, self._verify_trace_for(start, low), cq_id=0, blocking=False)
             t1 = time.perf_counter()
             block, post = self.verify.read_result()
             d = block[1:]
             t2 = time.perf_counter()
+            R = self.rows_low if low else R_hi
             k = 0
-            while k < B - 1 and d[k] == post[k]:
+            while k < R - 1 and d[k] == post[k]:
                 k += 1
             ids += d[:k] + [post[k]]
             if self.device_rounds:  # the context positions are on device already
@@ -284,5 +305,6 @@ class FastDFlashRunner:
                 self.draft.add_context_traced(None, range(start, start + k + 1))
             t3 = time.perf_counter()
             accept.append(k + 1)
+            low = bool(getattr(self, "low_traces", None)) and k + 1 < self.adapt
             rounds.append((t1 - t, t2 - t1, t3 - t2))
         return ids[L:], accept, dict(prefill=t_prefill, rounds=rounds)
