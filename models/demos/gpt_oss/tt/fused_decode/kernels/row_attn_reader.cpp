@@ -57,7 +57,6 @@ void kernel_main() {
     cb_reserve_back(cb_scr, 1);
     const uint32_t scr = get_write_ptr(cb_scr);  // [pos page | page-table row]
     noc_async_read(s_pos.get_noc_addr(0), scr, pos_page_bytes);
-    noc_async_read(s_pt.get_noc_addr(0), scr + 256, pt_page_bytes);
     cb_reserve_back(cb_q, 2);
 #ifndef RA_WAIT_SEM
     noc_async_read(s_q.get_noc_addr(2 * r), get_write_ptr(cb_q), tile);
@@ -85,6 +84,14 @@ void kernel_main() {
     if (nk > max_chunks) {  // never overrun the CBs (the host keeps longer rows on ttnn SDPA)
         nk = max_chunks;
     }
+    // only the page-table entries of positions [c0, p] (every core reading the whole row would hit one DRAM bank with
+    // 16 x the row at long context), read from the 64-byte boundary at or below the first
+    const uint32_t a0 = (c0 / block * 4) & ~63u;
+    const uint32_t a1 = ((static_cast<uint32_t>(p) / block + 1) * 4 + 63) & ~63u;
+    noc_async_read(s_pt.get_noc_addr(0) + a0, scr + 256, (a1 < pt_page_bytes ? a1 : pt_page_bytes) - a0);
+    const uint32_t pt_first = a0 / 4;
+    noc_async_read_barrier();
+    invalidate_l1_cache();
     const uint32_t first_cut = lo - c0;                              // masked columns at the start of chunk 0
     const uint32_t last_keep = (static_cast<uint32_t>(p) & 31) + 1;  // valid columns of the last chunk
 
@@ -107,7 +114,7 @@ void kernel_main() {
 #endif
     auto read_chunk = [&](uint32_t j) {
         const uint32_t pos = c0 + 32 * j;
-        const uint32_t blk = static_cast<uint32_t>(pt[pos / block]);
+        const uint32_t blk = static_cast<uint32_t>(pt[pos / block - pt_first]);
         const uint32_t t0 = ((blk * nkv + g) * tpb + (pos % block) / 32) * 2;
         for (uint32_t d = 0; d < 2; ++d) {
             noc_async_read(s_k.get_noc_addr(t0 + d), kl1 + (2 * j + d) * kv_tile_bytes, kv_tile_bytes);

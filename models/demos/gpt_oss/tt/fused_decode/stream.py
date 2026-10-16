@@ -521,9 +521,9 @@ class LinearStream(_BankStreamOp):
     ):
         """spec_tt = Tt (rows > 1): x (x_pages > 0) is / Q (out_mode 3) goes to the shared-KV attention's packed layout
         (dflash/shared_kv_attention.py, Tt packed row-tiles per kv head) instead of [M, heads, head_dim].
-        fuse = (kernels, cbs, io, noc_cores, sem_id): another op's parts on other cores added to this program; the
-        writers increment program semaphore sem_id on noc_cores once all their outputs are written (QKV + row
-        attention, dflash/verify.py).
+        fuse = (kernels, cbs, io, noc_cores, sem_id[, semaphores]): another op's parts on other cores added to this
+        program (with its own program semaphores); the writers increment program semaphore sem_id on noc_cores once all
+        their outputs are written (QKV + row / block attention, dflash/verify.py).
         send = (boundary, site), out_mode 5: fuse the boundary all-reduce's fabric send (fused_decode/boundary.py
         sending_program). x may be a fused_decode.boundary.PendingBoundary: the boundary producing x then runs inside
         this op (DecodeBoundary.consumer_parts) while the weight readers stream ahead. exchange (out_mode 3): an object
@@ -701,14 +701,14 @@ class LinearStream(_BankStreamOp):
                     ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, self.cores, 0)
                 ]
             if fuse is not None:
-                f_kernels, f_cbs, _, f_noc, f_sem = fuse
-                assert all(sd.id != f_sem for sd in program.semaphores)
+                f_kernels, f_cbs, _, f_noc, f_sem = fuse[:5]
+                f_extra = list(fuse[5]) if len(fuse) > 5 else []  # the fused op's own semaphores
+                f_cores = f_kernels[0].core_ranges
+                f_sems = [ttnn.SemaphoreDescriptor(f_sem, ttnn.CoreType.WORKER, f_cores, 0)] + f_extra
+                assert all(sd.id != f.id for sd in program.semaphores for f in f_sems)
                 program.kernels = list(program.kernels) + list(f_kernels)
                 program.cbs = list(program.cbs) + list(f_cbs)
-                f_cores = f_kernels[0].core_ranges
-                program.semaphores = list(program.semaphores) + [
-                    ttnn.SemaphoreDescriptor(f_sem, ttnn.CoreType.WORKER, f_cores, 0)
-                ]
+                program.semaphores = list(program.semaphores) + f_sems
             return program
 
         assert not (send and pending), "an op is either a boundary producer or its consumer"

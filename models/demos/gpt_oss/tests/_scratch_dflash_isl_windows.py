@@ -70,10 +70,20 @@ def test_dflash_isl_windows(mesh_device, device_params):
         d_ms = sum(sum(x) for x in tm["rounds"]) * 1e3
         print(
             f"DFISLG isl={isl} ctx={ctx} window={w}: {n} tokens, accept {sum(acc) / len(acc):.2f} ({len(acc)} rounds), "
-            f"DFlash {n / d_ms * 1e3:.1f} tok/s/u",
+            f"DFlash {n / d_ms * 1e3:.1f} tok/s/u, round {d_ms / len(acc):.3f} ms",
             flush=True,
         )
         if os.environ.get("SHOW_ACC") == "1":  # accepted tokens per round, in order (position = isl + running sum)
             print(f"DFACC window={w}: {''.join(str(a - 1) for a in acc)}", flush=True)
+            print(f"DFTOK window={w}: {list(toks[:n])}", flush=True)  # the generated ids (compare paths exactly)
             if w == windows[0]:
                 print(f"DFTXT {tokenizer.decode(toks[:n])!r}"[:1200], flush=True)
+        if os.environ.get("PLAIN_REF") == "1":  # the target's own greedy decode (eager) on the same prompt
+            from models.demos.gpt_oss.tt.dflash.runner import DFlashRunner
+
+            fast.release_traces()  # (eager programs compiled after a capture could sit in the traces' space)
+            plain = [first]
+            for i in range(n - 1):
+                plain.append(DFlashRunner._decode(fast, plain[-1], len(ids) + i))
+            k = next((i for i in range(n) if toks[i] != plain[i]), None)
+            print(f"DFPLAIN window={w}: == plain greedy over {n} tokens: {k is None}; first diff at {k}", flush=True)

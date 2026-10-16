@@ -200,13 +200,41 @@ class FusedDraft:
                 uniform=True,
             )
             self.shared.prepare([c for kv in draft.caches for c in kv], [])
+        # DFLASH_DRAFT_BA=1: the shared pass's attention is block attention (dflash/block_attention.py, uniform mode:
+        # every row attends [0, pos[M - 1]]) instead of the spec SDPA op; DFLASH_BA_S slice cores per kv head
+        self.ba = None
+        if self.shared is not None and os.environ.get("DFLASH_DRAFT_BA", "1") == "1":
+            self.ba = self._block_attention(draft.window or 0)
+
+    def _block_attention(self, window):
+        from .block_attention import BlockAttention, free_cores
+
+        d, mesh = self.d, self.mesh
+        grid = mesh.compute_with_storage_grid_size()
+        per_slice = BlockAttention.cores_needed(d.nkv, self.M, 1)
+        S = min(int(os.environ.get("DFLASH_BA_S", "24")), grid.x * grid.y // per_slice)
+        return BlockAttention(
+            mesh,
+            self.M,
+            d.nq,
+            d.nkv,
+            d.hd,
+            d.block_size,
+            free_cores(mesh, set(), per_slice * S),
+            S,
+            uniform=True,
+            window=window,
+        )
 
     def shared_allowed(self):
         """The draft pass reads its whole history once (shared) only without a drafter window: with one, each row
         reads just its last W positions, cheaper than the shared op's fixed cost (DFLASH_DRAFT_SHARED=1 / 0 forces
         it on / off)."""
         forced = os.environ.get("DFLASH_DRAFT_SHARED")
-        return self.shared is not None and (forced == "1" if forced is not None else not self.d.window)
+        if forced is not None:
+            return self.shared is not None and forced == "1"
+        # block attention reads a window exactly once (the spec op's window is a page-table shift: per row only)
+        return self.shared is not None and (self.ba is not None or not self.d.window)
 
     def set_window(self, w):
         # the shared-KV attention for drafter window w (0: none); call with no traces captured
@@ -227,6 +255,8 @@ class FusedDraft:
             uniform=True,
         )
         self.shared.prepare([c for kv in d.caches for c in kv], [])
+        if self.ba is not None:
+            self.ba = self._block_attention(w or 0)
 
     def _argmax_gather(self):
         return self._gather
@@ -463,7 +493,7 @@ class FusedDraft:
         pending = PendingBoundary(b, emb, self.g_ln1[0], entry=True)
         rot = d.rope.get_rot_mats(d.t_rot) if self.prep is None else []
         shared = self.use_shared and self.shared_allowed()
-        if shared:
+        if shared and self.ba is None:
             self.shared.begin(d.t_bound, d.page_table)
         for i in range(d.layers):
             L = d.L[i]
@@ -489,7 +519,10 @@ class FusedDraft:
             vs.deallocate(True)
             if shared:
                 self.shared.load_q(qr)
-                attn = self.shared.attend(kc, vc, None, d.hd**-0.5, d.ck)
+                if self.ba is not None:
+                    attn = self.ba(self.shared.q, kc, vc, d.t_bound, d.page_table, None, d.hd**-0.5)
+                else:
+                    attn = self.shared.attend(kc, vc, None, d.hd**-0.5, d.ck)
             else:
                 attn = ttnn.transformer.paged_scaled_dot_product_attention_decode(
                     qr,
@@ -511,7 +544,8 @@ class FusedDraft:
                 send=(b, "attn") if fab else None,
                 spec_tt=self.shared.Tt if shared else None,
             )
-            attn.deallocate(True)
+            if self.ba is None or attn is not self.ba.out:  # block attention's output is persistent
+                attn.deallocate(True)
             pending = PendingBoundary(b, res, self.g_ln2[i], v.partial, "attn", sent=fab)
             if self.mlp_fused is not None:
                 self.mlp_fused(pending, self.union, self.weights, self.w_gu[i], self.act, self.w_down[i], v.partial)

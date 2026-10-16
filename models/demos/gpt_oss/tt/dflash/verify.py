@@ -178,6 +178,7 @@ class FusedVerify:
         # DFLASH_SHARED_KV=1: the full-attention layers past row attention's range read the K / V cache once for the
         # M rows (dflash/shared_kv_attention.py: SDPA's spec_multi_pos_tiles mode) instead of once per row
         self.shared_kv = None
+        self.block_attn = None
         self.use_shared = False  # set per traced variant (FastDFlashRunner)
         if os.environ.get("DFLASH_SHARED_KV", "1") == "1":
             from .shared_kv_attention import SharedKVAttention
@@ -197,6 +198,30 @@ class FusedVerify:
             self.shared_kv.prepare(
                 [c for i in full for c in kv_cache[i]], [self.layers[i].self_attn.weights.decode_sinks for i in full]
             )
+            # DFLASH_BLOCK_ATTN=1 (with the fusion): the full-attention layers' shared-KV attention runs inside the QKV
+            # program (dflash/block_attention.py: row attention's design, the rows sharing each K / V read) instead of
+            # the spec SDPA op; DFLASH_BA_S slice cores per kv head
+            if os.environ.get("DFLASH_BLOCK_ATTN", "1") == "1" and getattr(self, "ra_fuse", False):
+                from .block_attention import BlockAttention, free_cores
+
+                taken = {(c.x, c.y) for c in ttnn.corerange_to_cores(self.qkv.cores, row_wise=True)}
+                taken |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.boundary.cores, row_wise=True)}
+                taken |= {(h.x, h.y) for h in getattr(self.boundary, "helpers", [])}
+                grid = mesh.compute_with_storage_grid_size()
+                n_free = grid.x * grid.y - len(taken)
+                per_slice = BlockAttention.cores_needed(self.nkv, M, 1)
+                # DFLASH_BA_S slices per (kv head, tile group), capped by the cores QKV / the boundary leave free
+                S = min(int(os.environ.get("DFLASH_BA_S", "24")), n_free // per_slice)
+                self.block_attn = BlockAttention(
+                    mesh,
+                    M,
+                    self.nq,
+                    self.nkv,
+                    self.hd,
+                    kv_cache[full[0]][0].shape[2],
+                    free_cores(mesh, taken, BlockAttention.cores_needed(self.nkv, M, S)),
+                    S,
+                )
         self.moe_fused = None
         if os.environ.get("DFLASH_MOE_FUSED", "1") == "1" and self.boundary.ccl == "fabric":
             from .moe_fused import MoEFused
@@ -389,7 +414,8 @@ class FusedVerify:
         )
         emb = ttnn.reshape(emb, (1, 1, M, self.H))
         pending = PendingBoundary(b, emb, self.gamma_in[0], entry=True)
-        if self.shared_kv is not None and self.use_shared:
+        ba = self.block_attn if self.use_shared else None
+        if self.shared_kv is not None and self.use_shared and ba is None:
             self.shared_kv.begin(self.pos, self.page_table)
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
@@ -417,6 +443,18 @@ class FusedVerify:
                 )
                 fuse = (kern, cbs, io, self.row_attn.noc_cores(), 3)
             shared = self.shared_kv is not None and self.use_shared and not attn.config.sliding_window
+            if shared and ba is not None:  # block attention fused into the QKV program (Q in its packed layout)
+                kern, cbs, io = ba.parts(
+                    ba.q,
+                    k_cache,
+                    v_cache,
+                    self.pos,
+                    self.page_table,
+                    attn.weights.decode_sinks,
+                    attn.config.scaling,
+                    wait=(3, len(self.qkv.assignments)),
+                )
+                fuse = (kern, cbs, io, ba.notify_order(), 3, ba.semaphores())
             if o_f is not None:
                 # QKV + row attention + o_proj + the attn-site boundary send: one program per device
                 qprog, qio = self.qkv(
@@ -456,8 +494,10 @@ class FusedVerify:
                         io.append(t)
                 ttnn.generic_op(io, mesh_program)
             elif shared:  # Q straight into the shared-KV attention's packed layout
-                sq = self.shared_kv.q
-                self.qkv(pending, attn.weights.wqkv_stream, (sq, sq, sq), rope_kv=rk, spec_tt=self.shared_kv.Tt)
+                sq = ba.q if ba is not None else self.shared_kv.q
+                self.qkv(
+                    pending, attn.weights.wqkv_stream, (sq, sq, sq), rope_kv=rk, spec_tt=self.shared_kv.Tt, fuse=fuse
+                )
             else:
                 self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse)
             res = pending.residual_out
@@ -465,7 +505,9 @@ class FusedVerify:
             pending.residual.deallocate(True)
             if i - 1 in self.capture_layers:  # layer i - 1's output = this layer's input residual
                 self._capture(i - 1, res)
-            if fuse is not None:
+            if shared and ba is not None:
+                sdpa = ba.out
+            elif fuse is not None:
                 sdpa = self.row_attn.out
             elif shared:
                 sdpa = self.shared_kv.attend(
@@ -646,7 +688,7 @@ class FusedVerify:
 
     def _persistent(self, t):
         # the row attention / shared-KV outputs are reused by every layer
-        return any(o is not None and t is o.out for o in (self.row_attn, self.shared_kv))
+        return any(o is not None and t is o.out for o in (self.row_attn, self.shared_kv, self.block_attn))
 
     def _sdpa(self, i):
         attn = self.layers[i].self_attn
