@@ -95,7 +95,18 @@ class MoEFused:
         per_device = os.environ.get("DFLASH_MOE_PER_DEVICE", "0") == "1"
         self.coords = list(boundary.coords)
         self.parts = {}
+        # DFLASH_MOE_ROWS=1: gate|up / down readers on their DRAM bank's row (fused_decode/stream.py row_placement):
+        # per bank its gate_up_readers nearest cores to gate|up, the next down_readers to down (the router moved off
+        # the rows, dflash/verify.py); the straggler exclusions do not apply
+        rows_mode = os.environ.get("DFLASH_MOE_ROWS", "0") == "1"
         for coord in self.coords if per_device else [None]:
+            gp = dp = None
+            if rows_mode:
+                from ..fused_decode.stream import row_placement
+
+                rp = row_placement(mesh_device, gate_up_readers + down_readers, exclude=taken, coord=coord)
+                gp = [(rp[b][r], b, r) for b in sorted(rp) for r in range(gate_up_readers)]
+                dp = [(rp[b][gate_up_readers + r], b, r) for b in sorted(rp) for r in range(down_readers)]
             gu = ExpertGateUpUnion(
                 mesh_device,
                 hidden,
@@ -108,6 +119,7 @@ class MoEFused:
                 real_inter=real_inter,
                 coord=coord,
                 rot=EXPERT_BANK_ROT,
+                placed=gp,
             )
             dn = ExpertDownUnion(
                 mesh_device,
@@ -120,6 +132,7 @@ class MoEFused:
                 coord=coord,
                 rot=EXPERT_BANK_ROT,
                 skip_pad=SKIP_PAD,
+                placed=dp,
             )
             gu.noc1_cores, dn.noc1_cores = G_NOC1, D_NOC1
             self.parts[None if coord is None else (coord[0], coord[1])] = (gu, dn)
@@ -188,6 +201,8 @@ class MoEFused:
         early = bool(self.split_defines) and not STEAL and os.environ.get("DFLASH_MOE_EARLY_UNION", "1") == "1"
         if early:
             MOE_ = MOE_ + [("MOE_WSEM", str(EARLY_WSEM))]
+        if os.environ.get("DFLASH_MOE_PRED_VC", "0") == "1":  # predicted-expert prefetch on the readers' VCs
+            MOE_ = MOE_ + [("MOE_PRED_VC", "1")]
         b, mesh = self.boundary, self.mesh
         ctr = self.counters.buffer_address()
         rx, ry = self.router_noc.x, self.router_noc.y

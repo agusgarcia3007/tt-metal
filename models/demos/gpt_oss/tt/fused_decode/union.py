@@ -115,12 +115,13 @@ class ExpertGateUpUnion(_BankStreamOp):
         real_inter=None,
         coord=None,
         rot=0,
+        placed=None,
     ):
         """dense_silu: plain silu(g) * u (a dense MLP run as one union expert, e.g. the DFlash drafter).
         real_inter: the unpadded intermediate size; cores whose column pairs are all padding are dropped (their act
         tiles stay zero, as do the matching down weights). coord: per-device placement, rot: the weights' bank
-        rotation (_BankStreamOp)."""
-        super().__init__(mesh_device, readers, exclude=exclude, coord=coord, rot=rot)
+        rotation (_BankStreamOp); placed: explicit reader cores (_BankStreamOp)."""
+        super().__init__(mesh_device, readers, exclude=exclude, coord=coord, rot=rot, placed=placed)
         self.dense_silu = dense_silu
         self.max_experts = max_experts
         self.rows = rows
@@ -268,12 +269,13 @@ class ExpertDownUnion(_BankStreamOp):
         coord=None,
         rot=0,
         skip_pad=False,
+        placed=None,
     ):
         """num_buffers: weight blocks in the reader's ring (expert-outer; 2 when the blocks are large).
         expert_outer: kernels/stream_down_union2_*: each core reads its columns of one expert as one contiguous
         block and accumulates its (<= 4) output tiles across the experts in DST (larger DRAM reads). rot: the weights'
         bank rotation (_BankStreamOp). skip_pad: drop the cores whose output columns are all past `hidden` (padding)."""
-        super().__init__(mesh_device, readers, exclude=exclude, coord=coord, rot=rot)
+        super().__init__(mesh_device, readers, exclude=exclude, coord=coord, rot=rot, placed=placed)
         self.rows = rows
         self.hidden = hidden
         self.inter_pad = inter_pad

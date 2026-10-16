@@ -124,6 +124,10 @@ class FusedVerify:
             out_page_bytes=128,
             heads=(self.top_k, self.n_experts),
             rows=M,
+            # DFLASH_MOE_ROWS=1: off the DRAM bank rows (the MoE readers take them, dflash/moe_fused.py)
+            exclude=[(x, 9) for x in range(mesh.compute_with_storage_grid_size().x)]
+            if os.environ.get("DFLASH_MOE_ROWS", "0") == "1"
+            else (),
         )
         ex = mlp0.experts
         inter_pad = ex.decode_weights.intermediate_padded

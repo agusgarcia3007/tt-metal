@@ -189,6 +189,39 @@ def _page_bytes(tiles, tile_bytes):
     return max(d for d in range(1, tiles + 1) if tiles % d == 0 and d * tile_bytes <= MAX_PACKET_BYTES) * tile_bytes
 
 
+def row_placement(mesh_device, per_bank, exclude=(), coord=None):
+    """per_bank logical reader cores per DRAM bank, on the row of the bank's optimal NOC0 worker: nearest that worker
+    first, a row shared by two banks split at the right bank's worker column, a bank short of cores on its row
+    topped up from the row above (then below). Measured with every reader streaming one bank's share (16 KB
+    trid-pipelined reads, one device): 490 GB/s (95.7 % of 512) vs 464 for the placement that spreads a bank's
+    readers over neighbouring rows: readers off the bank's row lose NOC arbitration to the row's own and finish
+    their share late, and the bank finishes with its slowest reader. Returns {bank: [CoreCoord] * per_bank}."""
+    if coord is not None:
+        a = mesh_device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0, coord)
+        opt = [a[b] for b in sorted(a)]
+    else:
+        opt = mesh_device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0)
+    grid = mesh_device.compute_with_storage_grid_size()
+    used = {tuple(c) for c in exclude}
+    out = {}
+    for b, w in enumerate(opt):
+        mates = sorted(c.x for c in opt if c.y == w.y)
+        lo = w.x if w.x != mates[0] else 0
+        nxt = [x for x in mates if x > w.x]
+        hi = nxt[0] if nxt else grid.x
+        mine = []
+        for y, xs in ((w.y, range(lo, hi)), (w.y - 1, range(grid.x)), (w.y + 1, range(grid.x))):
+            if not 0 <= y < grid.y:
+                continue
+            for x in sorted(xs, key=lambda x: (abs(x - w.x), x)):
+                if len(mine) < per_bank and (x, y) not in used:
+                    used.add((x, y))
+                    mine.append(ttnn.CoreCoord(x, y))
+        assert len(mine) == per_bank, f"row placement: {len(mine)} cores for bank {b}"
+        out[b] = mine
+    return out
+
+
 class _BankStreamOp:
     """Worker placement shared by the streaming ops: `readers` cores per DRAM bank (the first `active_banks` banks),
     starting at the bank's optimal NOC0 reader core and growing along its row, each with a NOC virtual channel
@@ -196,7 +229,8 @@ class _BankStreamOp:
     coalesced into rectangles: dispatch writes kernel binaries and arguments per core range, and single-core ranges
     made multi-reader programs measurably slower to launch under trace."""
 
-    def __init__(self, mesh_device, readers, active_banks=None, exclude=(), coord=None, rot=0):
+    def __init__(self, mesh_device, readers, active_banks=None, exclude=(), coord=None, rot=0, placed=None):
+        explicit = placed  # explicit (logical core, bank, reader index) per reader (row_placement)
         """exclude: logical (x, y) cores to leave free (a fused program's other kernels); a bank's readers then also
         spill onto the neighbouring rows when its own row is full. coord: place for that device's own optimal bank
         workers (harvesting differs per chip) instead of the first device's. rot: DRAM bank b holds the weights'
@@ -218,8 +252,10 @@ class _BankStreamOp:
         grid = mesh_device.compute_with_storage_grid_size()
         exclude = {tuple(c) for c in exclude}
         used = {(c.x, c.y) for c in bank_workers} | exclude
-        placed = []
-        for bank, core in enumerate(bank_workers):
+        placed = [] if explicit is None else list(explicit)
+        if explicit is not None:
+            assert len(placed) == len(bank_workers) * readers
+        for bank, core in enumerate(bank_workers if explicit is None else []):
             cores = [] if (core.x, core.y) in exclude else [core]
             # along the row (+dx before -dx); with exclusions, nearest first (Manhattan) over the rows within 2
             cand = [(dx, 0) for d in range(1, grid.x) for dx in (d, -d)]

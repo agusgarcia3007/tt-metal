@@ -53,10 +53,36 @@ void kernel_main() {
         pred);
     cb_reserve_back(MOE_PRED_CB, P * cols * kt);
     const uint32_t pre = get_write_ptr(MOE_PRED_CB);
+#ifdef MOE_PRED_VC
+    // MOE_PRED_VC: the prefetch's requests on this reader's virtual channel (as the stream below), in packets
+    {
+        const uint64_t pb = get_noc_addr_from_bank_id<true>(bank_id, w_addr);
+        noc_async_read_one_packet_set_state<true>(pb, pkt, vc);
+        for (uint32_t k = 0; k < P; ++k) {
+            uint32_t src = w_addr + pred[k] * expert_stride + reader_offset;
+            uint32_t dst = pre + k * cols * col_bytes;
+            for (uint32_t c = 0; c < cols; ++c) {
+                for (uint32_t q = 0; q < full_pkts; ++q) {
+                    noc_async_read_one_packet_with_state<true>(src, dst, vc);
+                    src += pkt;
+                    dst += pkt;
+                }
+                if constexpr (tail > 0) {
+                    noc_async_read_one_packet_set_state<true>(pb, tail, vc);
+                    noc_async_read_one_packet_with_state<true>(src, dst, vc);
+                    noc_async_read_one_packet_set_state<true>(pb, pkt, vc);
+                    src += tail;
+                    dst += tail;
+                }
+            }
+        }
+    }
+#else
     for (uint32_t k = 0; k < P; ++k) {
         const uint64_t src = get_noc_addr_from_bank_id<true>(bank_id, w_addr + pred[k] * expert_stride + reader_offset);
         noc_async_read(src, pre + k * cols * col_bytes, cols * col_bytes);
     }
+#endif
 #endif
 
 #if defined(MOE_FUSED) && !defined(MOE_NO_ROUTER)
