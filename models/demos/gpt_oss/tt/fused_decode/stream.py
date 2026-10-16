@@ -286,23 +286,46 @@ class _BankStreamOp:
         defines=None,
     ):
         dm = ttnn.DataMovementConfigDescriptor
-        kernels = [
-            ttnn.KernelDescriptor(
-                kernel_source=str(KERNEL_DIR / f"stream_{name}_reader.cpp"),
-                core_ranges=self.cores,
-                compile_time_args=reader_ct,
-                runtime_args=reader_rt,
-                config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_0),
-                defines=defines or [],
-            ),
-            ttnn.KernelDescriptor(
-                kernel_source=str(KERNEL_DIR / f"stream_{name}_writer.cpp"),
-                core_ranges=self.cores,
-                compile_time_args=writer_ct,
-                runtime_args=writer_rt,
-                config=dm(processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_1),
-                defines=defines or [],
-            ),
+        # noc1_cores (set of logical (x, y)): readers on NOC1 (the bank's other DRAM endpoint, west / north paths) and
+        # writers on NOC0 there
+        all_cores = ttnn.corerange_to_cores(self.cores, row_wise=True)
+        swap = [c for c in all_cores if (c.x, c.y) in getattr(self, "noc1_cores", set())]
+        groups = [([c for c in all_cores if (c.x, c.y) not in {(s.x, s.y) for s in swap}], False), (swap, True)]
+        kernels = []
+        for cores, swapped in groups:
+            if not cores:
+                continue
+            crs = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in cores])
+            if not swapped and not swap:
+                crs, rrt, wrt = self.cores, reader_rt, writer_rt
+            else:
+                rrt, wrt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+                for c in cores:
+                    rrt[c.x][c.y] = list(reader_rt[c.x][c.y])
+                    wrt[c.x][c.y] = list(writer_rt[c.x][c.y])
+            kernels += [
+                ttnn.KernelDescriptor(
+                    kernel_source=str(KERNEL_DIR / f"stream_{name}_reader.cpp"),
+                    core_ranges=crs,
+                    compile_time_args=reader_ct,
+                    runtime_args=rrt,
+                    config=dm(
+                        processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_1 if swapped else ttnn.NOC.NOC_0
+                    ),
+                    defines=defines or [],
+                ),
+                ttnn.KernelDescriptor(
+                    kernel_source=str(KERNEL_DIR / f"stream_{name}_writer.cpp"),
+                    core_ranges=crs,
+                    compile_time_args=writer_ct,
+                    runtime_args=wrt,
+                    config=dm(
+                        processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.NOC_0 if swapped else ttnn.NOC.NOC_1
+                    ),
+                    defines=defines or [],
+                ),
+            ]
+        kernels += [
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / f"stream_{compute}_compute.cpp"),
                 core_ranges=self.cores,

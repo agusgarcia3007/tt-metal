@@ -536,6 +536,15 @@ void kernel_main() {
                         const uint32_t base = n * 32 + f * 16;
                         for (uint32_t i = 0; i < 8; ++i) {
                             const uint32_t v = w[i];
+                            if (thr >= 0) {
+                                // both values' keys <= thr (>= 0) unless one is positive with magnitude bits > thr:
+                                // per 16-bit half, ((h | 0x8000) - (thr + 1)) keeps bit 15 iff (h & 0x7FFF) > thr,
+                                // and ~h's bit 15 is the sign test (no borrow crosses the halves)
+                                const uint32_t k2 = static_cast<uint32_t>(thr + 1) * 0x00010001u;
+                                if ((((v | 0x80008000u) - k2) & ~v & 0x80008000u) == 0) {
+                                    continue;
+                                }
+                            }
                             int32_t lo = static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFF));
                             int32_t hi = static_cast<int32_t>(v) >> 16;
                             lo ^= (lo >> 31) & 0x7FFF;
@@ -559,6 +568,12 @@ void kernel_main() {
                             const uint32_t base = n * 32 + f * 16;
                             for (uint32_t i = 0; i < 8; ++i) {
                                 const uint32_t v = w[i];
+                                if (bk >= 0) {  // the word test of the LM_TOPK scan above, against the running best
+                                    const uint32_t k2 = static_cast<uint32_t>(bk + 1) * 0x00010001u;
+                                    if ((((v | 0x80008000u) - k2) & ~v & 0x80008000u) == 0) {
+                                        continue;
+                                    }
+                                }
                                 int32_t lo = static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFF));
                                 int32_t hi = static_cast<int32_t>(v) >> 16;
                                 lo ^= (lo >> 31) & 0x7FFF;

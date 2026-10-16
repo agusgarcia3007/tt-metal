@@ -319,6 +319,11 @@ class FusedVerify:
                 prefetch_cols=int(os.environ.get("DFLASH_LM_PREFETCH", LM_HEAD_STREAM_PREFETCH)),
                 rows=M,
                 out_page_bytes=8 * self.prescreen,  # the top-K lists: one page per (core, row)
+                # DFLASH_LM_EXCLUDE="x,y;...": logical cores its readers do not use (also switches the placement to
+                # nearest-first around each bank's worker)
+                exclude=[
+                    tuple(map(int, c.split(","))) for c in os.environ.get("DFLASH_LM_EXCLUDE", "").split(";") if c
+                ],
             )
             self.rescore = LMRescore(mesh, M, self.prescreen, len(self.lm_head.assignments), H, lm_n, round_robin=rr)
 

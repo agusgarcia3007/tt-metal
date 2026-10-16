@@ -51,6 +51,11 @@ D_EXCLUDE = [tuple(map(int, c.split(","))) for c in os.environ.get("DFLASH_MOE_D
 G_EXCLUDE = [
     tuple(map(int, c.split(","))) for c in os.environ.get("DFLASH_MOE_G_EXCLUDE", "6,1;6,6;6,4;6,9").split(";") if c
 ]
+# DFLASH_MOE_G_NOC1 / DFLASH_MOE_D_NOC1="x,y;...": gate|up / down cores whose readers use NOC1 (experiment)
+G_NOC1, D_NOC1 = (
+    {tuple(map(int, c.split(","))) for c in os.environ.get(k, "").split(";") if c}
+    for k in ("DFLASH_MOE_G_NOC1", "DFLASH_MOE_D_NOC1")
+)
 
 
 def _wait_n(b):
@@ -115,6 +120,7 @@ class MoEFused:
                 rot=EXPERT_BANK_ROT,
                 skip_pad=SKIP_PAD,
             )
+            gu.noc1_cores, dn.noc1_cores = G_NOC1, D_NOC1
             self.parts[None if coord is None else (coord[0], coord[1])] = (gu, dn)
         self.gate_up, self.down = next(iter(self.parts.values()))
         # every device's G / D cores (the router's union notification and the semaphores cover all of them)
