@@ -270,19 +270,50 @@ class ExpertDownUnion(_BankStreamOp):
         rot=0,
         skip_pad=False,
         placed=None,
+        bank_cols=None,
+        seg_inter=None,
     ):
         """num_buffers: weight blocks in the reader's ring (expert-outer; 2 when the blocks are large).
         expert_outer: kernels/stream_down_union2_*: each core reads its columns of one expert as one contiguous
         block and accumulates its (<= 4) output tiles across the experts in DST (larger DRAM reads). rot: the weights'
-        bank rotation (_BankStreamOp). skip_pad: drop the cores whose output columns are all past `hidden` (padding)."""
+        bank rotation (_BankStreamOp). skip_pad: drop the cores whose output columns are all past `hidden` (padding).
+        bank_cols (the balanced layout, fused_decode/stream.py down_bank_columns / stream_down_bal_layout; expert-outer
+        and `placed` only): (first output column, count) per DRAM bank, split over that bank's placed cores (<= 4
+        columns each, a per-core count: runtime args); seg_inter: the K tiles per segment before the bias tile (the
+        unpadded intermediate's, not inter_pad's)."""
+        self.balanced = bank_cols is not None
+        if self.balanced:
+            assert expert_outer and placed is not None
+            per_bank = {}
+            for c, b, _ in placed:
+                per_bank.setdefault(b, []).append(c)
+            placed, self.core_cols = [], {}
+            for b, (c0, n) in enumerate(bank_cols):
+                k = -(-n // 4)
+                cores = per_bank[b][:k]
+                assert len(cores) == k, f"bank {b}: {n} columns need {k} cores, {len(per_bank[b])} placed"
+                q, extra = divmod(n, k)
+                slot = 0
+                for r, c in enumerate(cores):
+                    m = q + (1 if r < extra else 0)
+                    placed.append((c, b, r))
+                    self.core_cols[(c.x, c.y)] = (slot, m, c0 + slot)
+                    slot += m
+            readers = None
         super().__init__(mesh_device, readers, exclude=exclude, coord=coord, rot=rot, placed=placed)
         self.rows = rows
         self.hidden = hidden
         self.inter_pad = inter_pad
-        self.seg_tiles = inter_pad // TILE + 1
-        self.C = columns_per_bank(hidden, self.banks)
-        assert self.C % readers == 0, f"{self.C} columns per bank do not split over {readers} readers"
-        self.cols = self.C // readers
+        if self.balanced:
+            self.seg_tiles = seg_inter + 1
+            self.C = max(n for _, n in bank_cols)
+            self.cols = 4
+            self.readers = max(r for _, _, r, _ in self.assignments) + 1
+        else:
+            self.seg_tiles = inter_pad // TILE + 1
+            self.C = columns_per_bank(hidden, self.banks)
+            assert self.C % readers == 0, f"{self.C} columns per bank do not split over {readers} readers"
+            self.cols = self.C // readers
         self.weight_dtype = weight_dtype
         self.tile_bytes = TILE_BYTES[weight_dtype]
         self.seg_bytes = self.seg_tiles * self.tile_bytes
@@ -339,22 +370,30 @@ class ExpertDownUnion(_BankStreamOp):
         ]
         if pred_p:  # MOE_PRED: the predicted experts' prefetched blocks (CB 6)
             cbs.append(self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * block))
-        reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        reader_rt, writer_rt, compute_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for core, bank, r, vc in self.assignments:
+            if self.balanced:  # (slot in the bank, columns, first output column) of this core
+                slot, ncols, col0 = self.core_cols[(core.x, core.y)]
+            else:
+                slot, ncols, col0 = r * self.cols, self.cols, self.logical_bank(bank) * self.C + r * self.cols
             reader_rt[core.x][core.y] = [
                 w_stream.buffer_address(),
                 union.buffer_address(),
                 bank,
                 vc,
-                r * self.cols * self.seg_bytes,
+                slot * self.seg_bytes,
             ] + list(extra_reader_rt or [])
             writer_rt[core.x][core.y] = [
                 act.buffer_address(),
                 weights.buffer_address(),
                 out.buffer_address(),
-                self.logical_bank(bank) * self.C + r * self.cols,
+                col0,
                 union.buffer_address(),
             ] + list(extra_writer_rt or [])
+            if self.balanced:  # the column count, last (kernels: D_NCOLS_ARG / D_NCOLS_WARG; compute: arg 0)
+                reader_rt[core.x][core.y] = list(reader_rt[core.x][core.y]) + [ncols]
+                writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [ncols]
+                compute_rt[core.x][core.y] = [ncols]
         if self.expert_outer:
             reader_ct = [cb_w, cb_idx, self.seg_tiles, self.cols, self.expert_stride, self.tile_bytes, self.page_bytes]
             reader_ct.append(self.num_buffers)
@@ -381,8 +420,17 @@ class ExpertDownUnion(_BankStreamOp):
                 writer_rt,
                 compute_ct,
                 name,
+                compute_rt=compute_rt if self.balanced else None,
                 defines=list(extra_defines or [])
                 + ([("ACT_SPREAD", "1")] if spread else [])
+                + (
+                    [
+                        ("D_NCOLS_ARG", str(5 + len(extra_reader_rt or []))),
+                        ("D_NCOLS_WARG", str(5 + len(extra_writer_rt or []))),
+                    ]
+                    if self.balanced
+                    else []
+                )
                 + ([("D_INFLIGHT", str(self.d_inflight))] if self.expert_outer and self.d_inflight != 1 else []),
             )
 

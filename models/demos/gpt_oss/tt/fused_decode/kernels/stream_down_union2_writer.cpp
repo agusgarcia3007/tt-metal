@@ -50,6 +50,14 @@ void kernel_main() {
     constexpr uint32_t notify_sem = get_compile_time_arg_val(notify_ct + 3);
 
     constexpr uint32_t tiny_bytes = 64 * rows;
+#ifdef D_NCOLS_WARG
+    const uint32_t ncols = get_arg_val<uint32_t>(D_NCOLS_WARG);  // balanced down layout: this core's columns
+#else
+    constexpr uint32_t ncols = cols;
+#endif
+    // the segment's activation tiles (the slot may hold more: inter_pad's all-padding tiles, which the balanced
+    // layout's segments leave out)
+    constexpr uint32_t act_tiles = seg_tiles - 1;
 
 #ifdef ACT_SPREAD
     // one page per [rows, 32] tile: slot s, tile t = page s * slot_tiles + t (union.py act_buffer spread)
@@ -174,11 +182,13 @@ void kernel_main() {
         }
 #endif
 #ifdef ACT_SPREAD
-        for (uint32_t t = 0; t < slot_tiles; ++t) {
+        static_assert(act_tiles <= slot_tiles, "segment longer than the activation slot");
+        for (uint32_t t = 0; t < act_tiles; ++t) {
             noc_async_read(s_act.get_noc_addr(order[e] * slot_tiles + t), slot + t * tiny_bytes, tiny_bytes);
         }
 #else
-        noc_async_read(s_act.get_noc_addr(order[e]), slot, act_page_bytes);
+        static_assert(act_tiles * tiny_bytes <= act_page_bytes, "segment longer than the activation slot");
+        noc_async_read(s_act.get_noc_addr(order[e]), slot, act_tiles * tiny_bytes);
 #endif
 #ifdef MOE_FUSED
         noc_async_read_barrier();
@@ -190,7 +200,7 @@ void kernel_main() {
     cb_push_back(cb_in0, num_sel * seg_tiles);
 #endif
 
-    for (uint32_t c = 0; c < cols; ++c) {
+    for (uint32_t c = 0; c < ncols; ++c) {
         cb_wait_front(cb_out, 1);
         const uint32_t n = col0 + c;
         if (n < n_tiles) {

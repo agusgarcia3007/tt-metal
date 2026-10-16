@@ -37,8 +37,16 @@ void kernel_main() {
     constexpr uint32_t seg_bytes = seg_tiles * tile_bytes;
     constexpr uint32_t block_tiles = cols * seg_tiles;
     constexpr uint32_t block_bytes = cols * seg_bytes;
-    constexpr uint32_t pages = block_bytes / page_bytes;
-    static_assert(pages * page_bytes == block_bytes && page_bytes <= NOC_MAX_BURST_SIZE, "packet size");
+    static_assert(seg_bytes % page_bytes == 0 && page_bytes <= NOC_MAX_BURST_SIZE, "packet size");
+#ifdef D_NCOLS_ARG
+    // balanced down layout (union.py bank_cols): this core's column count (<= cols); its blocks keep the ring's
+    // cols-column stride, only the first ncols segments are read
+    const uint32_t ncols = get_arg_val<uint32_t>(D_NCOLS_ARG);
+#else
+    constexpr uint32_t ncols = cols;
+#endif
+    const uint32_t read_bytes = ncols * seg_bytes;
+    const uint32_t pages = read_bytes / page_bytes;
 
     cb_reserve_back(cb_idx, 1);
     const uint32_t idx_l1 = get_write_ptr(cb_idx);
@@ -53,7 +61,7 @@ void kernel_main() {
     const uint32_t pre = get_write_ptr(MOE_PRED_CB);
     for (uint32_t k = 0; k < MOE_PRED; ++k) {
         const uint64_t src = get_noc_addr_from_bank_id<true>(bank_id, w_addr + pred[k] * expert_stride + reader_offset);
-        noc_async_read(src, pre + k * block_bytes, block_bytes);
+        noc_async_read(src, pre + k * block_bytes, read_bytes);
     }
 #endif
 #if defined(MOE_FUSED) && !defined(MOE_NO_ROUTER)

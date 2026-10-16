@@ -27,7 +27,9 @@ from models.tt_transformers.tt.load_checkpoints import reverse_permute, reverse_
 from ..fused_decode.boundary import PendingBoundary, flat_shape
 from ..fused_decode.stream import (
     LinearStream,
+    _columns_with_bias,
     as_stream_tensor,
+    stream_down_bal_layout,
     stream_down_layout,
     stream_gate_up_layout,
     stream_linear_layout,
@@ -78,7 +80,9 @@ class FusedDraft:
             out_mode=3,
             heads=(nq * hd // TILE, nkv * hd // TILE),
             rows=M,
-            prefetch_cols=2,
+            # DFLASH_DRAFT_QKV_PREFETCH: weight columns the readers may hold (the ring; >= the core's columns: all of
+            # them stream in during the boundary)
+            prefetch_cols=int(os.environ.get("DFLASH_DRAFT_QKV_PREFETCH", "2")),
         )
         # DFLASH_DRAFT_OPROJ_FUSE=1: o_proj (+ the attn-site boundary send) runs in the attention program (q / k prep +
         # KV write + block attention): its weights stream in while attention runs, block attention's roots signal it.
@@ -111,6 +115,22 @@ class FusedDraft:
             from .moe_fused import DenseMLPFused
 
             self.slices = int(os.environ.get("DFLASH_DRAFT_MLP_SLICES", "2"))
+            # DFLASH_DRAFT_DOWN_BAL=1: the down weights in the balanced layout (fused_decode/stream.py down_bal_plan:
+            # more down columns on the bank whose gate|up pairs are padding, no all-padding K tiles)
+            self.down_bal = None
+            if os.environ.get("DFLASH_DRAFT_DOWN_BAL", "0") == "1" and DRAFT_BANK_ROT:
+                from ..fused_decode.stream import down_bal_plan
+
+                g_readers = int(os.environ.get("DFLASH_DRAFT_G_READERS", "4"))
+                self.down_bal = down_bal_plan(
+                    H,
+                    I_pad // self.slices,
+                    I // self.slices,
+                    banks,
+                    DRAFT_BANK_ROT,
+                    gate_up_readers=g_readers,
+                    cores_per_bank=g_readers + int(os.environ.get("DFLASH_DRAFT_D_READERS", "4")),
+                )
             self.mlp_fused = DenseMLPFused(
                 mesh,
                 b,
@@ -125,6 +145,7 @@ class FusedDraft:
                 rot=DRAFT_BANK_ROT,
                 real_inter=I // self.slices if DRAFT_BANK_ROT else None,
                 real_hidden=bool(DRAFT_BANK_ROT),
+                down_bal_plan=self.down_bal,
             )
             self.gu, self.down = self.mlp_fused.gate_up, self.mlp_fused.down
         else:
@@ -585,6 +606,9 @@ class FusedDraft:
         sfx = (f"_s{S}" if S > 1 else "") + ("_mlp4" if self.mlp_dtype != dtype else "")
         rot = DRAFT_BANK_ROT if self.mlp_fused is not None else 0
         sfx += f"_rot{rot}" if rot else ""
+        bal = getattr(self, "down_bal", None)
+        if bal is not None:
+            sfx += f"_dbal{bal[1]}_" + "_".join(str(n) for _, n in bal[0])
         base = None if cache_dir is None else f"{cache_dir}/dflash_fused_draft_{dt}_b{banks}_i{I_pad}{sfx}"
         marker = None if base is None else Path(base + ".built")
         w = None
@@ -654,7 +678,13 @@ class FusedDraft:
                         ]
                     )
                     lay["gu"].append(stream_gate_up_layout(gu_s, torch.zeros(S, 2 * Is), banks, rot))
-                    lay["down"].append(stream_down_layout(dd.reshape(S, Is, H), torch.zeros(S, H), banks, rot))
+                    if bal is not None:
+                        n_t = -(-H // TILE)
+                        cols = _columns_with_bias(dd.reshape(S, Is, H), torch.zeros(S, H))
+                        cols = torch.cat([cols[:, :n_t, : bal[1]], cols[:, :n_t, -1:]], dim=2)
+                        lay["down"].append(stream_down_bal_layout(cols, bal[0]))
+                    else:
+                        lay["down"].append(stream_down_layout(dd.reshape(S, Is, H), torch.zeros(S, H), banks, rot))
 
             def put(name, rows, dt=dtype):
                 cache = None if base is None else f"{base}_l{i}_{name}"

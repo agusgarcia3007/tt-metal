@@ -82,8 +82,11 @@ class MoEFused:
         gate_up_readers=3,
         down_readers=3,
         real_inter=None,
+        down_bal_plan=None,
     ):
-        """router: the verify pass's router LinearStream (out_mode 4, one core)."""
+        """router: the verify pass's router LinearStream (out_mode 4, one core). down_bal_plan: (bank_cols, seg_inter)
+        of the balanced down layout (experts/weights.py DFLASH_DOWN_BAL; row placement only): down on each bank's row
+        cores left by gate|up, as many as its columns need (4 per core)."""
         self.mesh = mesh_device
         self.boundary, self.router = boundary, router
         assert len(router.assignments) == 1
@@ -128,6 +131,14 @@ class MoEFused:
                 rot=EXPERT_BANK_ROT,
                 placed=gp,
             )
+            bal = {}
+            if down_bal_plan is not None:
+                assert rows_mode, "the balanced down layout needs the row placement (DFLASH_MOE_ROWS=1)"
+                g_used = {(c.x, c.y) for c, *_ in gu.assignments}
+                dp = [
+                    (c, b, r) for b in sorted(rp) for r, c in enumerate([c for c in rp[b] if (c.x, c.y) not in g_used])
+                ]
+                bal = dict(bank_cols=down_bal_plan[0], seg_inter=down_bal_plan[1])
             dn = ExpertDownUnion(
                 mesh_device,
                 hidden,
@@ -138,8 +149,9 @@ class MoEFused:
                 exclude=taken + [(c.x, c.y) for c, *_ in gu.assignments] + D_EXCLUDE,
                 coord=coord,
                 rot=EXPERT_BANK_ROT,
-                skip_pad=SKIP_PAD,
+                skip_pad=SKIP_PAD and not bal,
                 placed=dp,
+                **bal,
             )
             gu.noc1_cores, dn.noc1_cores = G_NOC1, D_NOC1
             self.parts[None if coord is None else (coord[0], coord[1])] = (gu, dn)
@@ -320,9 +332,11 @@ class DenseMLPFused:
         rot=0,
         real_inter=None,
         real_hidden=False,
+        down_bal_plan=None,
     ):
         """rot: the weights' bank rotation; real_inter (per slice) / real_hidden: drop the gate|up / down cores whose
-        columns are all padding (fused_decode/union.py)."""
+        columns are all padding (fused_decode/union.py). down_bal_plan: (bank_cols, seg_inter) of the balanced down
+        layout (DFLASH_DRAFT_DOWN_BAL; row placement): down on each bank's row cores left by gate|up."""
         self.mesh, self.boundary, self.slices = mesh_device, boundary, slices
         if slices > 2:  # the slice counters clear of the boundary's semaphores 5 / 6 (RELAY / XCHG)
             self.CTR_SEM = 7
@@ -359,6 +373,12 @@ class DenseMLPFused:
             rot=rot,
             placed=gp,
         )
+        bal = {}
+        if down_bal_plan is not None:
+            assert dp is not None, "the balanced down layout needs the row placement (DFLASH_DRAFT_MLP_ROWS=1)"
+            g_used = {(c.x, c.y) for c, *_ in self.gate_up.assignments}
+            dp = [(c, b, r) for b in sorted(rp) for r, c in enumerate([c for c in rp[b] if (c.x, c.y) not in g_used])]
+            bal = dict(bank_cols=down_bal_plan[0], seg_inter=down_bal_plan[1])
         taken += [(c.x, c.y) for c, *_ in self.gate_up.assignments]
         self.down = ExpertDownUnion(
             mesh_device,
@@ -372,8 +392,9 @@ class DenseMLPFused:
             num_buffers=2,
             exclude=taken + d_ex,
             rot=rot,
-            skip_pad=real_hidden,
+            skip_pad=real_hidden and not bal,
             placed=dp,
+            **bal,
         )
         self.G, self.D = self.gate_up.cores, self.down.cores
         if os.environ.get("DFLASH_LOG_CORES") == "1":

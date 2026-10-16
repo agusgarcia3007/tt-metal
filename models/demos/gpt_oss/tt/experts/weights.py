@@ -380,3 +380,50 @@ def load_decode_expert_weights(
         down_stream=stream("down_stream", dn_layouts),
         intermediate_padded=inter_pad,
     )
+
+
+def load_decode_down_bal(
+    mesh_device, config: ExpertConfig, mesh_config: MeshConfig, dw, weight_dtype, tensor_cache_path
+):
+    """The down weights of DecodeExpertWeights dw again, in the balanced layout of the fused verify MoE
+    (fused_decode/stream.py down_bal_plan / stream_down_bal_layout: more down columns on the DRAM bank whose gate|up
+    pairs are padding, no all-padding K tiles), from its cache or rebuilt from dw.down_stream (exact: whole BFP4
+    tiles move). Returns (tensor, (bank_cols, seg_inter))."""
+    from ..fused_decode.stream import (
+        EXPERT_BANK_ROT,
+        NBIAS,
+        as_stream_tensor,
+        columns_per_bank,
+        down_bal_plan,
+        stream_down_bal_layout,
+    )
+
+    tp = mesh_config.decode.tp
+    inter_local = config.intermediate_size // tp
+    inter_pad = dw.intermediate_padded
+    E, H = config.num_experts, config.hidden_size
+    banks = mesh_device.dram_grid_size().x
+    tile = ttnn.TILE_SIZE
+    plan = down_bal_plan(H, inter_pad, inter_local, banks, EXPERT_BANK_ROT)
+    bank_cols, seg_inter = plan
+    C = max(n for _, n in bank_cols)
+    n_tiles = -(-H // tile)
+    suffix = f"decode_i{inter_pad}_b{banks}_nb{NBIAS}" + (f"_rot{EXPERT_BANK_ROT}" if EXPERT_BANK_ROT else "")
+    cache = get_cache_file_name(
+        tensor_cache_path, f"down_bal_{suffix}_s{seg_inter}_" + "_".join(str(n) for _, n in bank_cols)
+    )
+    layouts = None
+    if cache is None or not glob.glob(glob.escape(cache) + "*"):
+        Cs = columns_per_bank(H, banks)
+        seg = inter_pad // tile + 1
+        hosts = ttnn.to_torch(dw.down_stream, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=1))[0]
+        layouts = []
+        for h in hosts:  # [E, columns, K tiles (I_pad / 32 + bias), 32, 32] of this device, logical column order
+            cols = torch.zeros(E, Cs * banks, seg, tile, tile, dtype=h.dtype)
+            for b in range(banks):
+                L = (b + EXPERT_BANK_ROT) % banks
+                cols[:, L * Cs : (L + 1) * Cs] = h[:, b * tile : (b + 1) * tile].reshape(E, Cs, seg, tile, tile)
+            cols = torch.cat([cols[:, :n_tiles, :seg_inter], cols[:, :n_tiles, -1:]], dim=2)
+            layouts.append(stream_down_bal_layout(cols, bank_cols))
+    t = as_stream_tensor(mesh_device, layouts, E * C * (seg_inter + 1) * tile, weight_dtype, cache)
+    return t, plan

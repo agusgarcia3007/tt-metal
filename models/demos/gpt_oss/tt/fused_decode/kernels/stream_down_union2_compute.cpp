@@ -20,6 +20,11 @@ void kernel_main() {
     constexpr uint32_t seg_tiles = get_compile_time_arg_val(3);
     constexpr uint32_t cols = get_compile_time_arg_val(4);
     static_assert(cols <= 4, "the output tiles of a core stay in DST (4 FP32 tiles)");
+#ifdef D_NCOLS_ARG
+    const uint32_t ncols = get_arg_val<uint32_t>(0);  // balanced down layout: this core's columns (<= cols)
+#else
+    constexpr uint32_t ncols = cols;
+#endif
 
     constexpr bool transpose = false;
     constexpr bool split_acc = true;
@@ -44,7 +49,7 @@ void kernel_main() {
         const uint32_t a0 = e * seg_tiles;
 #endif
         cb_wait_front(wcb, cols * seg_tiles);
-        for (uint32_t c = 0; c < cols; ++c) {
+        for (uint32_t c = 0; c < ncols; ++c) {
             if (e + 1 == num_sel) {
                 custom_mm_block<true>(cb_in0, wcb, a0, c * seg_tiles, c, seg_tiles);
             } else {
@@ -78,7 +83,7 @@ void kernel_main() {
     }
     tile_regs_commit();
     tile_regs_wait();
-    for (uint32_t c = 0; c < cols; ++c) {
+    for (uint32_t c = 0; c < ncols; ++c) {
         cb_reserve_back(cb_out, 1);
         pack_tile(c, cb_out);
         cb_push_back(cb_out, 1);

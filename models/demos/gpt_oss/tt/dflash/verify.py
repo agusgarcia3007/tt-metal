@@ -274,6 +274,20 @@ class FusedVerify:
         if os.environ.get("DFLASH_MOE_FUSED", "1") == "1" and self.boundary.ccl == "fabric":
             from .moe_fused import MoEFused
 
+            # DFLASH_DOWN_BAL=1: the MoE's down weights in the balanced layout (experts/weights.py
+            # load_decode_down_bal; one more copy per layer, ~57 MB per device): the bank whose gate|up pairs are
+            # padding takes more down columns, the all-padding K tile is dropped (busiest bank 846 -> 810 tiles per
+            # expert; round 4.986 -> 4.954 ms at 256, 5.192 -> 5.153 at 4K, 5.621 -> 5.568 at 32K, same tokens)
+            self.down_bal, bal_plan = {}, None
+            if os.environ.get("DFLASH_DOWN_BAL", "1") == "1":
+                from ..experts.weights import load_decode_down_bal
+
+                for li, L in enumerate(self.layers):
+                    e = L.mlp.experts
+                    self.down_bal[li], bal_plan = load_decode_down_bal(
+                        mesh, e.config, e.mesh_config, e.decode_weights, e.weight_dtype, e.tensor_cache_path
+                    )
+
             self.moe_fused = MoEFused(
                 mesh,
                 self.boundary,
@@ -286,6 +300,7 @@ class FusedVerify:
                 gate_up_readers=GATE_UP_STREAM_READERS,
                 down_readers=int(os.environ.get("DFLASH_DOWN_READERS", "3")),
                 real_inter=cfg.intermediate_size // tp if os.environ.get("DFLASH_SKIP_PAD", "1") == "1" else None,
+                down_bal_plan=bal_plan,
             )
         term = model.decode_terminal
         self.vd = term.vd
@@ -627,7 +642,7 @@ class FusedVerify:
                     self.weights,
                     dw.gate_up_stream,
                     self.act,
-                    dw.down_stream,
+                    self.down_bal.get(i, dw.down_stream),
                     self.partial,
                     layer=i,
                     active_rows=self.active_rows,
@@ -638,6 +653,9 @@ class FusedVerify:
                 if getattr(self, "union_sets", None) is not None:  # debugging: the union's expert ids (eager)
                     u = ttnn.to_torch(ttnn.get_device_tensors(self.union)[0]).reshape(-1).tolist()
                     self.union_sets.append(u[1 : 1 + u[0]])
+                    if getattr(self, "union_counts", None) is not None:  # + rows routed to each union slot
+                        wt = ttnn.to_torch(ttnn.get_device_tensors(self.weights)[0]).float().reshape(-1, 32)
+                        self.union_counts.append((wt[:, : u[0]] != 0).sum(0).tolist())
                 last = i + 1 == len(self.layers)
                 gamma = self.gamma_final if last else self.gamma_in[i + 1]
                 pending = PendingBoundary(b, res, gamma, self.partial, "moe", sent=True)

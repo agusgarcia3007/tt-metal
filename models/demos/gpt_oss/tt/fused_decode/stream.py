@@ -118,6 +118,57 @@ def stream_down_layout(down, down_bias, banks, rot=0):
     return _bank_columns(cols, banks, rot)
 
 
+def down_bank_columns(n_tiles, seg_tiles, bank_load, caps):
+    """Balanced down layout (DFLASH_DOWN_BAL): output column tiles per DRAM bank so that every bank streams about the
+    same tiles per expert. bank_load[b]: the bank's gate|up tiles per expert (the MoE reads both streams at once);
+    caps[b]: at most this many down columns. One column at a time to the bank with the least tiles so far (gpt-oss-20b
+    at TP 4, rot 7: 3 gate|up pairs (546 tiles) on banks 1..7, 2 on bank 0 (364); 24-tile segments -> 10-11 columns on
+    banks 1..7, 16 on bank 0, max 810 tiles vs 846 with 12 columns of 25 tiles everywhere). Returns
+    [(first column, count)] per bank, contiguous in bank order."""
+    counts = [0] * len(bank_load)
+    for _ in range(n_tiles):
+        b = min(
+            (b for b in range(len(bank_load)) if counts[b] < caps[b]),
+            key=lambda b: (bank_load[b] + seg_tiles * (counts[b] + 1), b),
+        )
+        counts[b] += 1
+    out, c0 = [], 0
+    for n in counts:
+        out.append((c0, n))
+        c0 += n
+    return out
+
+
+def down_bal_plan(hidden, inter_pad, real_inter, banks, rot, gate_up_readers=3, cores_per_bank=6):
+    """The balanced down layout's (bank_cols, seg_inter) for the fused verify MoE (dflash/moe_fused.py: per bank
+    gate_up_readers gate|up cores (those whose pairs are all padding dropped) and the rest of cores_per_bank row cores
+    for down). Gate|up load per bank: its kept cores' pairs x 2 columns x (hidden / 32 + 1) tiles."""
+    P = inter_pad // TILE // banks
+    pairs = P // gate_up_readers
+    kt = hidden // TILE + 1
+    load, caps = [], []
+    for b in range(banks):
+        L = (b + rot) % banks
+        kept = sum(1 for r in range(gate_up_readers) if (L * P + r * pairs) * TILE < real_inter)
+        load.append(kept * pairs * 2 * kt)
+        caps.append(4 * (cores_per_bank - kept))
+    seg_inter = -(-real_inter // TILE)
+    return down_bank_columns(-(-hidden // TILE), seg_inter + 1, load, caps), seg_inter
+
+
+def stream_down_bal_layout(cols, bank_cols):
+    """[E, n_tiles, seg, 32, 32] down tile columns (bias tile last) -> [rows, banks * 32]: bank b holds its columns
+    bank_cols[b] = (first, count), zero padded to the largest count, ordered expert -> column -> K tile."""
+    E, _, seg = cols.shape[:3]
+    C = max(n for _, n in bank_cols)
+    shards = []
+    for c0, n in bank_cols:
+        sh = torch.zeros(E, C, seg, TILE, TILE, dtype=cols.dtype)
+        sh[:, :n] = cols[:, c0 : c0 + n]
+        shards.append(sh.reshape(-1, TILE))
+    return torch.cat(shards, dim=-1)
+
+
 def stream_linear_layout(w, bias, banks, order=None):
     """[K, N] weights and [N] bias -> [rows, banks * 32]: bank b holds output columns [b * C, (b + 1) * C)
     (C = ceil(N / 32 / banks), zero padded), ordered column -> K tile (K / 32 weight tiles + 1 bias tile). order:
@@ -295,7 +346,7 @@ class _BankStreamOp:
         exclude = {tuple(c) for c in exclude}
         used = {(c.x, c.y) for c in bank_workers} | exclude
         placed = [] if explicit is None else list(explicit)
-        if explicit is not None:
+        if explicit is not None and readers:  # (readers None: a per-bank core count, e.g. the balanced down)
             assert len(placed) == len(bank_workers) * readers
         for bank, core in enumerate(bank_workers if explicit is None else []):
             cores = [] if (core.x, core.y) in exclude else [core]
