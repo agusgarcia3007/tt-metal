@@ -29,8 +29,20 @@ inline BaSlice ba_slice(
     if (b.active == 0) {
         b.active = 1;
     }
-    b.c_lo = s < b.active ? c_first + s * b.n_chunks / b.active : 0;
-    b.c_hi = s < b.active ? c_first + (s + 1) * b.n_chunks / b.active : 0;
+#ifdef BA_REV
+    // BA_REV: slice s takes the s-th slice from the end: the root (slice 0) holds the latest chunks (those with the
+    // block's rows, written this round: the slowest to start), the others' partials are ready by the time it merges
+    const uint32_t q = b.active - 1 - s;
+#elif defined(BA_PERM)
+    // BA_PERM: slice 1 (a leaf, the root's round-0 child) takes the latest chunks, slices s >= 2 the chunk slice
+    // s - 1; with the root merging its rounds last-first (ba_reader.cpp / ba_writer.cpp), slice 1's partial is the
+    // root's last merge: the slowest slice is one send and one merge from the output
+    const uint32_t q = (s == 0 || b.active < 2) ? s : (s == 1 ? b.active - 1 : s - 1);
+#else
+    const uint32_t q = s;
+#endif
+    b.c_lo = s < b.active ? c_first + q * b.n_chunks / b.active : 0;
+    b.c_hi = s < b.active ? c_first + (q + 1) * b.n_chunks / b.active : 0;
     b.c_block = p_first / 32;
     b.recv_rounds = 0;
     b.send_round = -1;
@@ -51,6 +63,23 @@ inline BaSlice ba_slice(
         }
     }
     return b;
+}
+
+// The rounds in which slice s receives (ba_slice's recv_rounds) among `active` slices
+inline uint32_t ba_recv_rounds(uint32_t s, uint32_t active) {
+    uint32_t n = 0;
+    for (uint32_t r = 0; r < 8; ++r) {
+        const uint32_t bit = 1u << r;
+        if (s & bit) {
+            break;
+        }
+        if (s + bit < active) {
+            n = r + 1;
+        } else if (bit >= active) {
+            break;
+        }
+    }
+    return n;
 }
 
 // This core's index in the op's core list (common runtime args from word `base`: one byte per grid core, row-major

@@ -53,7 +53,7 @@ void kernel_main() {
     const BaSlice sl = ba_slice(hi, hi, s, S, min_chunks, lo / 32);
     constexpr bool has_sink = false;
     // bit 13 (no sink here): chunk 0 of this slice is the window's first chunk with a cut start (mask e = 1)
-    const bool win_first = s == 0 && (lo % 32) && lo / 32 != hi / 32;
+    const bool win_first = sl.c_lo == lo / 32 && (lo % 32) && lo / 32 != hi / 32;  // (the window's first slice)
 #elif defined(BA_SLIDE)
     auto lo_of = [&](uint32_t r) -> uint32_t {
         const uint32_t p = static_cast<uint32_t>(pos[r]);
@@ -66,7 +66,7 @@ void kernel_main() {
     constexpr bool win_first = false;
     // slice 0's chunks 0 .. n_low - 1 take the window-start masks (some row's window starts inside them)
     uint32_t n_low = lo_max > 0 ? lo_max / 32 - lo_min / 32 + 1 : 0;
-    n_low = s == 0 ? (n_low > 2 ? 2 : n_low) : 0;
+    n_low = sl.c_lo == lo_min / 32 ? (n_low > 2 ? 2 : n_low) : 0;
 #else
     const BaSlice sl = ba_slice(static_cast<uint32_t>(pos[0]), static_cast<uint32_t>(pos[M - 1]), s, S, min_chunks);
     constexpr bool has_sink = true;
@@ -115,7 +115,13 @@ void kernel_main() {
         const uint32_t parent = grp * S + (s & (s - 1));
         const uint32_t nw = get_common_arg_val<uint32_t>(2 + BA_NIDX + parent / 2) >> (16 * (parent % 2));
         const uint32_t px = (nw >> 8) & 0xFF, py = nw & 0xFF;
-        const uint32_t dst = get_write_ptr(cb_recv) + r * partial_tiles * fp32_tile;  // slot r (no push on this RISC)
+#ifdef BA_PERM
+        // the parent merges its rounds last-first: round r's partial goes to slot recv_rounds(parent) - 1 - r
+        const uint32_t slot = ba_recv_rounds(s & (s - 1), sl.active) - 1 - r;
+#else
+        const uint32_t slot = r;
+#endif
+        const uint32_t dst = get_write_ptr(cb_recv) + slot * partial_tiles * fp32_tile;  // (no push on this RISC)
         cb_wait_front(cb_send, partial_tiles);
         noc_async_write(get_read_ptr(cb_send), get_noc_addr(px, py, dst), partial_tiles * fp32_tile);
         noc_async_write_barrier();

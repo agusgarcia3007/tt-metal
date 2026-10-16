@@ -219,7 +219,7 @@ void kernel_main() {
     // the window starts: chunks lo_min / 32 + e (slice 0's chunks e), row group i keeps [lo_r - 32 c, 32)
     for (uint32_t e = 0; e < 2; ++e) {
         const uint32_t c = lo_min / 32 + e;
-        if (s != 0 || c >= sl.c_hi || c >= sl.c_block) {
+        if (sl.c_lo != lo_min / 32 || c >= sl.c_hi || c >= sl.c_block) {  // (the window's first slice)
             continue;
         }
         for (uint32_t t = 0; t < TC; ++t) {
@@ -236,7 +236,7 @@ void kernel_main() {
 #endif
 #ifdef BA_UNIFORM
     // the window's first chunk (slice 0's chunk 0) when it is not the last: keep [lo % 32, 32)
-    if (s == 0 && (lo % 32) && lo / 32 != hi / 32) {
+    if (sl.c_lo == lo / 32 && (lo % 32) && lo / 32 != hi / 32) {
         const uint32_t keep32[4] = {32, 32, 32, 32};
         for (uint32_t t = 0; t < TC; ++t) {
             mask(1 + NM * t + 1, keep32, lo % 32);
@@ -487,7 +487,12 @@ void kernel_main() {
 
     // the children's partials (their writers fill slot r of cb_recv and set bit r of the tree semaphore)
     volatile tt_l1_ptr uint32_t* tree_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(BA_TREE_SEM));
-    for (uint32_t r = 0; r < sl.recv_rounds; ++r) {
+    for (uint32_t i = 0; i < sl.recv_rounds; ++i) {
+#ifdef BA_PERM
+        const uint32_t r = sl.recv_rounds - 1 - i;  // last round first (slot i: ba_writer.cpp)
+#else
+        const uint32_t r = i;
+#endif
         cb_reserve_back(cb_recv, partial_tiles);
         while ((*tree_sem & (1u << r)) == 0) {
             invalidate_l1_cache();

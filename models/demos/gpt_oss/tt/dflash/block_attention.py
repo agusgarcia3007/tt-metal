@@ -238,6 +238,19 @@ class BlockAttention:
         defines += [("BA_NIDX", str(len(idx_words))), ("BA_CB_POS", str(cb_scr2))]
         if self.share:
             defines += [("BA_SHARE", "1"), ("BA_LAND_SEM", str(LAND_SEM)), ("BA_COPY_SEM", str(COPY_SEM))]
+        # DFLASH_BA_REV=1 (DFLASH_DRAFT_BA_REV=1: the drafter's only): the root slice holds the latest chunks
+        # (kernels/ba_common.hpp)
+        if os.environ.get("DFLASH_BA_REV", "0") == "1" or (
+            self.uniform and os.environ.get("DFLASH_DRAFT_BA_REV", "0") == "1"
+        ):
+            defines.append(("BA_REV", "1"))
+        # DFLASH_BA_PERM=1 (DFLASH_DRAFT_BA_PERM=1: the drafter's only): the latest chunks on slice 1, the root merging
+        # its rounds last-first (kernels/ba_common.hpp)
+        if os.environ.get("DFLASH_BA_PERM", "0") == "1" or (
+            self.uniform and os.environ.get("DFLASH_DRAFT_BA_PERM", "0") == "1"
+        ):
+            assert not any(k == "BA_REV" for k, _ in defines)
+            defines.append(("BA_PERM", "1"))
         if os.environ.get("DFLASH_BA_Q_AFTER"):  # (experiment) Q read after the first n groups (kernels/ba_reader.cpp)
             defines.append(("BA_Q_AFTER", os.environ["DFLASH_BA_Q_AFTER"]))
         if os.environ.get("DFLASH_BA_CAP0"):  # groups in flight before Q (kernels/ba_reader.cpp)
