@@ -80,9 +80,9 @@ class FusedDraft:
             out_mode=3,
             heads=(nq * hd // TILE, nkv * hd // TILE),
             rows=M,
-            # DFLASH_DRAFT_QKV_PREFETCH: weight columns the readers may hold (the ring; >= the core's columns: all of
-            # them stream in during the boundary)
-            prefetch_cols=int(os.environ.get("DFLASH_DRAFT_QKV_PREFETCH", "2")),
+            # DFLASH_DRAFT_QKV_PREFETCH: weight columns the readers may hold (the ring; >= the core's 5 columns: all of
+            # them stream in during the boundary): 5 vs 2: 4.941 / 4.961 / 4.945 vs 4.967 / 4.956 / 4.959 ms at 256
+            prefetch_cols=int(os.environ.get("DFLASH_DRAFT_QKV_PREFETCH", "5")),
         )
         # DFLASH_DRAFT_OPROJ_FUSE=1: o_proj (+ the attn-site boundary send) runs in the attention program (q / k prep +
         # KV write + block attention): its weights stream in while attention runs, block attention's roots signal it.
@@ -116,7 +116,8 @@ class FusedDraft:
 
             self.slices = int(os.environ.get("DFLASH_DRAFT_MLP_SLICES", "2"))
             # DFLASH_DRAFT_DOWN_BAL=1: the down weights in the balanced layout (fused_decode/stream.py down_bal_plan:
-            # more down columns on the bank whose gate|up pairs are padding, no all-padding K tiles)
+            # more down columns on the bank whose gate|up pairs are padding, no all-padding K tiles); no gain here
+            # (4.961 vs 4.961 ms at 256)
             self.down_bal = None
             if os.environ.get("DFLASH_DRAFT_DOWN_BAL", "0") == "1" and DRAFT_BANK_ROT:
                 from ..fused_decode.stream import down_bal_plan

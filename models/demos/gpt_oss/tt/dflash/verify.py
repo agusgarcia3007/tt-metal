@@ -387,6 +387,11 @@ class FusedVerify:
             mesh_mapper=rep,
         )
         self.union, self.weights = union_buffers(mesh, M)
+        # DFLASH_UNION_LOG=1 (debugging, traced rounds): every layer its own union / weights buffers, read by the host
+        # after each round (runner.union_log)
+        self.union_l = None
+        if os.environ.get("DFLASH_UNION_LOG", "0") == "1":
+            self.union_l = [union_buffers(mesh, M) for _ in self.layers]
         self.act = act_buffer(mesh, inter_pad, M)
         n_lists = self.prescreen or len(self.lm_head.assignments)
         if self.prescreen:  # the BFP4 stage's per-core top-K lists
@@ -635,11 +640,12 @@ class FusedVerify:
             mlp = layer.mlp
             dw = mlp.experts.decode_weights
             if self.moe_fused is not None:
+                uw = self.union_l[i] if self.union_l is not None else (self.union, self.weights)
                 self.moe_fused(
                     pending,
                     mlp.router.weight_stream,
-                    self.union,
-                    self.weights,
+                    uw[0],
+                    uw[1],
                     dw.gate_up_stream,
                     self.act,
                     self.down_bal.get(i, dw.down_stream),

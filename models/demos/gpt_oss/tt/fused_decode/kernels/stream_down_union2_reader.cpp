@@ -46,7 +46,17 @@ void kernel_main() {
     constexpr uint32_t ncols = cols;
 #endif
     const uint32_t read_bytes = ncols * seg_bytes;
+#ifdef D_STREAM_PKT
+    // D_STREAM_PKT (union.py, when the segment's tile count has no divisor near 16 KB, e.g. 31): packets of this many
+    // bytes over the block's contiguous range, then a tail packet
+    constexpr uint32_t pkt = D_STREAM_PKT;
+    const uint32_t pages = read_bytes / pkt;
+    const uint32_t tail = read_bytes - pages * pkt;
+#else
+    constexpr uint32_t pkt = page_bytes;
     const uint32_t pages = read_bytes / page_bytes;
+    constexpr uint32_t tail = 0;
+#endif
 
     cb_reserve_back(cb_idx, 1);
     const uint32_t idx_l1 = get_write_ptr(cb_idx);
@@ -92,7 +102,7 @@ void kernel_main() {
 
     const uint64_t w_base = get_noc_addr_from_bank_id<true>(bank_id, w_addr);
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, noc_index);
-    noc_async_read_one_packet_set_state<true>(w_base, page_bytes, vc);
+    noc_async_read_one_packet_set_state<true>(w_base, pkt, vc);
 
 #ifdef D_INFLIGHT
     constexpr uint32_t extra_in_flight = D_INFLIGHT;  // union.py DFLASH_D_INFLIGHT
@@ -111,8 +121,12 @@ void kernel_main() {
         const uint32_t src = static_cast<uint32_t>(uni[1 + order[e]]) * expert_stride + reader_offset;
         noc_async_read_set_trid(trid);
         for (uint32_t pg = 0; pg < pages; ++pg) {
-            noc_async_read_one_packet_with_state_with_trid(
-                w_base, src + pg * page_bytes, l1_write + pg * page_bytes, trid);
+            noc_async_read_one_packet_with_state_with_trid(w_base, src + pg * pkt, l1_write + pg * pkt, trid);
+        }
+        if (tail > 0) {
+            noc_async_read_one_packet_set_state<true>(w_base, tail, vc);
+            noc_async_read_one_packet_with_state_with_trid(w_base, src + pages * pkt, l1_write + pages * pkt, trid);
+            noc_async_read_one_packet_set_state<true>(w_base, pkt, vc);
         }
         l1_write += block_bytes;
         if (free_blocks == num_buffers - extra_in_flight) {

@@ -383,6 +383,14 @@ class FastDFlashRunner:
             t1 = time.perf_counter()
             block, post = self.verify.read_result()
             d = block[1:]
+            if getattr(self, "union_log", None) is not None and self.verify.union_l is not None:
+                # (debugging, DFLASH_UNION_LOG) per layer: (union expert ids, rows routed to each)
+                rec = []
+                for u_t, w_t in self.verify.union_l:
+                    u = ttnn.to_torch(ttnn.get_device_tensors(u_t)[0]).reshape(-1).tolist()
+                    wt = ttnn.to_torch(ttnn.get_device_tensors(w_t)[0]).float().reshape(-1, 32)
+                    rec.append((u[1 : 1 + u[0]], (wt[:, : u[0]] != 0).sum(0).tolist()))
+                self.union_log.append(rec)
             t2 = time.perf_counter()
             R = self.rows_low if low else R_hi
             k = 0

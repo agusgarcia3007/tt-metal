@@ -431,6 +431,9 @@ class ExpertDownUnion(_BankStreamOp):
                     if self.balanced
                     else []
                 )
+                # a segment whose tile count has no divisor near 16 KB (the drafter's 31: 1-tile packets): 16 KB
+                # packets over each block plus a tail (kernels/stream_down_union2_reader.cpp D_STREAM_PKT)
+                + ([("D_STREAM_PKT", str(MAX_PACKET_BYTES))] if self.balanced and self.page_bytes < 8192 else [])
                 + ([("D_INFLIGHT", str(self.d_inflight))] if self.expert_outer and self.d_inflight != 1 else []),
             )
 
