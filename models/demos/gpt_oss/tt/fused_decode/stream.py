@@ -191,8 +191,9 @@ def _page_bytes(tiles, tile_bytes):
 
 def row_placement(mesh_device, per_bank, exclude=(), coord=None):
     """per_bank logical reader cores per DRAM bank, on the row of the bank's optimal NOC0 worker: nearest that worker
-    first, a row shared by two banks split at the right bank's worker column, a bank short of cores on its row
-    topped up from the row above (then below). Measured with every reader streaming one bank's share (16 KB
+    first, a row shared by two banks split at the right bank's worker column (DFLASH_ROW_SPLIT=half: equal halves,
+    slower: 32K 5.626 -> 5.872 ms), a bank short of cores on its segment topped up from the rest of its row (32K
+    5.689 -> 5.626 ms), then the row above (then below). Measured with every reader streaming one bank's share (16 KB
     trid-pipelined reads, one device): 490 GB/s (95.7 % of 512) vs 464 for the placement that spreads a bank's
     readers over neighbouring rows: readers off the bank's row lose NOC arbitration to the row's own and finish
     their share late, and the bank finishes with its slowest reader. Returns {bank: [CoreCoord] * per_bank}."""
@@ -204,21 +205,30 @@ def row_placement(mesh_device, per_bank, exclude=(), coord=None):
     grid = mesh_device.compute_with_storage_grid_size()
     used = {tuple(c) for c in exclude}
     out = {}
+    split = os.environ.get("DFLASH_ROW_SPLIT", "opt")  # "opt": at the right bank's worker; "half": equal parts
+    cand = {}
     for b, w in enumerate(opt):
         mates = sorted(c.x for c in opt if c.y == w.y)
-        lo = w.x if w.x != mates[0] else 0
-        nxt = [x for x in mates if x > w.x]
-        hi = nxt[0] if nxt else grid.x
-        mine = []
-        for y, xs in ((w.y, range(lo, hi)), (w.y - 1, range(grid.x)), (w.y + 1, range(grid.x))):
+        k, n = mates.index(w.x), len(mates)
+        if split == "half":  # the same cores on every chip (the right banks' workers sit at x 5 .. 7 by chip)
+            lo, hi = -(-k * grid.x // n), -(-(k + 1) * grid.x // n)
+        else:
+            lo = w.x if k else 0
+            hi = mates[k + 1] if k + 1 < n else grid.x
+        # phases: own segment, what the row has left, the row above, the row below
+        cand[b] = [(w.y, range(lo, hi)), (w.y, range(grid.x)), (w.y - 1, range(grid.x)), (w.y + 1, range(grid.x))]
+        out[b] = []
+    for phase in range(4):  # every bank's segment before any bank takes leftovers
+        for b, w in enumerate(opt):
+            y, xs = cand[b][phase]
             if not 0 <= y < grid.y:
                 continue
             for x in sorted(xs, key=lambda x: (abs(x - w.x), x)):
-                if len(mine) < per_bank and (x, y) not in used:
+                if len(out[b]) < per_bank and (x, y) not in used:
                     used.add((x, y))
-                    mine.append(ttnn.CoreCoord(x, y))
-        assert len(mine) == per_bank, f"row placement: {len(mine)} cores for bank {b}"
-        out[b] = mine
+                    out[b].append(ttnn.CoreCoord(x, y))
+    for b in out:
+        assert len(out[b]) == per_bank, f"row placement: {len(out[b])} cores for bank {b}"
     return out
 
 
