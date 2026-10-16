@@ -293,6 +293,8 @@ class DenseMLPFused:
         """rot: the weights' bank rotation; real_inter (per slice) / real_hidden: drop the gate|up / down cores whose
         columns are all padding (fused_decode/union.py)."""
         self.mesh, self.boundary, self.slices = mesh_device, boundary, slices
+        if slices > 2:  # the slice counters clear of the boundary's semaphores 5 / 6 (RELAY / XCHG)
+            self.CTR_SEM = 7
         taken = [(boundary.core.x, boundary.core.y)]
         taken += [(h.x, h.y) for h in getattr(boundary, "helpers", [])] if getattr(boundary, "mc", False) else []
         # DFLASH_DRAFT_G_EXCLUDE / DFLASH_DRAFT_D_EXCLUDE="x,y;x,y": logical cores the readers do not use (default:

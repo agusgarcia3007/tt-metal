@@ -72,7 +72,7 @@ class FusedDraft:
             H // TILE,
             (nq + 2 * nkv) * hd,
             dtype,
-            readers=1,
+            readers=int(os.environ.get("DFLASH_DRAFT_QKV_READERS", "1")),
             out_mode=3,
             heads=(nq * hd // TILE, nkv * hd // TILE),
             rows=M,
