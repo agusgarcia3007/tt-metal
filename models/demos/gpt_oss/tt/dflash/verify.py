@@ -40,7 +40,14 @@ from ..fused_decode.config import (
     ROUTER_DECODE_WEIGHT_DTYPE,
     sdpa_decode_program_config,
 )
-from ..fused_decode.stream import LinearStream, QKVRopeCache, merge_argmax, read_lists, rope_rotation_tiles
+from ..fused_decode.stream import (
+    EXPERT_BANK_ROT,
+    LinearStream,
+    QKVRopeCache,
+    merge_argmax,
+    read_lists,
+    rope_rotation_tiles,
+)
 from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion, act_buffer, union_buffers
 
 TILE = ttnn.TILE_SIZE
@@ -120,7 +127,14 @@ class FusedVerify:
         ex = mlp0.experts
         inter_pad = ex.decode_weights.intermediate_padded
         self.gate_up = ExpertGateUpUnion(
-            mesh, H, inter_pad, ex.config.swiglu_limit, ex.config.alpha, readers=GATE_UP_STREAM_READERS, rows=M
+            mesh,
+            H,
+            inter_pad,
+            ex.config.swiglu_limit,
+            ex.config.alpha,
+            readers=GATE_UP_STREAM_READERS,
+            rows=M,
+            rot=EXPERT_BANK_ROT,
         )
         self.down = ExpertDownUnion(
             mesh,
@@ -129,6 +143,7 @@ class FusedVerify:
             readers=int(os.environ.get("DFLASH_DOWN_READERS", "3")),
             rows=M,
             expert_outer=os.environ.get("DFLASH_DOWN_EO", "1") == "1",
+            rot=EXPERT_BANK_ROT,
         )
         # DFLASH_ROW_ATTN_MAX=n (> 0): row attention (dflash/row_attention.py) for positions < n (32-chunk cores)
         self.row_attn = None
@@ -254,7 +269,7 @@ class FusedVerify:
                 M,
                 gate_up_readers=GATE_UP_STREAM_READERS,
                 down_readers=int(os.environ.get("DFLASH_DOWN_READERS", "3")),
-                real_inter=cfg.intermediate_size // tp if os.environ.get("DFLASH_SKIP_PAD", "0") == "1" else None,
+                real_inter=cfg.intermediate_size // tp if os.environ.get("DFLASH_SKIP_PAD", "1") == "1" else None,
             )
         term = model.decode_terminal
         self.vd = term.vd
@@ -262,7 +277,11 @@ class FusedVerify:
         if lm_readers > 1:
             from .lm_head import padded_lm_head
 
-            self.lm_weights, lm_n = padded_lm_head(mesh, term, lm_readers, os.environ.get("TT_CACHE_PATH"))
+            # DFLASH_RS_RR=1 (two-stage head): the BF8 stream (read by the rescore only) laid out round-robin
+            rr = int(os.environ.get("DFLASH_LM_PRESCREEN", "8")) > 0 and os.environ.get("DFLASH_RS_RR", "1") == "1"
+            self.lm_weights, lm_n = padded_lm_head(
+                mesh, term, lm_readers, os.environ.get("TT_CACHE_PATH"), round_robin=rr
+            )
         else:
             self.lm_weights, lm_n = term.weights, term.vd
         self.lm_n = lm_n
@@ -273,7 +292,7 @@ class FusedVerify:
             LM_HEAD_DECODE_WEIGHT_DTYPE,
             readers=lm_readers,
             out_mode=6,
-            prefetch_cols=LM_HEAD_STREAM_PREFETCH,
+            prefetch_cols=int(os.environ.get("DFLASH_LM_PREFETCH", LM_HEAD_STREAM_PREFETCH)),
             rows=M,
         )
         # DFLASH_LM_PRESCREEN=K (> 0): two-stage LM head (dflash/lm_rescore.py): the BFP4 head keeps each row's K
@@ -296,11 +315,11 @@ class FusedVerify:
                 ttnn.bfloat4_b,
                 readers=r4,
                 out_mode=6,
-                prefetch_cols=LM_HEAD_STREAM_PREFETCH,
+                prefetch_cols=int(os.environ.get("DFLASH_LM_PREFETCH", LM_HEAD_STREAM_PREFETCH)),
                 rows=M,
                 out_page_bytes=8 * self.prescreen,  # the top-K lists: one page per (core, row)
             )
-            self.rescore = LMRescore(mesh, M, self.prescreen, len(self.lm_head.assignments), H, lm_n)
+            self.rescore = LMRescore(mesh, M, self.prescreen, len(self.lm_head.assignments), H, lm_n, round_robin=rr)
 
         rep = ttnn.ReplicateTensorToMesh(mesh)
         dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG

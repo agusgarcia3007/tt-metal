@@ -127,8 +127,16 @@ void kernel_main() {
         // (x arrived with the table) the column tile (one read: reading only the needed 16-column half's faces, 3
         // small reads per K tile, measured slower)
         cb_reserve_back(cb_w, kx + 1);
+#ifdef RS_RR
+        // round-robin layout (dflash/lm_head.py): tile n on bank n % banks, slot n / banks
+        noc_async_read(
+            get_noc_addr_from_bank_id<true>(n % RS_RR, w_addr + (n / RS_RR) * col_bytes),
+            get_write_ptr(cb_w),
+            col_bytes);
+#else
         noc_async_read(
             get_noc_addr_from_bank_id<true>(n / C, w_addr + (n % C) * col_bytes), get_write_ptr(cb_w), col_bytes);
+#endif
         noc_async_read_barrier();
         cb_push_back(cb_x, kx + 1);
         cb_push_back(cb_w, kx + 1);

@@ -33,8 +33,12 @@ def _hf_lm_head():
         return f.get_tensor(name)
 
 
-def padded_lm_head(mesh_device, terminal, readers, cache_dir=None, dtype=LM_HEAD_DECODE_WEIGHT_DTYPE):
-    """-> (weights, n): the per-device [hidden, n] LM-head stream (n = vd padded to banks * readers columns)."""
+def padded_lm_head(
+    mesh_device, terminal, readers, cache_dir=None, dtype=LM_HEAD_DECODE_WEIGHT_DTYPE, round_robin=False
+):
+    """-> (weights, n): the per-device [hidden, n] LM-head stream (n = vd padded to banks * readers columns).
+    round_robin: column tile n on bank n % banks, slot n / banks (the rescore's random column reads spread over the
+    banks; contiguous ranges put neighbouring vocabulary tiles on one bank)."""
     banks = mesh_device.dram_grid_size().x
     vd, hidden, tp, vocab = terminal.vd, terminal.hidden, terminal.tp, terminal.vocab_size
     step = banks * readers
@@ -42,7 +46,13 @@ def padded_lm_head(mesh_device, terminal, readers, cache_dir=None, dtype=LM_HEAD
     n = n_tiles * TILE
     rows = linear_stream_rows(mesh_device, hidden, n)
     dt = {ttnn.bfloat8_b: "bfp8", ttnn.bfloat4_b: "bfp4"}[dtype]
-    cache = None if cache_dir is None else f"{cache_dir}/dflash_lm_head_{dt}_vd{vd}_n{n}_b{banks}"
+    cache = (
+        None
+        if cache_dir is None
+        else f"{cache_dir}/dflash_lm_head_{dt}_vd{vd}_n{n}_b{banks}" + ("_rr" if round_robin else "")
+    )
+    C = n_tiles // banks
+    order = [i * banks + b for b in range(banks) for i in range(C)] if round_robin else None
     layouts = None
     marker = None if cache is None else Path(cache + ".built")  # as_tensor's cache file name carries extra suffixes
     if marker is None or not marker.exists():
@@ -54,7 +64,7 @@ def padded_lm_head(mesh_device, terminal, readers, cache_dir=None, dtype=LM_HEAD
             wd[:, : hi - lo] = w[:, lo:hi]
             bias = torch.zeros(n)
             bias[hi - lo :] = MASK
-            layouts.append(stream_linear_layout(wd, bias, banks))
+            layouts.append(stream_linear_layout(wd, bias, banks, order))
         assert layouts[0].shape[0] == rows
     t = as_stream_tensor(mesh_device, layouts, rows, dtype, cache)
     if marker is not None:

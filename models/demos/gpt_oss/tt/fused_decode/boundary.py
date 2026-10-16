@@ -240,6 +240,23 @@ class DecodeBoundary:
                 (h.x, h.y) for h in self.helpers
             ], "helpers in row-major order (shard order)"
             self.mc_config = self._helper_config(self.PH)
+            # DFLASH_BND_CONST=1: the helpers' constant tiles (reduce scaler, row-sum matrix P) as a two-page DRAM
+            # tensor the reader fetches at launch, instead of every launch's reader writing them (~9 us on the
+            # boundary's critical path); DRAM, not L1: persistent L1 lowers every program's CB region
+            self.const_tiles = None
+            if os.environ.get("DFLASH_BND_CONST", "1") == "1":
+                scaler = torch.zeros(TILE, TILE)
+                scaler[0], scaler[16] = 1.0, 1.0  # 1.0 in the first row of each face
+                idx = torch.arange(TILE)
+                pm = (idx[:, None] % rows == idx[None, :] % rows).float()  # P[R][C] = 1 iff R = C (mod rows)
+                self.const_tiles = ttnn.from_torch(
+                    torch.cat([scaler, pm])[None, None],
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=mesh_device,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+                )
             self.direct_notify = os.environ.get("DFLASH_BND_DIRECT", "1") == "1"  # helpers notify consumers directly
             # x mirror (DFLASH_X_MIRROR): the normed output at the same L1 address on every worker core (the helpers
             # multicast their pages into it), so consumers read x from their own L1 instead of the boundary core
@@ -475,6 +492,8 @@ class DecodeBoundary:
         reader_ct += [self.rows, cb_p, cb_xchg, Hn, self.XCHG_SEM]
         reader_ct += ttnn.TensorAccessorArgs(gamma).get_compile_time_args()
         reader_ct += ttnn.TensorAccessorArgs(residual).get_compile_time_args()
+        if self.const_tiles is not None:
+            reader_ct += ttnn.TensorAccessorArgs(self.const_tiles).get_compile_time_args()
         compute_ct = [cb_res, cb_recv, cb_gamma, cb_scaler, cb_res_out, cb_sq, cb_rs, cb_x, PH, slots]
         compute_ct += [_f32_bits(1.0 / self.hidden), _f32_bits(self.eps), cb_y, cb_p, cb_rsum, cb_v, cb_xchg, Hn]
         writer_ct = [cb_v, cb_xchg, cb_x, PH, Hn, self.XCHG_SEM, self.RELAY_SEM, 1 if self.x_mirror is not None else 0]
@@ -484,6 +503,8 @@ class DecodeBoundary:
         for h, c in enumerate(self.helpers):
             page0 = h * PH
             reader_rt[c.x][c.y] = [gamma.buffer_address(), sem_addr, residual.buffer_address(), page0]
+            if self.const_tiles is not None:
+                reader_rt[c.x][c.y] = list(reader_rt[c.x][c.y]) + [self.const_tiles.buffer_address()]
             writer_rt[c.x][c.y] = [out_x.buffer_address(), self.noc_xy[0], self.noc_xy[1], page0]
             writer_rt[c.x][c.y] = list(writer_rt[c.x][c.y]) + [max(0, min(PH, A - page0)), h] + hnoc
             if self.x_mirror is not None:
@@ -498,6 +519,7 @@ class DecodeBoundary:
                     compile_time_args=reader_ct,
                     runtime_args=reader_rt,
                     config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_1),
+                    defines=[("BND_CONST", "1")] if self.const_tiles is not None else [],
                 ),
                 ttnn.KernelDescriptor(
                     kernel_source=str(KERNEL_DIR / "bnd_mc_compute.cpp"),
@@ -517,7 +539,11 @@ class DecodeBoundary:
                 ),
             ]
 
-        io = [residual, out_res, out_x, gamma] + ([partial, recv] if slots else [])
+        io = (
+            [residual, out_res, out_x, gamma]
+            + ([partial, recv] if slots else [])
+            + ([self.const_tiles] if self.const_tiles is not None else [])
+        )
         return kernels, cbs, io, out_res, out_x, bool(slots) and not sent, None, cb_x
 
     def mc_semaphores(self):

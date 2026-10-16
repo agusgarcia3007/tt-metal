@@ -114,11 +114,13 @@ class ExpertGateUpUnion(_BankStreamOp):
         exclude=(),
         real_inter=None,
         coord=None,
+        rot=0,
     ):
         """dense_silu: plain silu(g) * u (a dense MLP run as one union expert, e.g. the DFlash drafter).
         real_inter: the unpadded intermediate size; cores whose column pairs are all padding are dropped (their act
-        tiles stay zero, as do the matching down weights). coord: per-device placement (_BankStreamOp)."""
-        super().__init__(mesh_device, readers, exclude=exclude, coord=coord)
+        tiles stay zero, as do the matching down weights). coord: per-device placement, rot: the weights' bank
+        rotation (_BankStreamOp)."""
+        super().__init__(mesh_device, readers, exclude=exclude, coord=coord, rot=rot)
         self.dense_silu = dense_silu
         self.max_experts = max_experts
         self.rows = rows
@@ -138,12 +140,7 @@ class ExpertGateUpUnion(_BankStreamOp):
         self.g_bufs = int(os.environ.get("DFLASH_G_BUFS", "3"))
         self.g_inflight = int(os.environ.get("DFLASH_G_INFLIGHT", "1"))
         if real_inter is not None:
-            keep = [a for a in self.assignments if (a[1] * self.P + a[2] * self.pairs) * TILE < real_inter]
-            if len(keep) < len(self.assignments):
-                self.assignments = keep
-                self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(keep[0][0], keep[0][0])])
-                for c, *_ in keep[1:]:
-                    self.cores = self.cores.merge(ttnn.CoreRangeSet([ttnn.CoreRange(c, c)]))
+            self._keep(lambda bank, r: (self.logical_bank(bank) * self.P + r * self.pairs) * TILE < real_inter)
 
     def weight_rows(self, num_experts):
         return num_experts * 2 * self.P * self.kt * TILE
@@ -195,7 +192,7 @@ class ExpertGateUpUnion(_BankStreamOp):
             writer_rt[core.x][core.y] = [
                 x_local_addr if x_local_addr is not None else x.buffer_address(),
                 act.buffer_address(),
-                bank * self.P + r * self.pairs,
+                self.logical_bank(bank) * self.P + r * self.pairs,
                 weights.buffer_address(),
                 union.buffer_address(),
                 ident.buffer_address(),
@@ -267,11 +264,14 @@ class ExpertDownUnion(_BankStreamOp):
         num_buffers=3,
         exclude=(),
         coord=None,
+        rot=0,
+        skip_pad=False,
     ):
         """num_buffers: weight blocks in the reader's ring (expert-outer; 2 when the blocks are large).
         expert_outer: kernels/stream_down_union2_*: each core reads its columns of one expert as one contiguous
-        block and accumulates its (<= 4) output tiles across the experts in DST (larger DRAM reads)."""
-        super().__init__(mesh_device, readers, exclude=exclude, coord=coord)
+        block and accumulates its (<= 4) output tiles across the experts in DST (larger DRAM reads). rot: the weights'
+        bank rotation (_BankStreamOp). skip_pad: drop the cores whose output columns are all past `hidden` (padding)."""
+        super().__init__(mesh_device, readers, exclude=exclude, coord=coord, rot=rot)
         self.rows = rows
         self.hidden = hidden
         self.inter_pad = inter_pad
@@ -293,6 +293,8 @@ class ExpertDownUnion(_BankStreamOp):
         self.num_buffers = int(os.environ.get("DFLASH_D_BUFS", num_buffers)) if expert_outer else num_buffers
         self.d_inflight = int(os.environ.get("DFLASH_D_INFLIGHT", "1"))
         assert not expert_outer or self.cols <= 4, "expert-outer down keeps a core's output tiles in DST"
+        if skip_pad:
+            self._keep(lambda bank, r: (self.logical_bank(bank) * self.C + r * self.cols) * TILE < hidden)
 
     def weight_rows(self, num_experts):
         return num_experts * self.C * self.seg_tiles * TILE
@@ -346,7 +348,7 @@ class ExpertDownUnion(_BankStreamOp):
                 act.buffer_address(),
                 weights.buffer_address(),
                 out.buffer_address(),
-                bank * self.C + r * self.cols,
+                self.logical_bank(bank) * self.C + r * self.cols,
                 union.buffer_address(),
             ] + list(extra_writer_rt or [])
         if self.expert_outer:

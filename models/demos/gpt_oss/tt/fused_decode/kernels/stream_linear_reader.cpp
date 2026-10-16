@@ -67,15 +67,11 @@ void kernel_main() {
             l1_write = cb_base;
         }
     }
-    for (uint32_t i = 0; i < extra_in_flight && i < cols; ++i) {
-        noc_async_read_barrier_with_trid(trid_to_wait);
-        cb_push_back(cb_w, kt);
-        trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
-    }
 #ifdef KV_SPLIT
     // Multi-row QKV with the K / V cache write (stream_linear_writer.cpp): this core's first output column is a K / V
     // column; convert rows [rows / 2, rows) of it to BFP8 (shared exponent + 4 mantissa words per 16-value half, 32 B
-    // apart in KV_SPLIT_CB_STAGE) while the writer converts the others; the writer pops the tile.
+    // apart in KV_SPLIT_CB_STAGE) while the writer converts the others; the writer pops the tile. Before the last
+    // columns' read barrier: the conversion overlaps their reads.
     {
         constexpr uint32_t rows = ROWS;
         constexpr uint32_t half_row = 32;  // one row of a [rows, 16] face
@@ -102,6 +98,11 @@ void kernel_main() {
         noc_async_atomic_barrier();
     }
 #endif
+    for (uint32_t i = 0; i < extra_in_flight && i < cols; ++i) {
+        noc_async_read_barrier_with_trid(trid_to_wait);
+        cb_push_back(cb_w, kt);
+        trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
+    }
 #ifdef MOE_SPLIT_ROWS
     // Router of the fused MoE (dflash/moe_fused.py): the second half of the rows' top-k (stream_linear_writer.cpp
     // runs the first half and the union), from the logits tile in cb_out (the writer pops it after the union).

@@ -42,6 +42,10 @@ BFP8_TILE_BYTES = 1088
 TILE_BYTES = {ttnn.bfloat4_b: BFP4_TILE_BYTES, ttnn.bfloat8_b: BFP8_TILE_BYTES, ttnn.bfloat16: 2048}
 TINY_BYTES = 2 * TILE  # one 1x32 BF16 tile
 MAX_PACKET_BYTES = 16384  # Blackhole NOC max burst
+# GPT_OSS_EXPERT_BANK_ROT=r: the decode expert weight streams (experts/weights.py) put logical bank (b + r) % banks on
+# DRAM bank b, and the streaming ops read them so. r = 7 puts the last logical bank (the intermediate / hidden padding)
+# on DRAM bank 0, which the MoE readers find slowest; the ops skip the all-padding columns there.
+EXPERT_BANK_ROT = int(os.environ.get("GPT_OSS_EXPERT_BANK_ROT", "7"))
 
 
 def _f32_bits(v):
@@ -78,37 +82,40 @@ def _columns_with_bias(w, bias):
     return torch.cat([cols, b.unsqueeze(2)], dim=2)
 
 
-def _bank_columns(cols, banks):
-    """[E, C * banks, k, 32, 32] -> [rows, banks * 32]: bank b's shard = its C columns as one column of tiles."""
+def _bank_columns(cols, banks, rot=0):
+    """[E, C * banks, k, 32, 32] -> [rows, banks * 32]: bank b's shard = the C columns of logical bank (b + rot) % banks
+    as one column of tiles."""
     C = cols.shape[1] // banks
-    return torch.cat([cols[:, b * C : (b + 1) * C].reshape(-1, TILE) for b in range(banks)], dim=-1)
+    return torch.cat(
+        [cols[:, L * C : (L + 1) * C].reshape(-1, TILE) for L in ((b + rot) % banks for b in range(banks))], dim=-1
+    )
 
 
 def columns_per_bank(n, banks):
     return -(-n // TILE // banks)
 
 
-def stream_gate_up_layout(gate_up, gate_up_bias, banks):
+def stream_gate_up_layout(gate_up, gate_up_bias, banks, rot=0):
     """One TP shard of [E, hidden, 2 * I_pad] packed [gate | up] weights and [E, 2 * I_pad] biases -> [rows, banks * 32]:
     bank b's shard is a column of tiles ordered expert -> (gate j, up j) for the P pairs j in [b * P, (b + 1) * P)
-    -> K tile (hidden / 32 weight tiles + 1 bias tile)."""
+    -> K tile (hidden / 32 weight tiles + 1 bias tile). rot: the bank rotation (EXPERT_BANK_ROT)."""
     E, H, W = gate_up.shape
     half = W // TILE // 2
     P = half // banks
     assert P * banks == half, f"{half} column pairs do not split over {banks} banks"
     cols = _columns_with_bias(gate_up, gate_up_bias)
     order = [c for bank in range(banks) for j in range(bank * P, (bank + 1) * P) for c in (j, half + j)]
-    return _bank_columns(cols[:, order], banks)
+    return _bank_columns(cols[:, order], banks, rot)
 
 
-def stream_down_layout(down, down_bias, banks):
+def stream_down_layout(down, down_bias, banks, rot=0):
     """One TP shard of [E, I_pad, hidden] down weights and [E, hidden] biases -> [rows, banks * 32]: bank b holds output
     columns [b * C, (b + 1) * C) (C = ceil(hidden / 32 / banks), zero padded), ordered expert -> column -> K tile
     (I_pad / 32 weight tiles + 1 bias tile)."""
     E, K, N = down.shape
     pad = columns_per_bank(N, banks) * banks * TILE - N
     cols = _columns_with_bias(torch.nn.functional.pad(down, (0, pad)), torch.nn.functional.pad(down_bias, (0, pad)))
-    return _bank_columns(cols, banks)
+    return _bank_columns(cols, banks, rot)
 
 
 def stream_linear_layout(w, bias, banks, order=None):
@@ -189,12 +196,14 @@ class _BankStreamOp:
     coalesced into rectangles: dispatch writes kernel binaries and arguments per core range, and single-core ranges
     made multi-reader programs measurably slower to launch under trace."""
 
-    def __init__(self, mesh_device, readers, active_banks=None, exclude=(), coord=None):
+    def __init__(self, mesh_device, readers, active_banks=None, exclude=(), coord=None, rot=0):
         """exclude: logical (x, y) cores to leave free (a fused program's other kernels); a bank's readers then also
         spill onto the neighbouring rows when its own row is full. coord: place for that device's own optimal bank
-        workers (harvesting differs per chip) instead of the first device's."""
+        workers (harvesting differs per chip) instead of the first device's. rot: DRAM bank b holds the weights'
+        logical bank (b + rot) % banks (EXPERT_BANK_ROT)."""
         self.mesh_device = mesh_device
         self.banks = mesh_device.dram_grid_size().x
+        self.rot = rot
         self.readers = readers
         if coord is not None:
             a = mesh_device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0, coord)
@@ -226,6 +235,10 @@ class _BankStreamOp:
                     used.add((x, y))
             assert len(cores) == readers, f"no room for {readers} readers next to bank {bank} worker {core}"
             placed += [(c, bank, r) for r, c in enumerate(cores)]
+        swap = os.environ.get("DFLASH_BANK_SWAP", "") if exclude else ""  # experiment: "a,b" swaps two banks' cores
+        if swap:
+            a, b = map(int, swap.split(","))
+            placed = [(c, {a: b, b: a}.get(bk, bk), r) for c, bk, r in placed]
         vcs = []
         for i, (core, bank, r) in enumerate(placed):
             vc = (bank + r) & 0x3
@@ -237,6 +250,18 @@ class _BankStreamOp:
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(self.assignments[0][0], self.assignments[0][0])])
         for c, *_ in self.assignments[1:]:
             self.cores = self.cores.merge(ttnn.CoreRangeSet([ttnn.CoreRange(c, c)]))
+
+    def logical_bank(self, bank):
+        return (bank + self.rot) % self.banks
+
+    def _keep(self, pred):
+        """Drop the assignments (core, bank, r, vc) for which pred(bank, r) is false (all-padding columns)."""
+        keep = [a for a in self.assignments if pred(a[1], a[2])]
+        if len(keep) < len(self.assignments):
+            self.assignments = keep
+            self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(keep[0][0], keep[0][0])])
+            for c, *_ in keep[1:]:
+                self.cores = self.cores.merge(ttnn.CoreRangeSet([ttnn.CoreRange(c, c)]))
 
     def _cb(self, index, dtype, page, pages, tiny=False, rows=1):
         """tiny: [rows, 32] tiles (page = 64 rows bytes for BF16)."""
@@ -298,7 +323,7 @@ class ExpertGateUpStream(_BankStreamOp):
     I_pad] BF16 row-major L1, receives w_e * SwiGLU(gate_e, up_e) per routed expert e."""
 
     def __init__(self, mesh_device, hidden, inter_pad, num_sel, swiglu_limit, alpha, readers):
-        super().__init__(mesh_device, readers)
+        super().__init__(mesh_device, readers, rot=EXPERT_BANK_ROT)
         self.kx = hidden // TILE
         self.kt = self.kx + 1
         self.num_sel = num_sel
@@ -335,7 +360,7 @@ class ExpertGateUpStream(_BankStreamOp):
             writer_rt[core.x][core.y] = [
                 x.buffer_address(),
                 act.buffer_address(),
-                bank * self.P + r * self.pairs,
+                self.logical_bank(bank) * self.P + r * self.pairs,
                 scores.buffer_address(),
             ]
         reader_ct = [cb_w, cb_idx, self.kt, 2 * self.pairs, self.num_sel, self.expert_stride, BFP4_TILE_BYTES]
@@ -366,7 +391,7 @@ class ExpertDownStream(_BankStreamOp):
     the routed experts)."""
 
     def __init__(self, mesh_device, hidden, inter_pad, num_sel, readers):
-        super().__init__(mesh_device, readers)
+        super().__init__(mesh_device, readers, rot=EXPERT_BANK_ROT)
         self.hidden = hidden
         self.num_sel = num_sel
         self.inter_pad = inter_pad
@@ -406,7 +431,7 @@ class ExpertDownStream(_BankStreamOp):
                 act.buffer_address(),
                 scores.buffer_address(),
                 out.buffer_address(),
-                bank * self.C + r * self.cols,
+                self.logical_bank(bank) * self.C + r * self.cols,
             ]
         reader_ct = [cb_w, cb_idx, self.seg_tiles, self.cols, self.num_sel, self.expert_stride, BFP4_TILE_BYTES]
         reader_ct += ttnn.TensorAccessorArgs(ids).get_compile_time_args()
@@ -660,7 +685,8 @@ class LinearStream(_BankStreamOp):
                 ("QKV_NOTIFY_SEM", str(fuse[4])),
                 ("QKV_NOTIFY_ARG", str(notify_arg)),
             ]
-        if os.environ.get("LIN_T") and rope_kv is not None:  # (profiling: the QKV writer's per-column timeline)
+        lin_t = os.environ.get("LIN_T")  # (profiling: the QKV writer's per-column timeline; "lm": the LM head's)
+        if lin_t and (rope_kv is not None if lin_t != "lm" else self.out_mode == 6):
             defines = (defines or []) + [("LIN_T", "1")]
         # DFLASH_KV_SPLIT=1 (multi-row QKV with the K / V cache write): the reader converts half the rows of the first
         # (K / V) output column to BFP8 while the writer converts the others (kernels/stream_linear_reader.cpp)

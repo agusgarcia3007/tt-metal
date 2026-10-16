@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
+#include "bnd_tiles.hpp"
 
 void kernel_main() {
     const uint32_t gamma_addr = get_arg_val<uint32_t>(0);
@@ -90,27 +91,12 @@ void kernel_main() {
     if constexpr (do_norm) {
         // Reduce scaler: 1.0 in the first row of each face of a BF16 tile (scalar sum of all 1024 values).
         cb_reserve_back(cb_scaler, 1);
-        volatile tt_l1_ptr uint32_t* s = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_scaler));
-        for (uint32_t i = 0; i < page / 4; ++i) {
-            s[i] = 0;
-        }
-        for (uint32_t f = 0; f < 4; ++f) {
-            for (uint32_t i = 0; i < 8; ++i) {
-                s[f * 128 + i] = 0x3F803F80;
-            }
-        }
+        bnd_tiles::scaler(get_write_ptr(cb_scaler));
         cb_push_back(cb_scaler, 1);
         if constexpr (rows > 1) {
             // P[R][R'] = 1 iff R = R' (mod rows), BF16 32x32 tile (faces of 16x16, row-major).
             cb_reserve_back(cb_p, 1);
-            volatile tt_l1_ptr uint32_t* pm = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_p));
-            for (uint32_t R = 0; R < 32; ++R) {
-                for (uint32_t C = 0; C < 32; C += 2) {  // two BF16 values per word (C even, C + 1 odd)
-                    const uint32_t lo = (R % rows == C % rows) ? 0x3F80u : 0u;
-                    const uint32_t hi = (R % rows == (C + 1) % rows) ? 0x3F80u : 0u;
-                    pm[(((R / 16) * 2 + C / 16) * 256 + (R % 16) * 16 + C % 16) / 2] = lo | (hi << 16);
-                }
-            }
+            bnd_tiles::row_sum_matrix<rows>(get_write_ptr(cb_p));
             cb_push_back(cb_p, 1);
         }
     }

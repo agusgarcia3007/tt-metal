@@ -18,9 +18,11 @@ from ..fused_decode.stream import BFP8_TILE_BYTES, NBIAS, TILE, columns_per_bank
 
 
 class LMRescore:
-    def __init__(self, mesh_device, rows, K, n1, hidden, n_cols, cores_start=(0, 0)):
-        """n1: stage-1 cores (lists); n_cols: the BF8 stream's (padded) columns per device."""
+    def __init__(self, mesh_device, rows, K, n1, hidden, n_cols, cores_start=(0, 0), round_robin=False):
+        """n1: stage-1 cores (lists); n_cols: the BF8 stream's (padded) columns per device; round_robin: its layout
+        (dflash/lm_head.py padded_lm_head)."""
         self.mesh, self.M, self.K, self.n1 = mesh_device, rows, K, n1
+        self.round_robin = round_robin
         self.kx = hidden // TILE
         self.kt = self.kx + 1
         self.C = columns_per_bank(n_cols, mesh_device.dram_grid_size().x)
@@ -150,6 +152,7 @@ class LMRescore:
                 compile_time_args=reader_ct,
                 runtime_args=reader_rt,
                 config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_0),
+                defines=[("RS_RR", str(self.mesh.dram_grid_size().x))] if self.round_robin else [],
             ),
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / "lm_rescore2_writer.cpp"),

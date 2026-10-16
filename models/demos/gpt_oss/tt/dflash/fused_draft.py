@@ -46,6 +46,11 @@ class _Norm:
 # program semaphores of the fused drafter attention chain (clear of the boundary consumer's 0 and helpers' 5, 6, and
 # the block attention's 9 .. 11): the KV write (12, 13), QKV -> prep (14), KV write -> block attention (15)
 PREP_SEM_BASE, PREP_QKV_SEM, BA_PREP_SEM = 12, 14, 15
+# DFLASH_DRAFT_BANK_ROT=r (fused MLP): the MLP weights' logical bank (b + r) % banks on DRAM bank b, each slice's
+# intermediate padding at its end (the same pair positions in every slice) and the cores whose columns are all padding
+# dropped: r = 7 puts the padding on DRAM bank 0, the slowest for the streaming readers (fused_decode/stream.py
+# EXPERT_BANK_ROT)
+DRAFT_BANK_ROT = int(os.environ.get("DFLASH_DRAFT_BANK_ROT", "7"))
 
 
 class FusedDraft:
@@ -94,7 +99,18 @@ class FusedDraft:
             from .moe_fused import DenseMLPFused
 
             self.slices = int(os.environ.get("DFLASH_DRAFT_MLP_SLICES", "2"))
-            self.mlp_fused = DenseMLPFused(mesh, b, H, I_pad // self.slices, self.slices, M, self.mlp_dtype)
+            self.mlp_fused = DenseMLPFused(
+                mesh,
+                b,
+                H,
+                I_pad // self.slices,
+                self.slices,
+                M,
+                self.mlp_dtype,
+                rot=DRAFT_BANK_ROT,
+                real_inter=I // self.slices if DRAFT_BANK_ROT else None,
+                real_hidden=bool(DRAFT_BANK_ROT),
+            )
             self.gu, self.down = self.mlp_fused.gate_up, self.mlp_fused.down
         else:
             self.gu = ExpertGateUpUnion(
@@ -133,7 +149,7 @@ class FusedDraft:
                 ttnn.bfloat4_b,
                 readers=readers,
                 out_mode=6,
-                prefetch_cols=LM_HEAD_STREAM_PREFETCH,
+                prefetch_cols=int(os.environ.get("DFLASH_LM_PREFETCH", LM_HEAD_STREAM_PREFETCH)),
                 rows=M,
             )
         rep = ttnn.ReplicateTensorToMesh(mesh)
@@ -472,6 +488,8 @@ class FusedDraft:
         cache_dir = os.environ.get("TT_CACHE_PATH")
         S = self.slices
         sfx = (f"_s{S}" if S > 1 else "") + ("_mlp4" if self.mlp_dtype != dtype else "")
+        rot = DRAFT_BANK_ROT if self.mlp_fused is not None else 0
+        sfx += f"_rot{rot}" if rot else ""
         base = None if cache_dir is None else f"{cache_dir}/dflash_fused_draft_{dt}_b{banks}_i{I_pad}{sfx}"
         marker = None if base is None else Path(base + ".built")
         w = None
@@ -507,18 +525,41 @@ class FusedDraft:
                     lay["o"].append(
                         stream_linear_layout(o[dv * qh : (dv + 1) * qh], ob if dv == 0 else torch.zeros_like(ob), banks)
                     )
-                    gd = torch.nn.functional.pad(g[dv * I : (dv + 1) * I].T, (0, I_pad - I))
-                    ud = torch.nn.functional.pad(u[dv * I : (dv + 1) * I].T, (0, I_pad - I))
                     Is = I_pad // S  # slice s = intermediate columns [s Is, (s + 1) Is)
+                    if rot:  # slice s = real columns [s I / S, (s + 1) I / S), padded at its end
+                        Ir = I // S
+                        gd, ud = (
+                            torch.cat(
+                                [
+                                    torch.nn.functional.pad(
+                                        t[dv * I + s_ * Ir : dv * I + (s_ + 1) * Ir].T, (0, Is - Ir)
+                                    )
+                                    for s_ in range(S)
+                                ],
+                                -1,
+                            )
+                            for t in (g, u)
+                        )
+                        dd = torch.cat(
+                            [
+                                torch.nn.functional.pad(
+                                    dn[dv * I + s_ * Ir : dv * I + (s_ + 1) * Ir], (0, 0, 0, Is - Ir)
+                                )
+                                for s_ in range(S)
+                            ]
+                        )
+                    else:
+                        gd = torch.nn.functional.pad(g[dv * I : (dv + 1) * I].T, (0, I_pad - I))
+                        ud = torch.nn.functional.pad(u[dv * I : (dv + 1) * I].T, (0, I_pad - I))
+                        dd = torch.nn.functional.pad(dn[dv * I : (dv + 1) * I], (0, 0, 0, I_pad - I))
                     gu_s = torch.stack(
                         [
                             torch.cat([gd[:, s_ * Is : (s_ + 1) * Is], ud[:, s_ * Is : (s_ + 1) * Is]], -1)
                             for s_ in range(S)
                         ]
                     )
-                    lay["gu"].append(stream_gate_up_layout(gu_s, torch.zeros(S, 2 * Is), banks))
-                    dd = torch.nn.functional.pad(dn[dv * I : (dv + 1) * I], (0, 0, 0, I_pad - I))
-                    lay["down"].append(stream_down_layout(dd.reshape(S, Is, H), torch.zeros(S, H), banks))
+                    lay["gu"].append(stream_gate_up_layout(gu_s, torch.zeros(S, 2 * Is), banks, rot))
+                    lay["down"].append(stream_down_layout(dd.reshape(S, Is, H), torch.zeros(S, H), banks, rot))
 
             def put(name, rows, dt=dtype):
                 cache = None if base is None else f"{base}_l{i}_{name}"

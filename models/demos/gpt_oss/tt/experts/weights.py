@@ -3,6 +3,7 @@
 
 """Generic expert weight loading and management."""
 
+import glob
 from dataclasses import dataclass
 
 import torch
@@ -302,6 +303,7 @@ def load_decode_expert_weights(
     tensor_cache_path=None,
 ) -> DecodeExpertWeights:
     from ..fused_decode.stream import (
+        EXPERT_BANK_ROT,
         NBIAS,
         as_stream_tensor,
         columns_per_bank,
@@ -337,7 +339,9 @@ def load_decode_expert_weights(
         # One streamed layout per TP shard: [E, H, 2 * I_pad] = [gate shard | up shard] and its [E, 2 * I_pad] bias;
         # [E, I_pad, H] down rows and the [E, H] bias.
         gu_layouts = [
-            stream_gate_up_layout(torch.cat([g[0], u[0]], -1), torch.cat([gb[:, 0], ub[:, 0]], -1), banks)
+            stream_gate_up_layout(
+                torch.cat([g[0], u[0]], -1), torch.cat([gb[:, 0], ub[:, 0]], -1), banks, EXPERT_BANK_ROT
+            )
             for g, u, gb, ub in zip(
                 torch.chunk(gate, tp, -1),
                 torch.chunk(up, tp, -1),
@@ -346,29 +350,33 @@ def load_decode_expert_weights(
             )
         ]
         dn_layouts = [
-            stream_down_layout(w[0], b[:, 0], banks)
+            stream_down_layout(w[0], b[:, 0], banks, EXPERT_BANK_ROT)
             for w, b in zip(torch.chunk(down, tp, -2), torch.chunk(down_bias, tp, -1))
         ]
 
-    suffix = f"decode_i{inter_pad}_b{banks}_nb{NBIAS}"
+    suffix0 = f"decode_i{inter_pad}_b{banks}_nb{NBIAS}"
+    suffix = suffix0 + (f"_rot{EXPERT_BANK_ROT}" if EXPERT_BANK_ROT else "")
     rows = {
-        "gate_up": E * 2 * inter_pad // tile // banks * (H // tile + 1) * tile,
-        "down": E * columns_per_bank(H, banks) * (inter_pad // tile + 1) * tile,
+        "gate_up_stream": E * 2 * inter_pad // tile // banks * (H // tile + 1) * tile,
+        "down_stream": E * columns_per_bank(H, banks) * (inter_pad // tile + 1) * tile,
     }
+
+    def stream(name, layouts):
+        cache = get_cache_file_name(tensor_cache_path, f"{name}_{suffix}")
+        if layouts is None and EXPERT_BANK_ROT and cache is not None and not glob.glob(glob.escape(cache) + "*"):
+            # no rotated cache and no state dict: rotate the unrotated cache's bank shards on the host (exact: the
+            # BFP4 blocks stay within a bank's tiles)
+            base = as_stream_tensor(
+                mesh_device, None, rows[name], weight_dtype, get_cache_file_name(tensor_cache_path, f"{name}_{suffix0}")
+            )
+            host = ttnn.to_torch(base, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=1))[0]
+            ttnn.deallocate(base)
+            r = EXPERT_BANK_ROT * tile
+            layouts = [torch.cat([h[:, r:], h[:, :r]], dim=-1) for h in host]
+        return as_stream_tensor(mesh_device, layouts, rows[name], weight_dtype, cache)
+
     return DecodeExpertWeights(
-        gate_up_stream=as_stream_tensor(
-            mesh_device,
-            gu_layouts,
-            rows["gate_up"],
-            weight_dtype,
-            get_cache_file_name(tensor_cache_path, f"gate_up_stream_{suffix}"),
-        ),
-        down_stream=as_stream_tensor(
-            mesh_device,
-            dn_layouts,
-            rows["down"],
-            weight_dtype,
-            get_cache_file_name(tensor_cache_path, f"down_stream_{suffix}"),
-        ),
+        gate_up_stream=stream("gate_up_stream", gu_layouts),
+        down_stream=stream("down_stream", dn_layouts),
         intermediate_padded=inter_pad,
     )

@@ -62,6 +62,7 @@ void kernel_main() {
     // `dev` of every device (this one by a NOC copy) and bumps their receive semaphore; then the best over the
     // ARGMAX_RING slots (as mode 1). runtime args 3..: [vocab offset, payload, slots, receive semaphore, dev]
     if constexpr (mode == 2) {
+        DeviceTimestampedData("AMX_T", 900);
         noc_async_read(s_in.get_noc_addr(0), scr, in_page);
         noc_async_read_barrier();
         invalidate_l1_cache();
@@ -81,9 +82,11 @@ void kernel_main() {
         }
         // the sender (local mode) copies the payload into this device's own slot too: every device's slot arrives
         // with one increment of the receive semaphore
+        DeviceTimestampedData("AMX_T", 901);
         noc_semaphore_inc(get_noc_addr(get_semaphore(ARGMAX_SEND_SEM)), 1);  // the sender may go
         volatile tt_l1_ptr uint32_t* recv = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_val<uint32_t>(6));
         noc_semaphore_wait(recv, ARGMAX_RING);
+        DeviceTimestampedData("AMX_T", 902);
         noc_semaphore_set(recv, 0);
         invalidate_l1_cache();
         for (uint32_t g = 0; g < ARGMAX_RING; ++g) {
@@ -212,4 +215,5 @@ void kernel_main() {
 #endif
     }
     noc_async_write_barrier();
+    DeviceTimestampedData("AMX_T", 903);
 }

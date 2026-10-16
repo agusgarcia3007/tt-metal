@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
+#include "bnd_tiles.hpp"
 
 void kernel_main() {
     const uint32_t gamma_addr = get_arg_val<uint32_t>(0);
@@ -39,6 +40,18 @@ void kernel_main() {
     constexpr auto res_args = TensorAccessorArgs<gamma_args.next_compile_time_args_offset()>();
 
     constexpr uint32_t page = 2048;
+#ifdef BND_CONST
+    // the reduce scaler and P from their DRAM tiles (fused_decode/boundary.py const_tiles; runtime arg 4), landing
+    // long before the norm needs them
+    constexpr auto c_args = TensorAccessorArgs<res_args.next_compile_time_args_offset()>();
+    {
+        const auto s_c = TensorAccessor(c_args, get_arg_val<uint32_t>(4), page);
+        cb_reserve_back(cb_scaler, 1);
+        cb_reserve_back(cb_p, 1);
+        noc_async_read(s_c.get_noc_addr(0), get_write_ptr(cb_scaler), page);
+        noc_async_read(s_c.get_noc_addr(1), get_write_ptr(cb_p), page);
+    }
+#endif
     cb_reserve_back(cb_gamma, PH);
     {
         const auto s_gamma = TensorAccessor(gamma_args, gamma_addr, page);
@@ -75,32 +88,6 @@ void kernel_main() {
             }
         }
     }
-    // reduce scaler (1.0 in the first row of each face) and P[R][R'] = 1 iff R = R' (mod rows)
-    cb_reserve_back(cb_scaler, 1);
-    {
-        volatile tt_l1_ptr uint32_t* s = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_scaler));
-        for (uint32_t i = 0; i < page / 4; ++i) {
-            s[i] = 0;
-        }
-        for (uint32_t f = 0; f < 4; ++f) {
-            for (uint32_t i = 0; i < 8; ++i) {
-                s[f * 128 + i] = 0x3F803F80;
-            }
-        }
-    }
-    cb_push_back(cb_scaler, 1);
-    cb_reserve_back(cb_p, 1);
-    {
-        volatile tt_l1_ptr uint32_t* pm = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_p));
-        for (uint32_t R = 0; R < 32; ++R) {
-            for (uint32_t C = 0; C < 32; C += 2) {
-                const uint32_t lo = (R % rows == C % rows) ? 0x3F80u : 0u;
-                const uint32_t hi = (R % rows == (C + 1) % rows) ? 0x3F80u : 0u;
-                pm[(((R / 16) * 2 + C / 16) * 256 + (R % 16) * 16 + C % 16) / 2] = lo | (hi << 16);
-            }
-        }
-    }
-    cb_push_back(cb_p, 1);
     if constexpr (res_mode >= 1) {
         noc_async_read_barrier();
     }
@@ -109,14 +96,30 @@ void kernel_main() {
         {
             DeviceZoneScopedN("BND_R_WAIT");
             volatile tt_l1_ptr uint32_t* sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_addr);
+#if defined(PROFILE_KERNEL)
+            for (uint32_t k = 1; k <= expected; ++k) {  // (profiling: each source's arrival)
+                noc_semaphore_wait_min(sem, k);
+                DeviceTimestampedData("BND_A", k);
+            }
+#endif
             noc_semaphore_wait_min(sem, expected);
             noc_semaphore_set(sem, 0);
         }
         cb_reserve_back(cb_recv, slots * PH);
         cb_push_back(cb_recv, slots * PH);
     }
+    // reduce scaler (1.0 in the first row of each face) and P[R][R'] = 1 iff R = R' (mod rows), while compute sums
+    // (both come after the sum and gamma)
+#ifndef BND_CONST  // (else read at the start)
+    cb_reserve_back(cb_scaler, 1);
+    cb_reserve_back(cb_p, 1);
+    bnd_tiles::scaler(get_write_ptr(cb_scaler));
+    bnd_tiles::row_sum_matrix<rows>(get_write_ptr(cb_p));
+#endif
     noc_async_read_barrier();
     cb_push_back(cb_gamma, PH);
+    cb_push_back(cb_scaler, 1);
+    cb_push_back(cb_p, 1);
     // the helpers' row sums of squares (written into slot h of this cb by helper h's writer)
     cb_reserve_back(cb_xchg, helpers);
     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(xchg_sem)), helpers);

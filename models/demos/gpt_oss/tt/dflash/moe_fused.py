@@ -23,6 +23,7 @@ import torch
 
 import ttnn
 
+from ..fused_decode.stream import EXPERT_BANK_ROT
 from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion
 
 MOE = [("MOE_FUSED", "1")]
@@ -34,6 +35,9 @@ if STEAL:
 # DFLASH_VERIFY_ROWS=R (< block): only the first R block rows are verified (route to experts; the accept count is
 # capped at R): the union of experts, and with it the MoE's weight traffic, covers R rows (0: all rows)
 VERIFY_ROWS = int(os.environ.get("DFLASH_VERIFY_ROWS", "0"))
+# DFLASH_SKIP_PAD=1: drop the gate|up and down cores whose columns are all padding (with GPT_OSS_EXPERT_BANK_ROT=7
+# they read DRAM bank 0, the MoE's slowest)
+SKIP_PAD = os.environ.get("DFLASH_SKIP_PAD", "1") == "1"
 
 
 def _wait_n(b):
@@ -84,6 +88,7 @@ class MoEFused:
                 exclude=taken,
                 real_inter=real_inter,
                 coord=coord,
+                rot=EXPERT_BANK_ROT,
             )
             dn = ExpertDownUnion(
                 mesh_device,
@@ -94,6 +99,8 @@ class MoEFused:
                 expert_outer=True,
                 exclude=taken + [(c.x, c.y) for c, *_ in gu.assignments],
                 coord=coord,
+                rot=EXPERT_BANK_ROT,
+                skip_pad=SKIP_PAD,
             )
             self.parts[None if coord is None else (coord[0], coord[1])] = (gu, dn)
         self.gate_up, self.down = next(iter(self.parts.values()))
@@ -246,8 +253,22 @@ class DenseMLPFused:
     CTR_SEM = 3
 
     def __init__(
-        self, mesh_device, boundary, hidden, slice_pad, slices, rows, weight_dtype, gate_up_readers=4, down_readers=4
+        self,
+        mesh_device,
+        boundary,
+        hidden,
+        slice_pad,
+        slices,
+        rows,
+        weight_dtype,
+        gate_up_readers=4,
+        down_readers=4,
+        rot=0,
+        real_inter=None,
+        real_hidden=False,
     ):
+        """rot: the weights' bank rotation; real_inter (per slice) / real_hidden: drop the gate|up / down cores whose
+        columns are all padding (fused_decode/union.py)."""
         self.mesh, self.boundary, self.slices = mesh_device, boundary, slices
         taken = [(boundary.core.x, boundary.core.y)]
         taken += [(h.x, h.y) for h in getattr(boundary, "helpers", [])] if getattr(boundary, "mc", False) else []
@@ -263,6 +284,8 @@ class DenseMLPFused:
             max_experts=slices,
             weight_dtype=weight_dtype,
             exclude=taken,
+            real_inter=real_inter,
+            rot=rot,
         )
         taken += [(c.x, c.y) for c, *_ in self.gate_up.assignments]
         self.down = ExpertDownUnion(
@@ -276,6 +299,8 @@ class DenseMLPFused:
             weight_dtype=weight_dtype,
             num_buffers=2,
             exclude=taken,
+            rot=rot,
+            skip_pad=real_hidden,
         )
         self.G, self.D = self.gate_up.cores, self.down.cores
         moe = [d for d in MOE if d[0] != "MOE_STEAL"]  # (stealing needs the router's done flags)

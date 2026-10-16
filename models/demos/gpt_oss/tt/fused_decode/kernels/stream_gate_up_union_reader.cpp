@@ -79,6 +79,7 @@ void kernel_main() {
     noc_async_read_barrier();                  // the prefetch
     cb_push_back(MOE_PRED_CB, P * cols * kt);  // compute takes the routed ones, skips the others
     DeviceTimestampedData("MOE_T", 402);
+    DeviceTimestampedData("MOE_K", 1000 * num_sel + kept);  // (profiling: union size, predicted experts kept)
     e0 = kept;
 #else
     for (uint32_t e = 0; e < num_sel; ++e) {
@@ -219,18 +220,17 @@ void kernel_main() {
         push_task(e0 + n - m, owner);
         issue(expert_src(e0 + n - m, owner));
     }
-}
-push_task(0xFFFF, 0);  // end of tasks
+    push_task(0xFFFF, 0);  // end of tasks
 #else
     for (uint32_t e = e0; e < num_sel; ++e) {
         issue(static_cast<uint32_t>(uni[1 + order[e]]) * expert_stride + reader_offset);
     }
 #endif
-// Columns issued but not yet pushed (fewer than extra_in_flight + 1 when the union is tiny).
-const uint32_t pending = issued < extra_in_flight ? issued : extra_in_flight;
-for (uint32_t i = 0; i < pending; ++i) {
-    noc_async_read_barrier_with_trid(trid_to_wait);
-    cb_push_back(cb_w, kt);
-    trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
-}
+    // Columns issued but not yet pushed (fewer than extra_in_flight + 1 when the union is tiny).
+    const uint32_t pending = issued < extra_in_flight ? issued : extra_in_flight;
+    for (uint32_t i = 0; i < pending; ++i) {
+        noc_async_read_barrier_with_trid(trid_to_wait);
+        cb_push_back(cb_w, kt);
+        trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
+    }
 }
