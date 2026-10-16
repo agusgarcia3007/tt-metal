@@ -107,6 +107,9 @@ class FusedDraft:
                 self.slices,
                 M,
                 self.mlp_dtype,
+                # DFLASH_DRAFT_G_READERS / DFLASH_DRAFT_D_READERS: gate|up / down readers per bank (4 slices: 2)
+                gate_up_readers=int(os.environ.get("DFLASH_DRAFT_G_READERS", "4")),
+                down_readers=int(os.environ.get("DFLASH_DRAFT_D_READERS", "4")),
                 rot=DRAFT_BANK_ROT,
                 real_inter=I // self.slices if DRAFT_BANK_ROT else None,
                 real_hidden=bool(DRAFT_BANK_ROT),

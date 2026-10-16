@@ -224,6 +224,14 @@ class FusedVerify:
                 taken = {(c.x, c.y) for c in ttnn.corerange_to_cores(self.qkv.cores, row_wise=True)}
                 taken |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.boundary.cores, row_wise=True)}
                 taken |= {(h.x, h.y) for h in getattr(self.boundary, "helpers", [])}
+                # DFLASH_BA_EXCLUDE="x,y;...": logical cores block attention does not use. Default: (1..3, 1), leaders
+                # whose K / V reads starved for 100+ us in some layers at ISL 128K (block attention 228 -> 340-385 us
+                # there; 233 us flat without them, 23 slices instead of 24)
+                taken |= {
+                    tuple(map(int, c.split(",")))
+                    for c in os.environ.get("DFLASH_BA_EXCLUDE", "1,1;2,1;3,1").split(";")
+                    if c
+                }
                 grid = mesh.compute_with_storage_grid_size()
                 n_free = grid.x * grid.y - len(taken)
                 per_slice = BlockAttention.cores_needed(self.nkv, M, 1)
@@ -325,7 +333,15 @@ class FusedVerify:
                     tuple(map(int, c.split(","))) for c in os.environ.get("DFLASH_LM_EXCLUDE", "").split(";") if c
                 ],
             )
-            self.rescore = LMRescore(mesh, M, self.prescreen, len(self.lm_head.assignments), H, lm_n, round_robin=rr)
+            # DFLASH_RS_TILE=1: the BF8 weights for the rescore as an interleaved tile tensor (each column on every bank)
+            tile_nt = None
+            if os.environ.get("DFLASH_RS_TILE", "0") == "1":
+                from .lm_head import tile_lm_head
+
+                self.lm_w8, tile_nt = tile_lm_head(mesh, term, os.environ.get("TT_CACHE_PATH"))
+            self.rescore = LMRescore(
+                mesh, M, self.prescreen, len(self.lm_head.assignments), H, lm_n, round_robin=rr, tile_nt=tile_nt
+            )
 
         rep = ttnn.ReplicateTensorToMesh(mesh)
         dram, l1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG

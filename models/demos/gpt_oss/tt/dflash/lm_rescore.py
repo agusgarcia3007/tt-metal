@@ -18,11 +18,12 @@ from ..fused_decode.stream import BFP8_TILE_BYTES, NBIAS, TILE, columns_per_bank
 
 
 class LMRescore:
-    def __init__(self, mesh_device, rows, K, n1, hidden, n_cols, cores_start=(0, 0), round_robin=False):
+    def __init__(self, mesh_device, rows, K, n1, hidden, n_cols, cores_start=(0, 0), round_robin=False, tile_nt=None):
         """n1: stage-1 cores (lists); n_cols: the BF8 stream's (padded) columns per device; round_robin: its layout
         (dflash/lm_head.py padded_lm_head)."""
         self.mesh, self.M, self.K, self.n1 = mesh_device, rows, K, n1
         self.round_robin = round_robin
+        self.tile_nt = tile_nt  # the weights as an interleaved tile tensor with this many column tiles (tile_lm_head)
         self.kx = hidden // TILE
         self.kt = self.kx + 1
         self.C = columns_per_bank(n_cols, mesh_device.dram_grid_size().x)
@@ -133,7 +134,7 @@ class LMRescore:
             cb(cb_out, ttnn.bfloat16, 2 * TILE * M, 1, rows_tile),
         ]
         reader_ct = [cb_x, cb_w, cb_tab, cb_scr, self.n1, K, M, self.kx, self.col_bytes, self.C, NBIAS]
-        for t in (lists1, x):
+        for t in (lists1, x) + ((w8,) if self.tile_nt else ()):
             reader_ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
         writer_ct = [cb_out, cb_tab, M, K, K * M * 8] + ttnn.TensorAccessorArgs(lists2).get_compile_time_args()
         c0, c1 = self.core_list[0], self.core_list[-1]
@@ -152,7 +153,9 @@ class LMRescore:
                 compile_time_args=reader_ct,
                 runtime_args=reader_rt,
                 config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_0),
-                defines=[("RS_RR", str(self.mesh.dram_grid_size().x))] if self.round_robin else [],
+                defines=[("RS_TILE", str(self.tile_nt))]
+                if self.tile_nt
+                else ([("RS_RR", str(self.mesh.dram_grid_size().x))] if self.round_robin else []),
             ),
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / "lm_rescore2_writer.cpp"),

@@ -13,12 +13,16 @@
 
 namespace bnd_tiles {
 
+// (its own NOC transaction id: the barrier does not wait for the caller's other reads, e.g. DRAM ones still in flight)
 inline void zero(uint32_t addr, uint32_t bytes) {
+    constexpr uint32_t trid = 0xD;
     const uint64_t zeros = get_noc_addr(MEM_ZEROS_BASE);
+    noc_async_read_set_trid(trid);
     for (uint32_t z = 0; z < bytes; z += MEM_ZEROS_SIZE) {
         noc_async_read(zeros, addr + z, bytes - z < MEM_ZEROS_SIZE ? bytes - z : MEM_ZEROS_SIZE);
     }
-    noc_async_read_barrier();
+    noc_async_read_set_trid(0);
+    noc_async_read_barrier_with_trid(trid);
 }
 
 // reduce scaler: 1.0 in the first row of each face (scalar sum of all 1024 values)

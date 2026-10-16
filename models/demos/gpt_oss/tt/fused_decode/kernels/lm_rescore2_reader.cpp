@@ -131,7 +131,16 @@ void kernel_main() {
         // (x arrived with the table) the column tile (one read: reading only the needed 16-column half's faces, 3
         // small reads per K tile, measured slower)
         cb_reserve_back(cb_w, kx + 1);
-#ifdef RS_RR
+#if defined(RS_TILE)
+        // interleaved tile layout (dflash/lm_head.py tile_lm_head): tile (k, n) is page k RS_TILE + n, every bank
+        constexpr uint32_t tb = col_bytes / (kx + 1);
+        constexpr auto w_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
+        const auto s_w = TensorAccessor(w_args, w_addr, tb);
+        const uint32_t wl = get_write_ptr(cb_w);
+        for (uint32_t k = 0; k <= kx; ++k) {
+            noc_async_read(s_w.get_noc_addr(k * RS_TILE + n), wl + k * tb, tb);
+        }
+#elif defined(RS_RR)
         // round-robin layout (dflash/lm_head.py): tile n on bank n % banks, slot n / banks
         noc_async_read(
             get_noc_addr_from_bank_id<true>(n % RS_RR, w_addr + (n / RS_RR) * col_bytes),

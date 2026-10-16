@@ -297,11 +297,18 @@ void kernel_main() {
         q_done = true;
         DeviceTimestampedData("BA_R", 1);  // (profiling: Q read)
     };
+    uint32_t pushed = 0;
     auto q_ready = [&]() {
         invalidate_l1_cache();
+#ifdef BA_Q_AFTER
+        // (experiment) Q only once this core's first BA_Q_AFTER groups are in (or all of them)
+        if (pushed < BA_Q_AFTER && pushed < n_groups) {
+            return false;
+        }
+#endif
         return *qkv_sem >= BA_WAIT_N;
     };
-    uint32_t issued = 0, pushed = 0;
+    uint32_t issued = 0;
 #ifdef BA_SHARE
     // BA_SHARE (2 tile groups, 1 Q tile per core): the tile-group-0 core of each (kv head, slice) reads K / V from DRAM
     // (the leader); its tile-group-1 partner copies each landed group from the leader's L1 (2 NOC reads per group, the

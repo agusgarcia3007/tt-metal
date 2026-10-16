@@ -244,7 +244,7 @@ class DecodeBoundary:
             # tensor the reader fetches at launch, instead of every launch's reader writing them (~9 us on the
             # boundary's critical path); DRAM, not L1: persistent L1 lowers every program's CB region
             self.const_tiles = None
-            if os.environ.get("DFLASH_BND_CONST", "1") == "1":
+            if os.environ.get("DFLASH_BND_CONST", "0") == "1":
                 scaler = torch.zeros(TILE, TILE)
                 scaler[0], scaler[16] = 1.0, 1.0  # 1.0 in the first row of each face
                 idx = torch.arange(TILE)
