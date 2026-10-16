@@ -53,6 +53,8 @@ def test_block_attn(mesh_device, device_params):
     li = next(i for i, L in enumerate(m.layers) if not L.self_attn.config.sliding_window)
     attn = m.layers[li].self_attn
     k_cache, v_cache = kv[li]
+    if os.environ.get("BA_BF16") == "1":  # the drafter's cache format
+        k_cache, v_cache = (ttnn.typecast(c, ttnn.bfloat16) for c in (k_cache, v_cache))
     torch.manual_seed(0)
     shard = ttnn.ShardTensorToMesh(mesh_device, dim=1)
     for c in (k_cache, v_cache):
