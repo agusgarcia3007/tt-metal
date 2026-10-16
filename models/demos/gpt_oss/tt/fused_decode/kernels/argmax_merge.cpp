@@ -5,6 +5,7 @@
 // dflash/argmax.py.
 //   mode 0 (per device): the n_lists core lists ([key, index] per row, signed order keys) -> row 0 of a UINT32 tile:
 //          entries 2 r, 2 r + 1 = the row's best key and global vocab id (device offset + index; ties to the lower).
+//   mode 2 (ARGMAX_RING): mode 0 + a fabric exchange of the per-device bests + mode 1, one program (below);
 //   mode 1 (after the all-gather of those tiles, one tile per device): the best over the devices per row ->
 //          kind 0: tokens_out [last, best[1] .. best[rows - 1]] (last = tokens_src[0]): the drafter's 7 drafts as the
 //                  verify block; kind 1: out [tokens_src[0 .. rows - 1], best[0 .. rows - 1]] (the host's one read).
@@ -55,6 +56,44 @@ void kernel_main() {
             best_id[r] = id;
         }
     };
+#ifdef ARGMAX_RING
+    // mode 2 (one program per device, the all-gather replaced by the fabric): this device's best per row (as mode 0)
+    // -> its payload [key, id] x rows in L1; the sender kernel (boundary_sender.cpp, same core) writes it into slot
+    // `dev` of every device (this one by a NOC copy) and bumps their receive semaphore; then the best over the
+    // ARGMAX_RING slots (as mode 1). runtime args 3..: [vocab offset, payload, slots, receive semaphore, dev]
+    if constexpr (mode == 2) {
+        noc_async_read(s_in.get_noc_addr(0), scr, in_page);
+        noc_async_read_barrier();
+        invalidate_l1_cache();
+        volatile tt_l1_ptr uint32_t* l = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr);
+        const uint32_t voff = get_arg_val<uint32_t>(3);
+        for (uint32_t c = 0; c < n_in; ++c) {
+            for (uint32_t r = 0; r < rows; ++r) {
+                take(r, static_cast<int32_t>(l[(c * rows + r) * 2]), voff + l[(c * rows + r) * 2 + 1]);
+            }
+        }
+        const uint32_t payload = get_arg_val<uint32_t>(4), slots = get_arg_val<uint32_t>(5);
+        constexpr uint32_t slot_bytes = 64;  // [key, id] x <= 8 rows
+        volatile tt_l1_ptr uint32_t* pl = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(payload);
+        for (uint32_t r = 0; r < rows; ++r) {
+            pl[2 * r] = static_cast<uint32_t>(best_key[r]);
+            pl[2 * r + 1] = best_id[r];
+        }
+        // the sender (local mode) copies the payload into this device's own slot too: every device's slot arrives
+        // with one increment of the receive semaphore
+        noc_semaphore_inc(get_noc_addr(get_semaphore(ARGMAX_SEND_SEM)), 1);  // the sender may go
+        volatile tt_l1_ptr uint32_t* recv = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_val<uint32_t>(6));
+        noc_semaphore_wait(recv, ARGMAX_RING);
+        noc_semaphore_set(recv, 0);
+        invalidate_l1_cache();
+        for (uint32_t g = 0; g < ARGMAX_RING; ++g) {
+            volatile tt_l1_ptr uint32_t* t = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slots + g * slot_bytes);
+            for (uint32_t r = 0; r < rows; ++r) {
+                take(r, static_cast<int32_t>(t[2 * r]), t[2 * r + 1]);
+            }
+        }
+    }
+#endif
     if constexpr (mode == 0) {
         noc_async_read(s_in.get_noc_addr(0), scr, in_page);
         noc_async_read_barrier();
@@ -77,14 +116,15 @@ void kernel_main() {
         noc_async_write(scr, s_out.get_noc_addr(0), out_page);
     } else {
         const auto s_src = TensorAccessor(src_args, arg2, src_page);
-        for (uint32_t g = 0; g < n_in; ++g) {
+        constexpr uint32_t n_tiles = mode == 1 ? n_in : 0;  // mode 2: merged above
+        for (uint32_t g = 0; g < n_tiles; ++g) {
             noc_async_read(s_in.get_noc_addr(g), scr + g * in_page, 64);  // row 0, entries 0 .. 15
         }
-        const uint32_t tok = scr + n_in * in_page;
+        const uint32_t tok = scr + (mode == 1 ? n_in * in_page : in_page);
         noc_async_read(s_src.get_noc_addr(0), tok, src_page);
         noc_async_read_barrier();
         invalidate_l1_cache();
-        for (uint32_t g = 0; g < n_in; ++g) {
+        for (uint32_t g = 0; g < n_tiles; ++g) {
             volatile tt_l1_ptr uint32_t* t = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + g * in_page);
             for (uint32_t r = 0; r < rows; ++r) {
                 take(r, static_cast<int32_t>(t[2 * r]), t[2 * r + 1]);
@@ -119,13 +159,14 @@ void kernel_main() {
             constexpr auto tb_args = TensorAccessorArgs<tr_args.next_compile_time_args_offset()>();
             constexpr auto cp_args = TensorAccessorArgs<tb_args.next_compile_time_args_offset()>();
             constexpr auto cr_args = TensorAccessorArgs<cp_args.next_compile_time_args_offset()>();
-            const auto s_vp = TensorAccessor(vp_args, get_arg_val<uint32_t>(3), rows * 4);
-            const auto s_tk = TensorAccessor(tk_args, get_arg_val<uint32_t>(4), ROWS_D * 4);
-            const auto s_tp = TensorAccessor(tp_args, get_arg_val<uint32_t>(5), ROWS_D * 4);
-            const auto s_tr = TensorAccessor(tr_args, get_arg_val<uint32_t>(6), ROWS_D * 4);
-            const auto s_tb = TensorAccessor(tb_args, get_arg_val<uint32_t>(7), ROWS_D * 4);
-            const auto s_cp = TensorAccessor(cp_args, get_arg_val<uint32_t>(8), ROWS_D * 4);
-            const auto s_cr = TensorAccessor(cr_args, get_arg_val<uint32_t>(9), ROWS_D * 4);
+            constexpr uint32_t ab = mode == 2 ? 8 : 3;  // the ACCEPT tensors' runtime args
+            const auto s_vp = TensorAccessor(vp_args, get_arg_val<uint32_t>(ab), rows * 4);
+            const auto s_tk = TensorAccessor(tk_args, get_arg_val<uint32_t>(ab + 1), ROWS_D * 4);
+            const auto s_tp = TensorAccessor(tp_args, get_arg_val<uint32_t>(ab + 2), ROWS_D * 4);
+            const auto s_tr = TensorAccessor(tr_args, get_arg_val<uint32_t>(ab + 3), ROWS_D * 4);
+            const auto s_tb = TensorAccessor(tb_args, get_arg_val<uint32_t>(ab + 4), ROWS_D * 4);
+            const auto s_cp = TensorAccessor(cp_args, get_arg_val<uint32_t>(ab + 5), ROWS_D * 4);
+            const auto s_cr = TensorAccessor(cr_args, get_arg_val<uint32_t>(ab + 6), ROWS_D * 4);
             const uint32_t a = scr + 256;  // 7 x 128 B staging after the result
             noc_async_read(s_vp.get_noc_addr(0), a, rows * 4);
             noc_async_read_barrier();

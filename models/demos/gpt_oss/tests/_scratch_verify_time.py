@@ -42,6 +42,7 @@ def test_verify_time(mesh_device, device_params):
     ver.enable_device_argmax()
     toks = [1234, 200008, 976, 1825, 31064, 25, 392, 10930]
     ba0 = ver.block_attn
+    slide0 = ver.block_attn_slide
     cfgs = [("base", None), ("spec", None)]
     for spec in os.environ.get("VT_BA", "ba:X=1").split(";"):
         name, envs = spec.split(":")
@@ -69,6 +70,28 @@ def test_verify_time(mesh_device, device_params):
                     os.environ[k] = v
 
     bas = {name: make_ba(envs) for name, envs in cfgs if envs is not None}
+    if os.environ.get("VT_L1_DUMP") == "1":  # the L1 buffers on one worker core (address, size), after setup
+        ver.set_inputs(toks, POSITIONS[0])
+        ver.use_shared, ver.use_row_attn = True, False
+        ver.forward()
+        ttnn.synchronize_device(mesh_device)
+        d0 = mesh_device.get_devices()[0] if hasattr(mesh_device, "get_devices") else mesh_device
+        ttnn.device.dump_device_memory_state(d0, prefix="vt_")
+        seen = []
+        for owner, obj in [("ver", ver), ("moe", ver.moe_fused), ("ba", ver.block_attn), ("bnd", ver.boundary)]:
+            for k, t in vars(obj).items() if obj is not None else []:
+                if (
+                    isinstance(t, ttnn.Tensor)
+                    and t.is_allocated()
+                    and t.memory_config().buffer_type == ttnn.BufferType.L1
+                ):
+                    seen.append(
+                        (t.buffer_address(), f"{owner}.{k}", list(t.shape), str(t.memory_config().memory_layout))
+                    )
+        for a, n, sh, ml in sorted(seen):
+            print(f"VT L1 {a:8d} {n} {sh} {ml}", flush=True)
+        print("VT L1 dump written", flush=True)
+        return
     for p in POSITIONS:
         row = {}
         for name, envs in cfgs:
@@ -78,6 +101,8 @@ def test_verify_time(mesh_device, device_params):
             else:
                 ver.use_shared, ver.use_row_attn = True, False
                 ver.block_attn = bas.get(name)
+                # "..._noslide": the sliding-window layers on row attention
+                ver.block_attn_slide = None if name.endswith("_noslide") else slide0
             ver.forward()  # compile
             ttnn.synchronize_device(mesh_device)
             tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)

@@ -30,7 +30,21 @@ def _f32_bits(v):
 
 
 class DraftQKPrep:
-    def __init__(self, mesh_device, rows, nq, nkv, head_dim, eps, head_mc, cos_cache, sin_cache, head_grid_x=8):
+    def __init__(
+        self,
+        mesh_device,
+        rows,
+        nq,
+        nkv,
+        head_dim,
+        eps,
+        head_mc,
+        cos_cache,
+        sin_cache,
+        head_grid_x=8,
+        core_offset=(0, 0),
+        kv_core=None,
+    ):
         """head_mc: the head-sharded memory config (user r on core (r % head_grid_x, r // head_grid_x)); cos_cache /
         sin_cache: the RotarySetup row-major [1, 1, positions, head_dim] BF16 caches."""
         assert head_dim == 2 * TILE and nq <= TILE and nkv <= TILE
@@ -40,7 +54,11 @@ class DraftQKPrep:
         # once with per-row weights (half the compute phases)
         self.joint = os.environ.get("DFLASH_PREP_JOINT", "1") == "1" and nq + nkv <= 16
         self.defines = [("PREP_JOINT", "1"), ("NQ", str(nq)), ("NKV", str(nkv))] if self.joint else []
-        self.core_list = [ttnn.CoreCoord(r % head_grid_x, r // head_grid_x) for r in range(rows)]
+        # core_offset: head_mc's grid starts there (user r on core offset + (r % head_grid_x, r // head_grid_x));
+        # kv_core: the fused KV write's core
+        x0, y0 = core_offset
+        self.core_list = [ttnn.CoreCoord(x0 + r % head_grid_x, y0 + r // head_grid_x) for r in range(rows)]
+        self.kv_core = kv_core or KV_CORE
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in self.core_list])
         rep = ttnn.ReplicateTensorToMesh(mesh_device)
         self.trans = ttnn.from_torch(
@@ -92,11 +110,23 @@ class DraftQKPrep:
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
 
-    def __call__(self, q, k, v, gamma, rot_pos, kv=None):
+    def __call__(self, q, k, v, gamma, rot_pos, kv=None, fuse_fn=None):
+        kernels, cbs, sems, io, outs = self.parts(q, k, v, gamma, rot_pos, kv=kv, fuse_fn=fuse_fn)
+        ttnn.generic_op(io + list(outs), ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs))
+        return outs
+
+    def noc_cores(self):
+        return [self.mesh.worker_core_from_logical_core(c) for c in self.core_list]
+
+    def parts(self, q, k, v, gamma, rot_pos, kv=None, fuse_fn=None, wait=None, sem_base=0):
         """q / k / v: [1, 32, heads, 64] BF16 tiles in DRAM (row r = user r); gamma: from gamma(); rot_pos: UINT32
         [1, 32] (row r's rope position). kv = (DraftKVWrite, k_cache, v_cache, pos, page_table): the K / V rows' cache
-        write in the same program (on core KV_CORE, after every prep core's semaphore). Returns the head-sharded
-        (q, k, v)."""
+        write in the same program (on core KV_CORE, after every prep core's semaphore). fuse_fn(qo) -> (kernels, cbs,
+        io, noc_cores, sem_id, semaphores): an op in the same program after the K / V cache write (its cores' semaphore
+        sem_id counts the K and V kernels' signals: 2; the drafter's block attention). Returns the head-sharded
+        (q, k, v). parts(): (kernels, cbs, semaphores, io, (q, k, v)) of the program; wait = (semaphore id, count): the
+        reader first waits for a producer of q / k / v in the same program (the drafter's QKV); sem_base: the KV
+        write's semaphore ids (sem_base, + 1)."""
         alloc = lambda h: ttnn.allocate_tensor_on_device(
             ttnn.Shape([1, TILE, h, self.hd]), ttnn.bfloat16, ttnn.TILE_LAYOUT, self.mesh, self.head_mc
         )
@@ -151,7 +181,7 @@ class DraftQKPrep:
         reader_rt, writer_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         notify = []
         if kv is not None:
-            p = self.mesh.worker_core_from_logical_core(KV_CORE)
+            p = self.mesh.worker_core_from_logical_core(self.kv_core)
             notify = [p.x, p.y]
         for r, c in enumerate(self.core_list):
             reader_rt[c.x][c.y] = [
@@ -168,7 +198,8 @@ class DraftQKPrep:
             ] + notify
             writer_rt[c.x][c.y] = [qo.buffer_address(), ko.buffer_address()] + notify
         dm = ttnn.DataMovementConfigDescriptor
-        defs = ([("PREP_NOTIFY", "1")] if kv is not None else []) + self.defines
+        defs = ([("PREP_NOTIFY", "1")] if kv is not None else []) + self.defines + [("PREP_SEM_BASE", str(sem_base))]
+        reader_defs = defs + ([("PREP_WAIT_SEM", str(wait[0])), ("PREP_WAIT_N", str(wait[1]))] if wait else [])
         kernels = [
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / "draft_qk_prep_reader.cpp"),
@@ -176,7 +207,7 @@ class DraftQKPrep:
                 compile_time_args=reader_ct,
                 runtime_args=reader_rt,
                 config=dm(processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_0),
-                defines=defs,
+                defines=reader_defs,
             ),
             ttnn.KernelDescriptor(
                 kernel_source=str(KERNEL_DIR / "draft_qk_prep_writer.cpp"),
@@ -198,14 +229,31 @@ class DraftQKPrep:
             ),
         ]
         sems, io = [], [q, k, v, gamma, self.cos, self.sin, rot_pos, self.trans]
+        fused = fuse_fn(qo) if fuse_fn is not None else None
         if kv is not None:
             writer, k_cache, v_cache, pos, page_table = kv
-            kk, kcb = writer.parts(ko, vo, k_cache, v_cache, pos, page_table, core=KV_CORE, cb_id=14, wait=(0, self.M))
+            kk, kcb = writer.parts(
+                ko,
+                vo,
+                k_cache,
+                v_cache,
+                pos,
+                page_table,
+                core=self.kv_core,
+                cb_id=14,
+                wait=(sem_base, self.M),
+                notify=(fused[3], fused[4]) if fused is not None else None,
+            )
             kernels += kk
             cbs += kcb
-            both = self.cores.merge(ttnn.CoreRangeSet([ttnn.CoreRange(KV_CORE, KV_CORE)]))
-            sems = [ttnn.SemaphoreDescriptor(i, ttnn.CoreType.WORKER, both, 0) for i in (0, 1)]
+            both = self.cores.merge(ttnn.CoreRangeSet([ttnn.CoreRange(self.kv_core, self.kv_core)]))
+            sems = [ttnn.SemaphoreDescriptor(sem_base + i, ttnn.CoreType.WORKER, both, 0) for i in (0, 1)]
             io += [pos, page_table, k_cache, v_cache]
-        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
-        ttnn.generic_op(io + [qo, ko, vo], program)
-        return qo, ko, vo
+        if fused is not None:
+            assert kv is not None, "the fused op waits for the K / V cache write"
+            f_kernels, f_cbs, f_io, _, f_sem, f_sems = fused
+            kernels += list(f_kernels)
+            cbs += list(f_cbs)
+            sems += [ttnn.SemaphoreDescriptor(f_sem, ttnn.CoreType.WORKER, f_kernels[0].core_ranges, 0)] + list(f_sems)
+            io += [t for t in f_io if all(t is not u for u in io + [qo, ko, vo])]
+        return kernels, cbs, sems, io, (qo, ko, vo)

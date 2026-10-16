@@ -54,6 +54,19 @@ void kernel_main() {
     constexpr bool has_sink = false;
     // bit 13 (no sink here): chunk 0 of this slice is the window's first chunk with a cut start (mask e = 1)
     const bool win_first = s == 0 && (lo % 32) && lo / 32 != hi / 32;
+#elif defined(BA_SLIDE)
+    auto lo_of = [&](uint32_t r) -> uint32_t {
+        const uint32_t p = static_cast<uint32_t>(pos[r]);
+        return p + 1 >= BA_SLIDE ? p + 1 - BA_SLIDE : 0;
+    };
+    const uint32_t lo_min = lo_of(0), lo_max = lo_of(M - 1);
+    const BaSlice sl =
+        ba_slice(static_cast<uint32_t>(pos[0]), static_cast<uint32_t>(pos[M - 1]), s, S, min_chunks, lo_min / 32);
+    constexpr bool has_sink = true;
+    constexpr bool win_first = false;
+    // slice 0's chunks 0 .. n_low - 1 take the window-start masks (some row's window starts inside them)
+    uint32_t n_low = lo_max > 0 ? lo_max / 32 - lo_min / 32 + 1 : 0;
+    n_low = s == 0 ? (n_low > 2 ? 2 : n_low) : 0;
 #else
     const BaSlice sl = ba_slice(static_cast<uint32_t>(pos[0]), static_cast<uint32_t>(pos[M - 1]), s, S, min_chunks);
     constexpr bool has_sink = true;
@@ -64,7 +77,12 @@ void kernel_main() {
     // clamped to [-1, 8190]: chunk j of the slice takes causal mask e = j - offset when 0 <= e <= 1)
     int32_t off = static_cast<int32_t>(sl.c_block) - static_cast<int32_t>(sl.c_lo);
     off = off < -1 ? -1 : (off > 8190 ? 8190 : off);
-    const uint32_t info = nc | ((has_sink && s == 0) || win_first ? 1u << 13 : 0u) |
+#ifdef BA_SLIDE
+    const uint32_t nlo_bits = n_low << 8;  // (nc < 256 here: a window of chunks)
+#else
+    constexpr uint32_t nlo_bits = 0;
+#endif
+    const uint32_t info = nc | nlo_bits | ((has_sink && s == 0) || win_first ? 1u << 13 : 0u) |
                           (sl.send_round < 0 ? 1u << 14 : 0u) | (sl.recv_rounds << 15) |
                           (static_cast<uint32_t>(off + 1) << 18);
     ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, info);

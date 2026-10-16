@@ -59,7 +59,12 @@ constexpr uint32_t M = get_compile_time_arg_val(16);
 constexpr uint32_t G = get_compile_time_arg_val(17);
 constexpr uint32_t Tt = BA_TPC;  // this core's packed Q tiles (of M / 4)
 static_assert(Tt >= 1 && Tt <= 2 && Tt <= M / 4, "one or two packed Q tiles per core (cb_m / cb_l / cb_o + t)");
-constexpr uint32_t mask_sink = 2 * Tt + 1, tile_sink = 2 * Tt + 2, tile_zero = 2 * Tt + 3;  // cb_aux tiles
+#ifdef BA_SLIDE
+constexpr uint32_t NM = 4;  // mask tiles per Q tile: causal e = 0, 1; window starts 2, 3
+#else
+constexpr uint32_t NM = 2;
+#endif
+constexpr uint32_t mask_sink = NM * Tt + 1, tile_sink = NM * Tt + 2, tile_zero = NM * Tt + 3;  // cb_aux tiles
 
 // formats for the next op: SrcA, SrcB operands and the pack output (compute_kernel_hw_startup runs once, at the start)
 inline void cfg(uint32_t a, uint32_t b, uint32_t out) {
@@ -147,7 +152,12 @@ void kernel_main() {
     UNPACK(info = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
     MATH(info = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
     PACK(info = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+#ifdef BA_SLIDE
+    const uint32_t nc = info & 0xFF, n_low = (info >> 8) & 3;  // slice 0's first n_low chunks: window-start masks
+#else
     const uint32_t nc = info & 0x1FFF;
+    constexpr uint32_t n_low = 0;
+#endif
     if (nc == 0) {
         return;
     }
@@ -185,7 +195,7 @@ void kernel_main() {
     cb_push_back(cb_qs, 2 * Tt);
     cb_pop_front(cb_q, 2 * Tt);
     cb_wait_front(cb_qs, 2 * Tt);
-    cb_wait_front(cb_aux, 2 * Tt + 4);
+    cb_wait_front(cb_aux, NM * Tt + 4);
 
     for (uint32_t gi = 0; gi < n_groups; ++gi) {
         const uint32_t j0 = gi * G;
@@ -240,9 +250,11 @@ void kernel_main() {
                     add_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_aux);
                     for (uint32_t b = 0; b < nb; ++b) {
                         const int32_t e = static_cast<int32_t>(j0 + jb + b) - off;
-                        const uint32_t mk = (e == 0 || e == 1)                ? 1 + 2 * t + e
-                                            : (win_first && j0 + jb + b == 0) ? 1 + 2 * t + 1
-                                                                              : tile_zero;
+                        const uint32_t jg = j0 + jb + b;
+                        const uint32_t mk = (e == 0 || e == 1)       ? 1 + NM * t + e
+                                            : jg < n_low             ? 1 + NM * t + 2 + jg
+                                            : (win_first && jg == 0) ? 1 + NM * t + 1
+                                                                     : tile_zero;
                         add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_aux, mk, b);
                     }
                     tile_regs_commit();

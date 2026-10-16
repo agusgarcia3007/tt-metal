@@ -43,6 +43,11 @@ class _Norm:
         self.tt_weight = tt_weight
 
 
+# program semaphores of the fused drafter attention chain (clear of the boundary consumer's 0 and helpers' 5, 6, and
+# the block attention's 9 .. 11): the KV write (12, 13), QKV -> prep (14), KV write -> block attention (15)
+PREP_SEM_BASE, PREP_QKV_SEM, BA_PREP_SEM = 12, 14, 15
+
+
 class FusedDraft:
     def __init__(self, draft, verify, dtype=ttnn.bfloat8_b):
         """draft: a DFlashDraft with enable_trace() and feed_verify() done; verify: the FusedVerify it feeds."""
@@ -171,9 +176,37 @@ class FusedDraft:
         if os.environ.get("DFLASH_DRAFT_QK_PREP", "1") == "1":
             from .qk_prep import DraftQKPrep
 
-            self.prep = DraftQKPrep(
-                mesh, M, nq, nkv, hd, draft.eps, draft.head_mc, draft.rope.cos_matrix, draft.rope.sin_matrix
-            )
+            # DFLASH_DRAFT_PREP_FUSE=1: the prep (+ KV write + block attention) runs in the QKV program: its cores
+            # move off the QKV / boundary cores ((0, 0), the KV write's (0, 1)): one column right, KV write at (9, 0)
+            self.prep_kv_write = draft.kv_write
+            if os.environ.get("DFLASH_DRAFT_PREP_FUSE", "0") == "1":
+                from .kv_write import DraftKVWrite
+
+                head_mc = ttnn.create_sharded_memory_config(
+                    shape=(TILE, hd),
+                    core_grid=ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(8, 3))]),
+                    strategy=ttnn.ShardStrategy.HEIGHT,
+                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                )
+                self.prep = DraftQKPrep(
+                    mesh,
+                    M,
+                    nq,
+                    nkv,
+                    hd,
+                    draft.eps,
+                    head_mc,
+                    draft.rope.cos_matrix,
+                    draft.rope.sin_matrix,
+                    core_offset=(1, 0),
+                    kv_core=ttnn.CoreCoord(9, 0),
+                )
+                self.prep_kv_write = DraftKVWrite(mesh, M, nkv, hd, draft.block_size, core_offset=(1, 0))
+            else:
+                self.prep = DraftQKPrep(
+                    mesh, M, nq, nkv, hd, draft.eps, draft.head_mc, draft.rope.cos_matrix, draft.rope.sin_matrix
+                )
             host = lambda t: ttnn.to_torch(ttnn.get_device_tensors(t)[0]).float().reshape(-1)[:hd]
             # DFLASH_DRAFT_PREP_KV=1: the K / V cache write in the same program
             self.prep_kv = os.environ.get("DFLASH_DRAFT_PREP_KV", "1") == "1"
@@ -210,9 +243,20 @@ class FusedDraft:
         from .block_attention import BlockAttention, free_cores
 
         d, mesh = self.d, self.mesh
+        from .qk_prep import KV_CORE
+
         grid = mesh.compute_with_storage_grid_size()
         per_slice = BlockAttention.cores_needed(d.nkv, self.M, 1)
-        S = min(int(os.environ.get("DFLASH_BA_S", "24")), grid.x * grid.y // per_slice)
+        # clear of the prep cores (one per row: (r % 8, r // 8)) and the KV write core: fused into that program
+        prep = getattr(self, "prep", None)
+        taken = {(r % 8, r // 8) for r in range(self.M)} | {(KV_CORE.x, KV_CORE.y)}
+        if prep is not None:
+            taken |= {(c.x, c.y) for c in prep.core_list} | {(prep.kv_core.x, prep.kv_core.y)}
+        # and of the QKV / boundary cores (the prep + attention chain can run in the QKV program)
+        taken |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.qkv.cores, row_wise=True)}
+        taken |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.b.cores, row_wise=True)}
+        taken |= {(h.x, h.y) for h in getattr(self.b, "helpers", [])}
+        S = min(int(os.environ.get("DFLASH_BA_S", "24")), (grid.x * grid.y - len(taken)) // per_slice)
         if window:  # a window caps the history: no more slices than its chunks give work (cores cost launch time)
             min_chunks = int(os.environ.get("BA_MIN_CHUNKS", "4"))
             S = min(S, -(-(window // 32 + 2) // min_chunks))
@@ -223,12 +267,24 @@ class FusedDraft:
             d.nkv,
             d.hd,
             d.block_size,
-            free_cores(mesh, set(), per_slice * S),
+            free_cores(mesh, taken, per_slice * S),
             S,
             uniform=True,
             window=window,
             q_rows=True,
         )
+
+    def _prep_fusable(self):
+        """The prep / KV write cores are clear of the QKV program's cores (QKV writers, boundary, helpers)."""
+
+        busy = {(c.x, c.y) for c in ttnn.corerange_to_cores(self.qkv.cores, row_wise=True)}
+        busy |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.b.cores, row_wise=True)}
+        busy |= {(h.x, h.y) for h in getattr(self.b, "helpers", [])}
+        mine = {(c.x, c.y) for c in self.prep.core_list} | {(self.prep.kv_core.x, self.prep.kv_core.y)}
+        if os.environ.get("DFLASH_LOG_CORES") == "1" and not getattr(self, "_logged_cores", False):
+            self._logged_cores = True
+            print(f"DRAFT cores: busy {sorted(busy)}; prep {sorted(mine)}; clash {sorted(busy & mine)}", flush=True)
+        return not (busy & mine)
 
     def shared_allowed(self):
         """The draft pass reads its whole history once (shared) only without a drafter window: with one, each row
@@ -501,7 +557,57 @@ class FusedDraft:
             self.shared.begin(d.t_bound, d.page_table)
         for i in range(d.layers):
             L = d.L[i]
-            if fab:
+            kc, vc = d.caches[i]
+            # DFLASH_DRAFT_BA_FUSE=1: the block attention runs in the prep program (after its K / V cache write)
+            ba_fused = (
+                shared
+                and self.ba is not None
+                and self.prep is not None
+                and self.prep_kv
+                and os.environ.get("DFLASH_DRAFT_BA_FUSE", "1") == "1"
+            )
+            fuse_fn = None
+            if ba_fused:
+
+                def fuse_fn(qo, kc=kc, vc=vc):
+                    kern, cbs, io = self.ba.parts(
+                        qo, kc, vc, d.t_bound, d.page_table, None, d.hd**-0.5, wait=(BA_PREP_SEM, 2)
+                    )
+                    return kern, cbs, io, self.ba.notify_order(), BA_PREP_SEM, self.ba.semaphores()
+
+            # DFLASH_DRAFT_PREP_FUSE=1: the prep (+ KV write + block attention) runs in the QKV program, after its
+            # writers' signal
+            prep_fused = (
+                fab
+                and self.prep is not None
+                and self.prep_kv
+                and self._prep_fusable()
+                and os.environ.get("DFLASH_DRAFT_PREP_FUSE", "0") == "1"
+            )
+            kv = (self.prep_kv_write, kc, vc, d.t_pos, d.page_table) if self.prep is not None and self.prep_kv else None
+            key = (prep_fused, ba_fused, shared)
+            if i == 0 and key not in getattr(self, "_logged_fusion", set()):
+                self._logged_fusion = getattr(self, "_logged_fusion", set()) | {key}
+                print(
+                    f"DRAFT fusion: shared {shared}, prep in QKV {prep_fused} (cores clear {self._prep_fusable()}), "
+                    f"block attention in prep {ba_fused}",
+                    flush=True,
+                )
+            if prep_fused:
+                pk, pc, ps, pio, (qr, kr, vs) = self.prep.parts(
+                    self.q,
+                    self.k,
+                    self.vv,
+                    self.prep_gamma[i],
+                    d.t_rot,
+                    kv=kv,
+                    fuse_fn=fuse_fn,
+                    wait=(PREP_QKV_SEM, len(self.qkv.assignments)),
+                    sem_base=PREP_SEM_BASE,
+                )
+                fuse = (pk, pc, pio + [qr, kr, vs], self.prep.noc_cores(), PREP_QKV_SEM, ps)
+                self.qkv(pending, self.w_qkv[i], (self.q, self.k, self.vv), fuse=fuse)
+            elif fab:
                 self.qkv(pending, self.w_qkv[i], (self.q, self.k, self.vv))
             else:
                 pending.run()
@@ -509,10 +615,10 @@ class FusedDraft:
             res = pending.residual_out
             pending.x.deallocate(True)
             pending.residual.deallocate(True)
-            kc, vc = d.caches[i]
-            if self.prep is not None:
-                kv = (d.kv_write, kc, vc, d.t_pos, d.page_table) if self.prep_kv else None
-                qr, kr, vs = self.prep(self.q, self.k, self.vv, self.prep_gamma[i], d.t_rot, kv=kv)
+            if prep_fused:
+                pass
+            elif self.prep is not None:
+                qr, kr, vs = self.prep(self.q, self.k, self.vv, self.prep_gamma[i], d.t_rot, kv=kv, fuse_fn=fuse_fn)
             else:
                 qr = self._norm_rope(self.q, L["q_norm"], rot)
                 kr = self._norm_rope(self.k, L["k_norm"], rot)
@@ -522,7 +628,9 @@ class FusedDraft:
             kr.deallocate(True)
             vs.deallocate(True)
             if shared:
-                if self.ba is not None:  # (the reader gathers Q from qr's rows layout)
+                if ba_fused:
+                    attn = self.ba.out
+                elif self.ba is not None:  # (the reader gathers Q from qr's rows layout)
                     attn = self.ba(qr, kc, vc, d.t_bound, d.page_table, None, d.hd**-0.5)
                 else:
                     self.shared.load_q(qr)

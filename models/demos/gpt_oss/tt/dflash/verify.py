@@ -179,6 +179,7 @@ class FusedVerify:
         # M rows (dflash/shared_kv_attention.py: SDPA's spec_multi_pos_tiles mode) instead of once per row
         self.shared_kv = None
         self.block_attn = None
+        self.block_attn_slide = None
         self.use_shared = False  # set per traced variant (FastDFlashRunner)
         if os.environ.get("DFLASH_SHARED_KV", "1") == "1":
             from .shared_kv_attention import SharedKVAttention
@@ -222,6 +223,22 @@ class FusedVerify:
                     free_cores(mesh, taken, BlockAttention.cores_needed(self.nkv, M, S)),
                     S,
                 )
+                # DFLASH_BA_SLIDE=1: the sliding-window layers too (row r attends its last `window` positions; a few
+                # chunks: DFLASH_BA_SLIDE_S slices) instead of row attention
+                slide = [L.self_attn.config.sliding_window for L in self.layers if L.self_attn.config.sliding_window]
+                if slide and os.environ.get("DFLASH_BA_SLIDE", "0") == "1":
+                    S2 = min(int(os.environ.get("DFLASH_BA_SLIDE_S", "2")), n_free // per_slice)
+                    self.block_attn_slide = BlockAttention(
+                        mesh,
+                        M,
+                        self.nq,
+                        self.nkv,
+                        self.hd,
+                        kv_cache[full[0]][0].shape[2],
+                        free_cores(mesh, taken, BlockAttention.cores_needed(self.nkv, M, S2)),
+                        S2,
+                        window=slide[0],
+                    )
         self.moe_fused = None
         if os.environ.get("DFLASH_MOE_FUSED", "1") == "1" and self.boundary.ccl == "fabric":
             from .moe_fused import MoEFused
@@ -424,7 +441,10 @@ class FusedVerify:
                 self.rot, self.cos_table, self.sin_table, self.pos, self.page_table, k_cache, v_cache
             )
             fuse = None
-            ra_here = self.row_attn is not None and (self.use_row_attn or attn.config.sliding_window)
+            slide_ba = self.block_attn_slide if (self.use_shared and attn.config.sliding_window) else None
+            ra_here = (
+                self.row_attn is not None and (self.use_row_attn or attn.config.sliding_window) and slide_ba is None
+            )
             o_f = self.o_proj_f if ra_here and getattr(self, "ra_fuse", False) else None
             if ra_here and getattr(self, "ra_fuse", False):
                 k_cache, v_cache = self.kv_cache[i]
@@ -442,10 +462,13 @@ class FusedVerify:
                     notify=(o_noc, 7) if o_f is not None else None,
                 )
                 fuse = (kern, cbs, io, self.row_attn.noc_cores(), 3)
-            shared = self.shared_kv is not None and self.use_shared and not attn.config.sliding_window
-            if shared and ba is not None:  # block attention fused into the QKV program (Q in its packed layout)
-                kern, cbs, io = ba.parts(
-                    ba.q,
+            shared = (self.shared_kv is not None and self.use_shared and not attn.config.sliding_window) or (
+                slide_ba is not None
+            )
+            lba = slide_ba if slide_ba is not None else ba  # this layer's block attention
+            if shared and lba is not None:  # block attention fused into the QKV program (Q in its packed layout)
+                kern, cbs, io = lba.parts(
+                    lba.q,
                     k_cache,
                     v_cache,
                     self.pos,
@@ -454,7 +477,7 @@ class FusedVerify:
                     attn.config.scaling,
                     wait=(3, len(self.qkv.assignments)),
                 )
-                fuse = (kern, cbs, io, ba.notify_order(), 3, ba.semaphores())
+                fuse = (kern, cbs, io, lba.notify_order(), 3, lba.semaphores())
             if o_f is not None:
                 # QKV + row attention + o_proj + the attn-site boundary send: one program per device
                 qprog, qio = self.qkv(
@@ -494,7 +517,7 @@ class FusedVerify:
                         io.append(t)
                 ttnn.generic_op(io, mesh_program)
             elif shared:  # Q straight into the shared-KV attention's packed layout
-                sq = ba.q if ba is not None else self.shared_kv.q
+                sq = lba.q if lba is not None else self.shared_kv.q
                 self.qkv(
                     pending, attn.weights.wqkv_stream, (sq, sq, sq), rope_kv=rk, spec_tt=self.shared_kv.Tt, fuse=fuse
                 )
@@ -505,8 +528,8 @@ class FusedVerify:
             pending.residual.deallocate(True)
             if i - 1 in self.capture_layers:  # layer i - 1's output = this layer's input residual
                 self._capture(i - 1, res)
-            if shared and ba is not None:
-                sdpa = ba.out
+            if shared and lba is not None:
+                sdpa = lba.out
             elif fuse is not None:
                 sdpa = self.row_attn.out
             elif shared:
@@ -688,7 +711,10 @@ class FusedVerify:
 
     def _persistent(self, t):
         # the row attention / shared-KV outputs are reused by every layer
-        return any(o is not None and t is o.out for o in (self.row_attn, self.shared_kv, self.block_attn))
+        return any(
+            o is not None and t is o.out
+            for o in (self.row_attn, self.shared_kv, self.block_attn, self.block_attn_slide)
+        )
 
     def _sdpa(self, i):
         attn = self.layers[i].self_attn

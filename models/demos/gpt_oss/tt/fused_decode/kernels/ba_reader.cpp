@@ -16,6 +16,7 @@
 //            BA_TREE_SEM bit r).
 //
 // common runtime args: [q_addr, k_addr, v_addr, pos_addr, pt_addr, sink_addr, mask_lib_addr, core index table]
+// BA_SLIDE: causal with a sliding window: row r attends [pos[r] + 1 - BA_SLIDE, pos[r]] (lower masks per row group).
 // BA_UNIFORM: every row attends [0, pos[M - 1]] (the drafter's block; [pos[M - 1] + 1 - BA_WINDOW, ..] with a window),
 // no sinks.
 // BA_TPC: packed Q tiles per core (t0 .. t0 + BA_TPC - 1; BA_TPC < Tt: the slices of each tile group are their own
@@ -108,9 +109,24 @@ void kernel_main() {
 #endif
     const BaSlice sl = ba_slice(hi, hi, s, S, min_chunks, lo / 32);
     constexpr bool has_sink = false;
+#elif defined(BA_SLIDE)
+    // row r attends [lo_r, pos[r]], lo_r = pos[r] + 1 - BA_SLIDE (>= 0): the slices cover from the first row's lo; its
+    // first chunks are cut per row group (lower masks e = 2, 3: slice 0's chunks 0, 1), the block's chunks causally
+    auto lo_of = [&](uint32_t r) -> uint32_t {
+        const uint32_t p = static_cast<uint32_t>(pos[r]);
+        return p + 1 >= BA_SLIDE ? p + 1 - BA_SLIDE : 0;
+    };
+    const uint32_t lo_min = lo_of(0);
+    const BaSlice sl = ba_slice(p0, static_cast<uint32_t>(pos[M - 1]), s, S, min_chunks, lo_min / 32);
+    constexpr bool has_sink = true;
 #else
     const BaSlice sl = ba_slice(p0, static_cast<uint32_t>(pos[M - 1]), s, S, min_chunks);
     constexpr bool has_sink = true;
+#endif
+#ifdef BA_SLIDE
+    constexpr uint32_t NM = 4;  // mask tiles per Q tile: causal e = 0, 1; window starts e = 2, 3
+#else
+    constexpr uint32_t NM = 2;
 #endif
     volatile tt_l1_ptr uint32_t* qkv_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(BA_WAIT_SEM));
     if (sl.c_hi == sl.c_lo) {
@@ -130,20 +146,20 @@ void kernel_main() {
     const uint32_t n_groups = (nc + G - 1) / G;
 
     // aux: scaler, causal masks, sink-column mask, sink tile, zero tile
-    constexpr uint32_t n_aux = 2 * TC + 4;
+    constexpr uint32_t n_aux = NM * TC + 4;
     cb_reserve_back(cb_aux, n_aux);
     const uint32_t aux = get_write_ptr(cb_aux);
     const uint64_t zeros = get_noc_addr(MEM_ZEROS_BASE);
     for (uint32_t z = 0; z < tile; z += MEM_ZEROS_SIZE) {
         noc_async_read(zeros, aux + z, MEM_ZEROS_SIZE);
-        noc_async_read(zeros, aux + (2 * TC + 3) * tile + z, MEM_ZEROS_SIZE);
+        noc_async_read(zeros, aux + (NM * TC + 3) * tile + z, MEM_ZEROS_SIZE);
     }
     if (has_sink &&
         s == 0) {  // the sink tile (aux 2 TC + 2): kv head g's rows of the heads' sink tile, in every row group
         const uint64_t src = s_sink.get_noc_addr(0);
         for (uint32_t i = 0; i < 4; ++i) {
             for (uint32_t f = 0; f < 2; ++f) {
-                noc_async_read(src + rows8(g, f), aux + (2 * TC + 2) * tile + rows8(i, f), 256);
+                noc_async_read(src + rows8(g, f), aux + (NM * TC + 2) * tile + rows8(i, f), 256);
             }
         }
     }
@@ -177,24 +193,43 @@ void kernel_main() {
             }
 #ifdef BA_UNIFORM
             // the window's first chunk is this one too: keep [lo % 32, ..)
-            mask(1 + 2 * t + e, keep, c == lo / 32 ? lo % 32 : 0);
+            mask(1 + NM * t + e, keep, c == lo / 32 ? lo % 32 : 0);
 #else
-            mask(1 + 2 * t + e, keep);
+            mask(1 + NM * t + e, keep);
 #endif
         }
     }
+#ifdef BA_SLIDE
+    // the window starts: chunks lo_min / 32 + e (slice 0's chunks e), row group i keeps [lo_r - 32 c, 32)
+    for (uint32_t e = 0; e < 2; ++e) {
+        const uint32_t c = lo_min / 32 + e;
+        if (s != 0 || c >= sl.c_hi || c >= sl.c_block) {
+            continue;
+        }
+        for (uint32_t t = 0; t < TC; ++t) {
+            for (uint32_t i = 0; i < 4; ++i) {
+                const uint32_t lo = lo_of(4 * (t0 + t) + i);
+                const uint32_t a = lo <= c * 32 ? 0 : (lo - c * 32 > 32 ? 32 : lo - c * 32);
+                for (uint32_t f = 0; f < 2; ++f) {
+                    noc_async_read(
+                        lib + ((a * 33 + 32) * 2 + f) * 256, aux + (1 + NM * t + 2 + e) * tile + rows8(i, f), 256);
+                }
+            }
+        }
+    }
+#endif
 #ifdef BA_UNIFORM
     // the window's first chunk (slice 0's chunk 0) when it is not the last: keep [lo % 32, 32)
     if (s == 0 && (lo % 32) && lo / 32 != hi / 32) {
         const uint32_t keep32[4] = {32, 32, 32, 32};
         for (uint32_t t = 0; t < TC; ++t) {
-            mask(1 + 2 * t + 1, keep32, lo % 32);
+            mask(1 + NM * t + 1, keep32, lo % 32);
         }
     }
 #endif
     if (has_sink && s == 0) {
         const uint32_t keep1[4] = {1, 1, 1, 1};
-        mask(1 + 2 * TC, keep1);
+        mask(1 + NM * TC, keep1);
     }
     noc_async_read_barrier();  // the zero fill / sink / masks
     // scaler: 1.0 in row 0 of each face (BF16)

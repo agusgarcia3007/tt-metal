@@ -72,7 +72,7 @@ def test_block_attn(mesh_device, device_params):
     shared = SharedKVAttention(mesh_device, v.M, v.nq, v.nkv, v.hd, page_table, 64, None, ttnn.L1_MEMORY_CONFIG)
     shared.prepare([k_cache, v_cache], [sinks])
     shared.load_q(v.q)  # the packed Q (the verify QKV writes it with spec_tt)
-    bas, unis = {}, {}
+    bas, unis, slides = {}, {}, {}
     for cfg in CFGS:
         S, G, mc = cfg[:3]
         tc = cfg[3] if len(cfg) > 3 else 2
@@ -81,6 +81,18 @@ def test_block_attn(mesh_device, device_params):
         bas[f"S{S}G{G}m{mc}t{tc}"] = BlockAttention(
             mesh_device, v.M, v.nq, v.nkv, v.hd, 64, free_cores(mesh_device, set(), n), S
         )
+        if os.environ.get("BA_SLIDE_W"):  # a sliding-window layer: row r attends its last W positions, sinks
+            slides[f"S{S}G{G}m{mc}t{tc}"] = BlockAttention(
+                mesh_device,
+                v.M,
+                v.nq,
+                v.nkv,
+                v.hd,
+                64,
+                free_cores(mesh_device, set(), n),
+                S,
+                window=int(os.environ["BA_SLIDE_W"]),
+            )
         if os.environ.get("BA_UNI") == "1":  # the drafter's mode: every row attends [0, pos[M - 1]], no sinks
             for w in (0, UNI_W):
                 unis[(f"S{S}G{G}m{mc}t{tc}", w)] = BlockAttention(
@@ -178,6 +190,15 @@ def test_block_attn(mesh_device, device_params):
                 )
             if min(pccs) < 0.999:
                 print("BA rows", [f"{x:.4f}" for x in pccs], flush=True)
+        if slides and href is not None:
+            W = int(os.environ["BA_SLIDE_W"])
+            sref = host_ref(p, window=W)
+            for S, ba in slides.items():
+                ba(shared.q, k_cache, v_cache, v.pos, v.page_table, sinks, scale)
+                shared._copy("SPEC_OUT", (ba.out, shared.out))
+                got = dev0(shared.out).clone()
+                sp = [_pcc(sref[r], got[0, r, :16]) for r in range(v.M)]
+                print(f"BA slide pos={p} {S} window={W}: vs host min {min(sp):.5f}", flush=True)
         if unis and href is not None:
             urefs = {w: host_ref(p, uniform=True, window=w) for w in (0, UNI_W)}
             for (S, w), ba in unis.items():

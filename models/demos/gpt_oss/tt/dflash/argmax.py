@@ -6,6 +6,8 @@
 final merge on every device that writes either the verify block [last token, 7 drafts] (kind 0: drafts go straight
 from the drafter to the verify pass) or [block, 8 target argmaxes] (kind 1: the host's single read per round)."""
 
+import os
+
 import torch
 
 import ttnn
@@ -38,6 +40,33 @@ class ArgmaxGather:
         )
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(CORE, CORE)])
         self.coords = [ttnn.MeshCoordinate(0, c) for c in range(mesh_device.shape[1])]
+        # DFLASH_ARGMAX_FABRIC=1: one program per device, the per-device bests exchanged through the fabric
+        # (fused_decode/kernels/argmax_merge.cpp mode 2 + boundary_sender.cpp) instead of merge, all_gather, merge
+        self.fabric = os.environ.get("DFLASH_ARGMAX_FABRIC", "1") == "1"
+        if self.fabric:
+            self.ring = mesh_device.shape[1]
+            self.slot = 64  # [key, id] x rows (<= 8)
+
+            def on_core(words):
+                mem = ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(self.cores, (1, words), ttnn.ShardOrientation.ROW_MAJOR),
+                )
+                return ttnn.from_torch(
+                    torch.zeros(1, 1, 1, words, dtype=torch.int32),
+                    device=mesh_device,
+                    dtype=ttnn.uint32,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    memory_config=mem,
+                    mesh_mapper=rep,
+                )
+
+            self.payload_buf = on_core(self.slot // 4)
+            self.slots = on_core(self.ring * self.slot // 4)
+            self.recv_sem = ttnn.create_global_semaphore(mesh_device, self.cores, 0)
+            phys = mesh_device.worker_core_from_logical_core(CORE)
+            self.noc_xy = (phys.x, phys.y)
 
     def _kernel(self, ct, rt_args, scratch, defines=None):
         rt = ttnn.RuntimeArgs()
@@ -61,6 +90,8 @@ class ArgmaxGather:
         """lists: the LM head's [1, n_lists * rows * 2] UINT32 lists; tokens_src: kind 0 the drafter's token input
         (element 0 = the block's first token), kind 1 the verify block tokens; out: kind 0 the verify token input
         [1, rows] UINT32, kind 1 a [1, 2 * rows] UINT32 result buffer."""
+        if self.fabric:
+            return self._fabric_call(lists, tokens_src, out, accept, rows_cap)
         rows = self.rows
         lists_page = self.n_lists * rows * 8
         ct0 = [0, rows, self.n_lists, self.kind, 0, lists_page, 4096, 64]
@@ -98,3 +129,75 @@ class ArgmaxGather:
                 defines.append(("ACCEPT_ROWS", str(rows_cap)))
         prog = self._kernel(ct1, rt1, n_dev * 4096 + max(src_page, 64) + 1024, defines)
         ttnn.generic_op(io, prog)
+
+    SEND_SEM = 1  # merge -> sender (same core)
+
+    def _fabric_call(self, lists, tokens_src, out, accept, rows_cap):
+        rows, mesh = self.rows, self.mesh_device
+        lists_page = self.n_lists * rows * 8
+        src_page = tokens_src.shape[-1] * 4
+        out_page = out.shape[-1] * 4
+        ct = [2, rows, self.n_lists, self.kind, 0, lists_page, out_page, src_page]
+        for t in (lists, out, tokens_src):
+            ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+        io = [lists, tokens_src, out, self.payload_buf, self.slots]
+        defines = [("ARGMAX_RING", str(self.ring)), ("ARGMAX_SEND_SEM", str(self.SEND_SEM))]
+        acc_addrs = []
+        if accept is not None:
+            mask_id, ts = accept
+            for t in ts:
+                ct += ttnn.TensorAccessorArgs(t).get_compile_time_args()
+            acc_addrs = [t.buffer_address() for t in ts]
+            io += list(ts)
+            defines += [("ACCEPT", "1"), ("ACCEPT_MASK_ID", str(mask_id))]
+            if rows_cap:
+                defines.append(("ACCEPT_ROWS", str(rows_cap)))
+        scratch = max(lists_page, 64) + src_page + 2048
+        fwd_hops = self.ring // 2
+        bwd_hops = self.ring - 1 - fwd_hops
+        sem_addr = ttnn.get_global_semaphore_address(self.recv_sem)
+        mesh_program = ttnn.MeshProgramDescriptor()
+        for d, coord in enumerate(self.coords):
+            program = self._kernel(
+                ct,
+                [lists.buffer_address(), out.buffer_address(), tokens_src.buffer_address(), d * self.vd]
+                + [self.payload_buf.buffer_address(), self.slots.buffer_address(), sem_addr, d]
+                + acc_addrs,
+                scratch,
+                defines,
+            )
+            program.semaphores = [ttnn.SemaphoreDescriptor(self.SEND_SEM, ttnn.CoreType.WORKER, self.cores, 0)]
+            srt = ttnn.RuntimeArgs()
+            srt[CORE.x][CORE.y] = [
+                self.payload_buf.buffer_address(),
+                self.slots.buffer_address() + d * self.slot,
+                self.noc_xy[0],
+                self.noc_xy[1],
+                sem_addr,
+            ]
+            sender = ttnn.KernelDescriptor(
+                kernel_source=str(KERNEL_DIR / "boundary_sender.cpp"),
+                core_ranges=self.cores,
+                compile_time_args=[self.slot, self.slot, fwd_hops, bwd_hops, 1, self.SEND_SEM, 0, 1, 1, 0, 0],
+                runtime_args=srt,
+                config=ttnn.DataMovementConfigDescriptor(
+                    processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_1
+                ),
+            )
+            program.kernels = list(program.kernels) + [sender]
+            src = mesh.get_fabric_node_id(coord)
+            fabric_args = []
+            for step, hops in ((1, fwd_hops), (-1, bwd_hops)):
+                fabric_args.append(1 if hops > 0 else 0)
+                if hops > 0:
+                    dst = ttnn.MeshCoordinate(coord[0], (coord[1] + step) % self.ring)
+                    fabric_args += ttnn.setup_fabric_connection(
+                        src_fabric_node_id=src,
+                        dst_fabric_node_id=mesh.get_fabric_node_id(dst),
+                        link_idx=0,
+                        program_descriptor=program,
+                        worker_core=CORE,
+                    )
+            program.kernels[len(program.kernels) - 1].runtime_args[CORE.x][CORE.y].extend(fabric_args)
+            mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
+        ttnn.generic_op(io, mesh_program)

@@ -10,6 +10,10 @@
 
 #include "api/dataflow/dataflow_api.h"
 
+#ifndef PREP_SEM_BASE
+#define PREP_SEM_BASE 0
+#endif
+
 void kernel_main() {
     const uint32_t q_out = get_arg_val<uint32_t>(0);
     const uint32_t k_out = get_arg_val<uint32_t>(1);
@@ -37,7 +41,8 @@ void kernel_main() {
     noc_async_write_barrier();
 #ifdef PREP_NOTIFY
     // K shard written: tell the fused KV write (semaphore 0 on its core)
-    noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(2), get_arg_val<uint32_t>(3), get_semaphore(0)), 1);
+    noc_semaphore_inc(
+        get_noc_addr(get_arg_val<uint32_t>(2), get_arg_val<uint32_t>(3), get_semaphore(PREP_SEM_BASE)), 1);
 #endif
     cb_pop_front(cb_qo, 2);
 #ifndef PREP_JOINT

@@ -55,6 +55,12 @@ def test_dflash_isl_windows(mesh_device, device_params):
     pre, post = text.split(mark)
     pre_ids = tokenizer.encode(pre, add_special_tokens=False)
     post_ids = tokenizer.encode(post, add_special_tokens=False)
+    if os.environ.get("DF_PROMPT") == "random":
+        import torch
+
+        # plain decode's ISL sweep prompt (_scratch_isl_sweep.py): the same random token ids
+        ids = torch.randint(1000, 199000, (1, isl), generator=torch.Generator().manual_seed(1234))[0].tolist()
+        pre_ids, post_ids, book_ids = [], [], ids
     n_book = isl - len(pre_ids) - len(post_ids)
     # (the template + question are 165 tokens: a smaller ISL would slice book_ids[:negative], i.e. almost the whole book)
     assert n_book >= 0, f"ISL {isl} < the template + question ({len(pre_ids) + len(post_ids)} tokens)"

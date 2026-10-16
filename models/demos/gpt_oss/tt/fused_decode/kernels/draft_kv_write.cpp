@@ -200,4 +200,17 @@ void kernel_main() {
         }
     }
     noc_async_write_barrier();
+#ifdef KV_NOTIFY_N
+    // fused with the drafter's block attention (dflash/qk_prep.py): this kernel's K or V rows are in the cache;
+    // increment program semaphore KV_NOTIFY_SEM on every attention core (runtime args KV_NOTIFY_ARG..: noc x, y)
+    for (uint32_t i = 0; i < KV_NOTIFY_N; ++i) {
+        noc_semaphore_inc(
+            get_noc_addr(
+                get_arg_val<uint32_t>(KV_NOTIFY_ARG + 2 * i),
+                get_arg_val<uint32_t>(KV_NOTIFY_ARG + 2 * i + 1),
+                get_semaphore(KV_NOTIFY_SEM)),
+            1);
+    }
+    noc_async_atomic_barrier();
+#endif
 }

@@ -14,14 +14,15 @@ CORE = ttnn.CoreCoord(0, 0)
 
 
 class DraftKVWrite:
-    def __init__(self, mesh_device, rows, kv_heads, head_dim, block_size, head_grid_x=8):
+    def __init__(self, mesh_device, rows, kv_heads, head_dim, block_size, head_grid_x=8, core_offset=(0, 0)):
         """rows: rows written per call (row r of the K / V head tensors: user r, sharded one user per core on a
         head_grid_x-wide row-major grid)."""
         self.mesh_device = mesh_device
         self.rows, self.kv_heads, self.head_tiles, self.block = rows, kv_heads, head_dim // TILE, block_size
         self.coords = []
         for r in range(rows):
-            p = mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(r % head_grid_x, r // head_grid_x))
+            x0, y0 = core_offset
+            p = mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(x0 + r % head_grid_x, y0 + r // head_grid_x))
             self.coords += [p.x, p.y]
         self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(CORE, CORE)])
         self.scratch = 512 + (2 * rows * self.head_tiles + 4 * kv_heads * self.head_tiles) * 2048
@@ -42,7 +43,19 @@ class DraftKVWrite:
         ttnn.generic_op(io, program)
 
     def parts(
-        self, k, v, k_cache, v_cache, pos, page_table, head_offset=0, core=CORE, cb_id=0, wait=None, more_caches=()
+        self,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        pos,
+        page_table,
+        head_offset=0,
+        core=CORE,
+        cb_id=0,
+        wait=None,
+        more_caches=(),
+        notify=None,
     ):
         """(kernels, cbs) of the write on `core`; wait = (first semaphore id, count): the K / V kernel first waits for
         `count` increments of semaphore id / id + 1 (fused after the producer of k / v, dflash/qk_prep.py)."""
@@ -63,6 +76,14 @@ class DraftKVWrite:
         extra = [] if wait is None else [("KV_WAIT_SEM", str(wait[0])), ("KV_WAIT_N", str(wait[1]))]
         if more_caches:
             extra.append(("KV_LAYERS", str(1 + len(more_caches))))
+        if notify is not None:  # (noc cores, semaphore id): both K and V kernels signal each core once written
+            n_args = len(rt[core.x][core.y])
+            rt[core.x][core.y] = list(rt[core.x][core.y]) + [v_ for p in notify[0] for v_ in (p.x, p.y)]
+            extra += [
+                ("KV_NOTIFY_N", str(len(notify[0]))),
+                ("KV_NOTIFY_SEM", str(notify[1])),
+                ("KV_NOTIFY_ARG", str(n_args)),
+            ]
         # K on BRISC / NOC0 and V on NCRISC / NOC1 of the same core, in parallel
         kernels = [
             ttnn.KernelDescriptor(

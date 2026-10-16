@@ -12,6 +12,10 @@
 
 #include "api/dataflow/dataflow_api.h"
 
+#ifndef PREP_SEM_BASE
+#define PREP_SEM_BASE 0  // the fused KV write's semaphores: PREP_SEM_BASE (K shards), + 1 (V shards)
+#endif
+
 void kernel_main() {
     const uint32_t q_addr = get_arg_val<uint32_t>(0);
     const uint32_t k_addr = get_arg_val<uint32_t>(1);
@@ -54,6 +58,11 @@ void kernel_main() {
     cb_reserve_back(cb_scr, 1);
     const uint32_t scr = get_write_ptr(cb_scr);
     noc_async_read(s_rp.get_noc_addr(0), scr, 128);
+#ifdef PREP_WAIT_SEM
+    // fused after the drafter's QKV (dflash/fused_draft.py): q / k / v are written once its PREP_WAIT_N writers have
+    // incremented program semaphore PREP_WAIT_SEM
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(PREP_WAIT_SEM)), PREP_WAIT_N);
+#endif
     cb_reserve_back(cb_q, 2);
     cb_reserve_back(cb_k, 2);
     for (uint32_t d = 0; d < 2; ++d) {
@@ -112,7 +121,8 @@ void kernel_main() {
     invalidate_l1_cache();
 #ifdef PREP_NOTIFY
     // V shard written: tell the fused KV write (semaphore 1 on its core)
-    noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(10), get_arg_val<uint32_t>(11), get_semaphore(1)), 1);
+    noc_semaphore_inc(
+        get_noc_addr(get_arg_val<uint32_t>(10), get_arg_val<uint32_t>(11), get_semaphore(PREP_SEM_BASE + 1)), 1);
 #endif
     volatile tt_l1_ptr uint32_t* sc = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scl);
     for (uint32_t f = 0; f < 4; ++f) {

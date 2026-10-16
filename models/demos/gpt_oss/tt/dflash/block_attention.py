@@ -56,14 +56,14 @@ class BlockAttention:
         """cores: cores_needed(n_kv, rows, slices) logical cores: (kv head g, tile group q, slice s) = cores[(g Tq + q)
         slices + s], each tile group (BA_TPC packed Q tiles per core, Tq = Tt / BA_TPC groups) with its own slices and
         merge tree. uniform: every row attends [0, pos[M - 1]] (the drafter's block: no causal mask inside it), no
-        sinks; window (uniform only): the rows attend the last `window` positions [pos[M - 1] + 1 - window, pos[M - 1]].
+        sinks; window: uniform, the rows attend the last `window` positions [pos[M - 1] + 1 - window, pos[M - 1]]; else
+        a sliding-window layer, row r attends [pos[r] + 1 - window, pos[r]].
         q_rows: q comes in the rows layout [1, M, heads, 64] (the reader gathers the packed tiles: no repacking op).
         """
         assert head_dim == 64 and n_heads // n_kv == 8 and rows % 4 == 0
         self.mesh, self.M, self.nq, self.nkv, self.hd = mesh_device, rows, n_heads, n_kv, head_dim
         self.block, self.S, self.Tt = block_size, slices, rows // 4
         self.uniform, self.window, self.q_rows = uniform, window, q_rows
-        assert not window or uniform
         self.TC = self.tiles_per_core(rows)
         self.Tq = self.Tt // self.TC
         # BA_SHARE=1 (2 tile groups): one DRAM read of each K / V group per (kv head, slice), the partner copies it
@@ -162,7 +162,7 @@ class BlockAttention:
             cb(cb_q, bf16, 2048, 2 * Tt),
             cb(cb_k, kv_dtype, kv_tile, 2 * G * cap),
             cb(cb_v, kv_dtype, kv_tile, 2 * G * cap),
-            cb(cb_aux, bf16, 2048, 2 * Tt + 4),
+            cb(cb_aux, bf16, 2048, (4 if self.window and not self.uniform else 2) * Tt + 4),
             cb(cb_scr, bf16, 256 + max(pt_page, 64), 1),
             cb(cb_qs, bf16, 2048, 2 * Tt),
             cb(cb_s, f32, 4096, Tt * (G + 1)),
@@ -233,8 +233,8 @@ class BlockAttention:
             defines.append(("BA_UNIFORM", "1"))
         if self.q_rows:
             defines.append(("BA_Q_ROWS", "1"))
-        if self.window:
-            defines.append(("BA_WINDOW", str(self.window)))
+        if self.window:  # uniform: one window for all rows; else per row (a sliding-window layer)
+            defines.append(("BA_WINDOW" if self.uniform else "BA_SLIDE", str(self.window)))
         dm = ttnn.DataMovementConfigDescriptor
         kernels = [
             ttnn.KernelDescriptor(
@@ -260,7 +260,7 @@ class BlockAttention:
                 core_ranges=self.cores,
                 compile_time_args=compute_ct,
                 runtime_args=[],
-                defines=[(k, v) for k, v in defines if k in ("BA_TPC", "BA_UNIFORM", "BA_WINDOW")]
+                defines=[(k, v) for k, v in defines if k in ("BA_TPC", "BA_UNIFORM", "BA_WINDOW", "BA_SLIDE")]
                 + ([("BA_PROF", "1")] if os.environ.get("BA_PROF") == "1" else [])
                 + ([("BA_ABLATE", os.environ["BA_ABLATE"])] if os.environ.get("BA_ABLATE") else []),
                 config=ttnn.ComputeConfigDescriptor(
