@@ -160,6 +160,16 @@ void kernel_main() {
         DeviceZoneScopedN("BND_C3_XWAIT");
         cb_wait_front(cb_xchg, helpers);
     }
+#ifdef BND_PV_ACC
+    // BND_PV_ACC: s = sum_h P v_h accumulated in DST by the matmul (no separate sum + pack / unpack of the v tiles)
+    cb_wait_front(cb_p, 1);
+    cfg(cb_xchg, cb_p, cb_rs);
+    tile_regs_acquire();
+    matmul_init(cb_p, cb_xchg);
+    for (uint32_t h = 0; h < helpers; ++h) {
+        matmul_tiles(cb_p, cb_xchg, 0, h, 0);
+    }
+#else
     cfg(cb_xchg, cb_xchg, cb_rsum);
     tile_regs_acquire();
     if constexpr (helpers == 1) {
@@ -189,6 +199,7 @@ void kernel_main() {
     tile_regs_acquire();
     matmul_init(cb_p, cb_rsum);
     matmul_tiles(cb_p, cb_rsum, 0, 0, 0);
+#endif
     binop_with_scalar_tile_init();
     MATH(SFPU_UNARY_CALL(
         DST_SYNC_MODE,
@@ -215,7 +226,11 @@ void kernel_main() {
     pack_tile(0, cb_rs);
     tile_regs_release();
     cb_push_back(cb_rs, 1);
+#ifdef BND_PV_ACC
+    cb_pop_front(cb_xchg, helpers);
+#else
     cb_pop_front(cb_rsum, 1);
+#endif
     cb_pop_front(cb_p, 1);
 
     cb_wait_front(cb_rs, 1);

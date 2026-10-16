@@ -526,6 +526,8 @@ class DecodeBoundary:
                     core_ranges=hc,
                     compile_time_args=compute_ct,
                     runtime_args=[],
+                    # DFLASH_BND_PV_ACC=1: the helpers' sums of squares reduced by the P matmul accumulating in DST
+                    defines=[("BND_PV_ACC", "1")] if os.environ.get("DFLASH_BND_PV_ACC", "0") == "1" else [],
                     config=ttnn.ComputeConfigDescriptor(
                         math_fidelity=ttnn.MathFidelity.HiFi2, fp32_dest_acc_en=True, math_approx_mode=False
                     ),

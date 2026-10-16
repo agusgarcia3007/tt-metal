@@ -105,8 +105,15 @@ class MoEFused:
                 from ..fused_decode.stream import row_placement
 
                 rp = row_placement(mesh_device, gate_up_readers + down_readers, exclude=taken, coord=coord)
-                gp = [(rp[b][r], b, r) for b in sorted(rp) for r in range(gate_up_readers)]
-                dp = [(rp[b][gate_up_readers + r], b, r) for b in sorted(rp) for r in range(down_readers)]
+                if os.environ.get("DFLASH_ROW_ALT", "0") == "1":  # gate|up / down alternate along the row
+                    n = gate_up_readers + down_readers
+                    g_idx = [i for i in range(n) if i % 2 == 0][:gate_up_readers]
+                    d_idx = [i for i in range(n) if i not in g_idx][:down_readers]
+                else:
+                    g_idx = list(range(gate_up_readers))
+                    d_idx = list(range(gate_up_readers, gate_up_readers + down_readers))
+                gp = [(rp[b][i], b, r) for b in sorted(rp) for r, i in enumerate(g_idx)]
+                dp = [(rp[b][i], b, r) for b in sorted(rp) for r, i in enumerate(d_idx)]
             gu = ExpertGateUpUnion(
                 mesh_device,
                 hidden,
