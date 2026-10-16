@@ -295,6 +295,7 @@ void kernel_main() {
         noc_async_read_barrier_with_trid(15);
         cb_push_back(cb_q, 2 * TC);
         q_done = true;
+        DeviceTimestampedData("BA_R", 1);  // (profiling: Q read)
     };
     auto q_ready = [&]() {
         invalidate_l1_cache();
@@ -350,13 +351,20 @@ void kernel_main() {
             cb_push_back(cb_k, group_pages);
             cb_push_back(cb_v, group_pages);
             ++pushed;
+            DeviceTimestampedData("BA_R", 200 + pushed);  // (profiling: partner group pushed)
             noc_semaphore_inc(get_noc_addr(pnx, pny, get_semaphore(BA_COPY_SEM)), 1);
         }
         issued = n_groups;
     }
 #endif
     while (pushed < n_groups) {
+#ifdef BA_CAP0
+        // before Q: at most BA_CAP0 groups in flight (the QKV weights and every core's first group land sooner)
+        while (issued < n_groups && issued - pushed < (q_done ? cap_groups : BA_CAP0) &&
+               (q_done || old_group(issued)) &&
+#else
         while (issued < n_groups && issued - pushed < cap_groups && (q_done || old_group(issued)) &&
+#endif
 #ifdef BA_SHARE
                slot_free(issued) &&
 #endif
@@ -373,6 +381,7 @@ void kernel_main() {
             cb_push_back(cb_k, group_pages);
             cb_push_back(cb_v, group_pages);
             ++pushed;
+            DeviceTimestampedData("BA_R", 100 + pushed);  // (profiling: group pushed)
 #ifdef BA_SHARE
             noc_semaphore_inc(get_noc_addr(pnx, pny, get_semaphore(BA_LAND_SEM)), 1);  // the partner may copy it
 #endif

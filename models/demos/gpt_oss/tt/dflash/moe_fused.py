@@ -32,6 +32,11 @@ MOE = [("MOE_FUSED", "1")]
 STEAL = os.environ.get("DFLASH_MOE_STEAL", "0") == "1"
 if STEAL:
     MOE += [("MOE_STEAL", "1")]
+# DFLASH_MOE_LOCKSTEP=L: gate|up readers of a bank issue their streamed columns at most L apart
+# (kernels/stream_gate_up_union_reader.cpp). Off: the MoE took 2-3 us longer per layer (L = 1, 2)
+LOCKSTEP = os.environ.get("DFLASH_MOE_LOCKSTEP", "")
+if LOCKSTEP and not STEAL:
+    MOE += [("MOE_LOCKSTEP", LOCKSTEP)]
 # DFLASH_VERIFY_ROWS=R (< block): only the first R block rows are verified (route to experts; the accept count is
 # capped at R): the union of experts, and with it the MoE's weight traffic, covers R rows (0: all rows)
 VERIFY_ROWS = int(os.environ.get("DFLASH_VERIFY_ROWS", "0"))
@@ -194,7 +199,7 @@ class MoEFused:
             sems.append(ttnn.SemaphoreDescriptor(3, ttnn.CoreType.WORKER, self.R, 0))
         if P:
             sems.append(ttnn.SemaphoreDescriptor(4, ttnn.CoreType.WORKER, self.R, 0))
-        if STEAL:  # gate|up progress (7) and per-mate claims (8 + reader index)
+        if STEAL or LOCKSTEP:  # gate|up progress (7) and per-mate claims / issued columns (8 + reader index)
             sems += [
                 ttnn.SemaphoreDescriptor(i, ttnn.CoreType.WORKER, self.G_all, 0)
                 for i in range(7, 8 + self.gate_up.readers)
@@ -303,7 +308,8 @@ class DenseMLPFused:
             skip_pad=real_hidden,
         )
         self.G, self.D = self.gate_up.cores, self.down.cores
-        moe = [d for d in MOE if d[0] != "MOE_STEAL"]  # (stealing needs the router's done flags)
+        # (stealing needs the router's done flags; lockstep the bank-mate semaphores of MoEFused)
+        moe = [d for d in MOE if d[0] not in ("MOE_STEAL", "MOE_LOCKSTEP")]
         self.defines = moe + [("MOE_NO_ROUTER", "1"), ("MOE_CTR_SEM", str(self.CTR_SEM))]
 
     def __call__(self, pending, union, weights, gate_up_ws, act, down_ws, partial):

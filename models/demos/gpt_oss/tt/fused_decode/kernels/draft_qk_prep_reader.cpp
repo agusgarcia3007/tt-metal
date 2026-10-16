@@ -71,6 +71,7 @@ void kernel_main() {
     }
     noc_async_read_barrier();
     invalidate_l1_cache();
+    DeviceTimestampedData("PREP_T", 1);  // (profiling: q / k read)
 #ifdef PREP_JOINT
     // q and k in one tile: k's head rows 0 .. NKV - 1 -> rows NQ .. NQ + NKV - 1 of the q tile (NQ + NKV <= 16: faces
     // 0 / 1, 32 bytes per face row); compute normalizes and rotates both at once (per-row weights)
@@ -119,6 +120,7 @@ void kernel_main() {
     noc_async_read(s_t.get_noc_addr(0), get_write_ptr(cb_t), tile);
     noc_async_read_barrier();
     invalidate_l1_cache();
+    DeviceTimestampedData("PREP_T", 2);  // (profiling: every input read)
 #ifdef PREP_NOTIFY
     // V shard written: tell the fused KV write (semaphore 1 on its core)
     noc_semaphore_inc(

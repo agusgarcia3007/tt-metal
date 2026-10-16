@@ -20,9 +20,18 @@
 #include "api/compute/eltwise_unary/rsqrt.h"
 #include "api/compute/matmul.h"
 #include "api/compute/pack.h"
+#include "api/compute/reconfig_data_format.h"
 #include "api/compute/reduce.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/debug/kernel_profiler.hpp"
+
+namespace {
+// operand / output formats for the next op (the full hardware startup runs once, at the start)
+inline void cfg(uint32_t a, uint32_t b, uint32_t out) {
+    reconfig_data_format(a, b);
+    pack_reconfig_data_format(out);
+}
+}  // namespace
 
 void kernel_main() {
     constexpr uint32_t cb_res = get_compile_time_arg_val(0);
@@ -95,8 +104,37 @@ void kernel_main() {
         cb_pop_front(cb_recv, slots * PH);
     }
 
-    // 2. y, q, v
+    // 2. q, v (the writer sends v to every helper), then y while the other helpers' v arrive
     cb_wait_front(cb_res_out, PH);
+    tile_regs_acquire();
+    mul_init(cb_res_out, cb_res_out);
+    for (uint32_t p = 0; p < PH; ++p) {
+        mul_tiles(cb_res_out, cb_res_out, p, p, 0);  // ELWMUL accumulates into DST 0
+    }
+    tile_regs_commit();
+    cb_reserve_back(cb_sq, 1);
+    tile_regs_wait();
+    pack_reconfig_data_format(cb_sq);
+    pack_tile(0, cb_sq);
+    tile_regs_release();
+    cb_push_back(cb_sq, 1);
+
+    cb_wait_front(cb_sq, 1);
+    cb_wait_front(cb_scaler, 1);
+    cfg(cb_scaler, cb_sq, cb_v);
+    tile_regs_acquire();
+    reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scaler, cb_v);
+    reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scaler, 0, 0, 0);
+    reduce_uninit(cb_sq);
+    tile_regs_commit();
+    cb_reserve_back(cb_v, 1);
+    tile_regs_wait();
+    pack_tile(0, cb_v);
+    tile_regs_release();
+    cb_push_back(cb_v, 1);
+    cb_pop_front(cb_sq, 1);
+    cb_pop_front(cb_scaler, 1);
+    cfg(cb_res_out, cb_gamma, cb_y);
     cb_wait_front(cb_gamma, PH);
     cb_reserve_back(cb_y, PH);
     for (uint32_t p0 = 0; p0 < PH; p0 += step) {
@@ -116,38 +154,10 @@ void kernel_main() {
     }
     cb_push_back(cb_y, PH);
     cb_pop_front(cb_gamma, PH);
-    tile_regs_acquire();
-    mul_init(cb_res_out, cb_res_out);
-    for (uint32_t p = 0; p < PH; ++p) {
-        mul_tiles(cb_res_out, cb_res_out, p, p, 0);  // ELWMUL accumulates into DST 0
-    }
-    tile_regs_commit();
-    cb_reserve_back(cb_sq, 1);
-    tile_regs_wait();
-    pack_reconfig_data_format(cb_sq);
-    pack_tile(0, cb_sq);
-    tile_regs_release();
-    cb_push_back(cb_sq, 1);
-
-    cb_wait_front(cb_sq, 1);
-    cb_wait_front(cb_scaler, 1);
-    compute_kernel_hw_startup(cb_scaler, cb_sq, cb_v);
-    tile_regs_acquire();
-    reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scaler, cb_v);
-    reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scaler, 0, 0, 0);
-    reduce_uninit(cb_sq);
-    tile_regs_commit();
-    cb_reserve_back(cb_v, 1);
-    tile_regs_wait();
-    pack_tile(0, cb_v);
-    tile_regs_release();
-    cb_push_back(cb_v, 1);
-    cb_pop_front(cb_sq, 1);
-    cb_pop_front(cb_scaler, 1);
 
     // 3. sum of the helpers' v (helper order) -> s = P v -> rs -> x
     cb_wait_front(cb_xchg, helpers);
-    compute_kernel_hw_startup(cb_xchg, cb_xchg, cb_rsum);
+    cfg(cb_xchg, cb_xchg, cb_rsum);
     tile_regs_acquire();
     if constexpr (helpers == 1) {
         copy_init(cb_xchg);
@@ -172,7 +182,7 @@ void kernel_main() {
 
     cb_wait_front(cb_p, 1);
     cb_wait_front(cb_rsum, 1);
-    compute_kernel_hw_startup(cb_rsum, cb_p, cb_rs);
+    cfg(cb_rsum, cb_p, cb_rs);
     tile_regs_acquire();
     matmul_init(cb_p, cb_rsum);
     matmul_tiles(cb_p, cb_rsum, 0, 0, 0);
@@ -208,7 +218,7 @@ void kernel_main() {
     cb_wait_front(cb_rs, 1);
     cb_wait_front(cb_y, PH);
     cb_reserve_back(cb_x, PH);
-    compute_kernel_hw_startup(cb_y, cb_rs, cb_x);
+    cfg(cb_y, cb_rs, cb_x);
     for (uint32_t p0 = 0; p0 < PH; p0 += step) {
         const uint32_t n = PH - p0 < step ? PH - p0 : step;
         tile_regs_acquire();

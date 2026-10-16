@@ -229,6 +229,8 @@ class BlockAttention:
         defines += [("BA_NIDX", str(len(idx_words))), ("BA_CB_POS", str(cb_scr2))]
         if self.share:
             defines += [("BA_SHARE", "1"), ("BA_LAND_SEM", str(LAND_SEM)), ("BA_COPY_SEM", str(COPY_SEM))]
+        if os.environ.get("DFLASH_BA_CAP0"):  # groups in flight before Q (kernels/ba_reader.cpp)
+            defines.append(("BA_CAP0", os.environ["DFLASH_BA_CAP0"]))
         if self.uniform:
             defines.append(("BA_UNIFORM", "1"))
         if self.q_rows:

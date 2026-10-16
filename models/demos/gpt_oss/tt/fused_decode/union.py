@@ -176,6 +176,7 @@ class ExpertGateUpUnion(_BankStreamOp):
         if pred_p:
             cbs.append(self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * 2 * self.pairs * self.kt))
         steal = any(d[0] == "MOE_STEAL" for d in (extra_defines or []))
+        lockstep = any(d[0] == "MOE_LOCKSTEP" for d in (extra_defines or []))
         if steal:  # work stealing (kernels/stream_gate_up_union_reader.cpp): the reader's task queue (cb 8)
             assert pred_p and act.shape[-1] == TILE * M, "stealing assumes MOE_PRED and the spread act layout"
             cbs.append(self._cb(8, ttnn.uint32, 32, 2 * MAX_EXPERTS + 4))
@@ -197,7 +198,7 @@ class ExpertGateUpUnion(_BankStreamOp):
                 union.buffer_address(),
                 ident.buffer_address(),
             ] + list(extra_writer_rt or [])
-            if steal:  # [my reader index, mates, (noc x, noc y, reader index) per bank-mate]
+            if steal or lockstep:  # [my reader index, mates, (noc x, noc y, reader index) per bank-mate]
                 mates = [(c, r2) for c, b2, r2, _ in self.assignments if b2 == bank and r2 != r]
                 if os.environ.get("DFLASH_STEAL_MATES", "1") == "0":  # debugging: the task / flag path, no steals
                     mates = []
@@ -206,7 +207,8 @@ class ExpertGateUpUnion(_BankStreamOp):
                     p = self.mesh_device.worker_core_from_logical_core(c)
                     rt += [p.x, p.y, r2]
                 reader_rt[core.x][core.y] = list(reader_rt[core.x][core.y]) + rt
-                writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [r]
+                if steal:
+                    writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [r]
         reader_ct = [cb_w, cb_idx, self.kt, 2 * self.pairs, self.expert_stride, self.tile_bytes, self.page_bytes]
         reader_ct += ttnn.TensorAccessorArgs(union).get_compile_time_args()
         act_page = self.inter_pad // TILE * tiny

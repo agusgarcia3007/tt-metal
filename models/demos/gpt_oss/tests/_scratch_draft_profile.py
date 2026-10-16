@@ -49,9 +49,18 @@ def test_draft_profile(mesh_device, device_params):
     draft._draft_device()
     draft._context_device()
     ttnn.synchronize_device(mesh_device)
+    traced = os.environ.get("DP_TRACED", "1") == "1"  # the draft pass replayed from a trace (as the rounds run it)
+    if traced:
+        tid = ttnn.begin_trace_capture(mesh_device, cq_id=0)
+        draft._draft_device()
+        ttnn.end_trace_capture(mesh_device, tid, cq_id=0)
+        ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=True)
     signpost("start")
     for _ in range(2):
-        draft._draft_device()
+        if traced:
+            ttnn.execute_trace(mesh_device, tid, cq_id=0, blocking=False)
+        else:
+            draft._draft_device()
     ttnn.synchronize_device(mesh_device)
     signpost("stop")
     signpost("start")

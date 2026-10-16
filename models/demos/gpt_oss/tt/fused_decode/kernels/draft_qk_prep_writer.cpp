@@ -21,6 +21,7 @@ void kernel_main() {
     constexpr uint32_t cb_ko = get_compile_time_arg_val(1);
     constexpr uint32_t tile = 2048;
     cb_wait_front(cb_qo, 2);
+    DeviceTimestampedData("PREP_T", 3);  // (profiling: q / k computed)
     noc_async_write(get_read_ptr(cb_qo), get_noc_addr(q_out), 2 * tile);
 #ifdef PREP_JOINT
     // the joint tile's k rows NQ .. NQ + NKV - 1 -> rows 0 .. NKV - 1 of the K shard (faces 0 / 1, 32 bytes each)
@@ -39,6 +40,7 @@ void kernel_main() {
     noc_async_write(get_read_ptr(cb_ko), get_noc_addr(k_out), 2 * tile);
 #endif
     noc_async_write_barrier();
+    DeviceTimestampedData("PREP_T", 4);  // (profiling: q / k written)
 #ifdef PREP_NOTIFY
     // K shard written: tell the fused KV write (semaphore 0 on its core)
     noc_semaphore_inc(

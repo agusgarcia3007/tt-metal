@@ -106,9 +106,28 @@ void kernel_main() {
     uint32_t trid = 1;
     uint32_t trid_to_wait = 1;
     uint32_t issued = 0;
+#ifdef MOE_LOCKSTEP
+    // Bank-mate lockstep (dflash/moe_fused.py DFLASH_MOE_LOCKSTEP = L): a reader issues its next streamed column only
+    // while no bank-mate has issued more than L fewer (program semaphore 8 + r: columns issued by the mate with reader
+    // index r, incremented by that mate): the bank's request queue then holds every reader's columns in step, and the
+    // one with the slowest NOC path is not left behind. Counting issued (not landed) columns cannot deadlock.
+    // runtime args 8..: [my reader index, mates, (noc x, noc y, reader index) per mate]
+    const uint32_t ls_r = get_arg_val<uint32_t>(8);
+    const uint32_t ls_n = get_arg_val<uint32_t>(9);
+    uint32_t ls_issued = 0;
+#endif
     // one task: the `cols` columns of one expert starting at src (bytes in this bank)
     auto issue = [&](uint32_t src) __attribute__((always_inline)) {
         for (uint32_t c = 0; c < cols; ++c) {
+#ifdef MOE_LOCKSTEP
+            for (uint32_t j = 0; j < ls_n; ++j) {
+                volatile tt_l1_ptr uint32_t* m = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                    get_semaphore(8 + get_arg_val<uint32_t>(12 + 3 * j)));
+                while (m[0] + MOE_LOCKSTEP < ls_issued) {
+                    invalidate_l1_cache();
+                }
+            }
+#endif
             noc_async_read_set_trid(trid);
             for (uint32_t p = 0; p < full_pkts; ++p) {
                 noc_async_read_one_packet_with_state_with_trid(w_base, src, l1_write, trid);
@@ -123,6 +142,15 @@ void kernel_main() {
                 l1_write += tail;
             }
             ++issued;
+#ifdef MOE_LOCKSTEP
+            ++ls_issued;
+            for (uint32_t j = 0; j < ls_n; ++j) {
+                noc_semaphore_inc(
+                    get_noc_addr(
+                        get_arg_val<uint32_t>(10 + 3 * j), get_arg_val<uint32_t>(11 + 3 * j), get_semaphore(8 + ls_r)),
+                    1);
+            }
+#endif
             if (free_blocks == num_buffers - extra_in_flight) {
                 noc_async_read_barrier_with_trid(trid_to_wait);
                 cb_push_back(cb_w, kt);
@@ -233,4 +261,7 @@ void kernel_main() {
         cb_push_back(cb_w, kt);
         trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
     }
+#ifdef MOE_LOCKSTEP
+    noc_async_atomic_barrier();
+#endif
 }

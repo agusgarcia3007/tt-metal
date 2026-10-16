@@ -17,8 +17,21 @@
 #include "api/compute/eltwise_unary/rsqrt.h"
 #include "api/compute/matmul.h"
 #include "api/compute/pack.h"
+#include "api/compute/reconfig_data_format.h"
 #include "api/compute/reduce.h"
 #include "api/compute/tile_move_copy.h"
+
+namespace {
+// operand / output formats for the next op (the full hardware startup runs once, at the start)
+inline void cfg(uint32_t a, uint32_t b, uint32_t out) {
+#ifdef PREP_FULL_STARTUP
+    compute_kernel_hw_startup(a, b, out);
+#else
+    reconfig_data_format(a, b);
+    pack_reconfig_data_format(out);
+#endif
+}
+}  // namespace
 
 void kernel_main() {
     constexpr uint32_t cb_q = get_compile_time_arg_val(0);
@@ -48,7 +61,11 @@ void kernel_main() {
     for (uint32_t x = 0; x < n_x; ++x) {
         const uint32_t cb_x = x == 0 ? cb_q : cb_k;
         cb_wait_front(cb_x, 2);
-        compute_kernel_hw_startup(cb_x, cb_x, cb_sq);
+        if (x == 0) {
+            compute_kernel_hw_startup(cb_x, cb_x, cb_sq);
+        } else {
+            cfg(cb_x, cb_x, cb_sq);
+        }
         tile_regs_acquire();
         mul_init(cb_x, cb_x);
         mul_tiles(cb_x, cb_x, 0, 0, 0);
@@ -63,7 +80,7 @@ void kernel_main() {
         tile_regs_release();
         cb_push_back(cb_sq, 1);
         cb_wait_front(cb_sq, 1);
-        compute_kernel_hw_startup(cb_scl, cb_sq, cb_rs);  // REDUCE_ROW: scaler to SrcA, data to SrcB
+        cfg(cb_scl, cb_sq, cb_rs);  // REDUCE_ROW: scaler to SrcA, data to SrcB
         tile_regs_acquire();
         reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scl, cb_rs);
         reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_sq, cb_scl, 0, 0, 0);
@@ -91,67 +108,79 @@ void kernel_main() {
         const uint32_t cb_x = x == 0 ? cb_q : cb_k;
         const uint32_t cb_o = x == 0 ? cb_qo : cb_ko;
         cb_reserve_back(cb_o, 2);
+        // both 32-column tiles d = 0, 1 per step (DST 0, 1)
+        cfg(cb_x, cb_rs, cb_t1);
+        tile_regs_acquire();
+        mul_bcast_cols_init(cb_x, cb_rs);
         for (uint32_t d = 0; d < 2; ++d) {
-            compute_kernel_hw_startup(cb_x, cb_rs, cb_t1);
-            tile_regs_acquire();
-            mul_bcast_cols_init(cb_x, cb_rs);
-            mul_tiles_bcast_cols(cb_x, cb_rs, d, x, 0);
-            tile_regs_commit();
-            cb_reserve_back(cb_t1, 1);
-            tile_regs_wait();
-            pack_reconfig_data_format(cb_t1);
-            pack_tile(0, cb_t1);
-            tile_regs_release();
-            cb_push_back(cb_t1, 1);
-
-            cb_wait_front(cb_t1, 1);
-            compute_kernel_hw_startup(cb_t1, cb_g, cb_xn);
-            tile_regs_acquire();
-#ifdef PREP_JOINT
-            mul_init(cb_t1, cb_g);
-            mul_tiles(cb_t1, cb_g, 0, d, 0);  // per-row weights (q rows, then k rows)
-#else
-            mul_bcast_rows_init(cb_t1, cb_g);
-            mul_tiles_bcast_rows(cb_t1, cb_g, 0, 2 * x + d, 0);
-#endif
-            tile_regs_commit();
-            cb_reserve_back(cb_xn, 1);
-            tile_regs_wait();
-            pack_reconfig_data_format(cb_xn);
-            pack_tile(0, cb_xn);
-            tile_regs_release();
-            cb_push_back(cb_xn, 1);
-            cb_pop_front(cb_t1, 1);
-
-            cb_wait_front(cb_xn, 1);
-            compute_kernel_hw_startup(cb_t, cb_xn, cb_t2);  // matmul: in1 to SrcA, in0 to SrcB
-            tile_regs_acquire();
-            matmul_init(cb_xn, cb_t, 0);
-            matmul_tiles(cb_xn, cb_t, 0, 0, 0);
-            tile_regs_commit();
-            cb_reserve_back(cb_t2, 1);
-            tile_regs_wait();
-            pack_reconfig_data_format(cb_t2);
-            pack_tile(0, cb_t2);
-            tile_regs_release();
-            cb_push_back(cb_t2, 1);
-
-            cb_wait_front(cb_t2, 1);
-            compute_kernel_hw_startup(cb_t2, cb_cs, cb_o);
-            tile_regs_acquire();
-            mul_bcast_rows_init(cb_t2, cb_cs);
-            mul_tiles_bcast_rows(cb_t2, cb_cs, 0, 2 + d, 0);  // (x . T) * sin
-            mul_tiles_bcast_rows(cb_xn, cb_cs, 0, d, 1);      // x * cos
-            add_binary_tile_init();
-            add_binary_tile(0, 1, 0);
-            tile_regs_commit();
-            tile_regs_wait();
-            pack_reconfig_data_format(cb_o);
-            pack_tile<true>(0, cb_o, d);
-            tile_regs_release();
-            cb_pop_front(cb_t2, 1);
-            cb_pop_front(cb_xn, 1);
+            mul_tiles_bcast_cols(cb_x, cb_rs, d, x, d);
         }
+        tile_regs_commit();
+        cb_reserve_back(cb_t1, 2);
+        tile_regs_wait();
+        pack_tile(0, cb_t1);
+        pack_tile(1, cb_t1);
+        tile_regs_release();
+        cb_push_back(cb_t1, 2);
+
+        cb_wait_front(cb_t1, 2);
+        cfg(cb_t1, cb_g, cb_xn);
+        tile_regs_acquire();
+#ifdef PREP_JOINT
+        mul_init(cb_t1, cb_g);
+        for (uint32_t d = 0; d < 2; ++d) {
+            mul_tiles(cb_t1, cb_g, d, d, d);  // per-row weights (q rows, then k rows)
+        }
+#else
+        mul_bcast_rows_init(cb_t1, cb_g);
+        for (uint32_t d = 0; d < 2; ++d) {
+            mul_tiles_bcast_rows(cb_t1, cb_g, d, 2 * x + d, d);
+        }
+#endif
+        tile_regs_commit();
+        cb_reserve_back(cb_xn, 2);
+        tile_regs_wait();
+        pack_tile(0, cb_xn);
+        pack_tile(1, cb_xn);
+        tile_regs_release();
+        cb_push_back(cb_xn, 2);
+        cb_pop_front(cb_t1, 2);
+
+        cb_wait_front(cb_xn, 2);
+        cfg(cb_t, cb_xn, cb_t2);  // matmul: in1 to SrcA, in0 to SrcB
+        tile_regs_acquire();
+        matmul_init(cb_xn, cb_t, 0);
+        for (uint32_t d = 0; d < 2; ++d) {
+            matmul_tiles(cb_xn, cb_t, d, 0, d);
+        }
+        tile_regs_commit();
+        cb_reserve_back(cb_t2, 2);
+        tile_regs_wait();
+        pack_tile(0, cb_t2);
+        pack_tile(1, cb_t2);
+        tile_regs_release();
+        cb_push_back(cb_t2, 2);
+
+        cb_wait_front(cb_t2, 2);
+        cfg(cb_t2, cb_cs, cb_o);
+        tile_regs_acquire();
+        mul_bcast_rows_init(cb_t2, cb_cs);
+        for (uint32_t d = 0; d < 2; ++d) {
+            mul_tiles_bcast_rows(cb_t2, cb_cs, d, 2 + d, 2 * d);  // (x . T) * sin
+            mul_tiles_bcast_rows(cb_xn, cb_cs, d, d, 2 * d + 1);  // x * cos
+        }
+        add_binary_tile_init();
+        for (uint32_t d = 0; d < 2; ++d) {
+            add_binary_tile(2 * d, 2 * d + 1, 2 * d);
+        }
+        tile_regs_commit();
+        tile_regs_wait();
+        for (uint32_t d = 0; d < 2; ++d) {
+            pack_tile<true>(2 * d, cb_o, d);
+        }
+        tile_regs_release();
+        cb_pop_front(cb_t2, 2);
+        cb_pop_front(cb_xn, 2);
         cb_push_back(cb_o, 2);
         cb_pop_front(cb_x, 2);
     }

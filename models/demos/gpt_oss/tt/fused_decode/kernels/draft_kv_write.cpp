@@ -134,7 +134,39 @@ void kernel_main() {
         noc_semaphore_wait(sem, KV_WAIT_N);
         noc_semaphore_set(sem, 0);
     }
+    DeviceTimestampedData("KVW_T", 1);  // (profiling: the source shards written)
 #endif
+#ifndef KVW_TILES
+    // Each valid row's 32-byte face rows straight from its user core into the landed cache tiles (row pos % 32):
+    // no staging of the whole source tiles, no copy loop.
+    noc_async_read_barrier();  // the cache tiles (their other rows are kept)
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        for (uint32_t r = first; r <= last; ++r) {
+            if (pos[r] < 0) {
+                continue;
+            }
+            const uint32_t x = get_arg_val<uint32_t>(6 + 2 * r), y = get_arg_val<uint32_t>(7 + 2 * r);
+            const uint32_t p = pos[r];
+            const uint32_t g = (p / block == bi0 && (p % block) / 32 == tr0) ? 0 : 1;
+            const uint32_t rr = p % 32;
+            const uint32_t dst_off = (rr < 16 ? 0 : 1024) + (rr % 16) * 32;
+            for (uint32_t kv = kv_lo; kv < kv_hi; ++kv) {
+                for (uint32_t h = 0; h < kv_heads; ++h) {
+                    const uint32_t hs = head_offset + l * kv_heads + h;
+                    const uint32_t src_off = (hs < 16 ? 0 : 1024) + (hs % 16) * 32;
+                    for (uint32_t t = 0; t < head_tiles; ++t) {
+                        const uint32_t s_ = (kv == 0 ? k_src : v_src) + t * tile + src_off;
+                        const uint32_t d = dst_l1(l, kv, g, h, t) + dst_off;
+                        for (uint32_t f = 0; f < 2; ++f) {
+                            noc_async_read(get_noc_addr(x, y, s_ + f * 512), d + f * 512, 32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    noc_async_read_barrier();
+#else
     // Source rows (each valid row's K / V tiles from its user core), one barrier with the cache tile reads above.
     for (uint32_t r = first; r <= last; ++r) {
         if (pos[r] < 0) {
@@ -183,6 +215,7 @@ void kernel_main() {
             }
         }
     }
+#endif
     for (uint32_t l = 0; l < n_layers; ++l) {
         const auto s_k = TensorAccessor(kc_args, layer_cache(l, 0), tile);
         const auto s_v = TensorAccessor(vc_args, layer_cache(l, 1), tile);
@@ -200,6 +233,7 @@ void kernel_main() {
         }
     }
     noc_async_write_barrier();
+    DeviceTimestampedData("KVW_T", 2);  // (profiling: the cache tiles written)
 #ifdef KV_NOTIFY_N
     // fused with the drafter's block attention (dflash/qk_prep.py): this kernel's K or V rows are in the cache;
     // increment program semaphore KV_NOTIFY_SEM on every attention core (runtime args KV_NOTIFY_ARG..: noc x, y)

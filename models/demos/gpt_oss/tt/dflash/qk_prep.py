@@ -151,9 +151,9 @@ class DraftQKPrep:
             cb(cb_scr, bf16, 384, 1),
             cb(cb_sq, f32, 4096, 1),
             cb(cb_rs, f32, 4096, 2),
-            cb(cb_t1, f32, 4096, 1),
-            cb(cb_xn, bf16, 2048, 1),
-            cb(cb_t2, bf16, 2048, 1),
+            cb(cb_t1, f32, 4096, 2),
+            cb(cb_xn, bf16, 2048, 2),
+            cb(cb_t2, bf16, 2048, 2),
             cb(cb_qo, bf16, 2048, 2),
             cb(cb_ko, bf16, 2048, 2),
         ]
