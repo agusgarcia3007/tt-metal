@@ -54,6 +54,9 @@ class DraftQKPrep:
         # once with per-row weights (half the compute phases)
         self.joint = os.environ.get("DFLASH_PREP_JOINT", "1") == "1" and nq + nkv <= 16
         self.defines = [("PREP_JOINT", "1"), ("NQ", str(nq)), ("NKV", str(nkv))] if self.joint else []
+        # DFLASH_PREP_MERGE_G=1 (joint): x * (1 / rms) * weight in one compute pass (kernels/draft_qk_prep_compute.cpp)
+        if self.joint and os.environ.get("DFLASH_PREP_MERGE_G", "0") == "1":
+            self.defines.append(("PREP_MERGE_G", "1"))
         # core_offset: head_mc's grid starts there (user r on core offset + (r % head_grid_x, r // head_grid_x));
         # kv_core: the fused KV write's core
         x0, y0 = core_offset
@@ -122,8 +125,9 @@ class DraftQKPrep:
         """q / k / v: [1, 32, heads, 64] BF16 tiles in DRAM (row r = user r); gamma: from gamma(); rot_pos: UINT32
         [1, 32] (row r's rope position). kv = (DraftKVWrite, k_cache, v_cache, pos, page_table): the K / V rows' cache
         write in the same program (on core KV_CORE, after every prep core's semaphore). fuse_fn(qo) -> (kernels, cbs,
-        io, noc_cores, sem_id, semaphores): an op in the same program after the K / V cache write (its cores' semaphore
-        sem_id counts the K and V kernels' signals: 2; the drafter's block attention). Returns the head-sharded
+        io, noc_cores, sem_id, semaphores[, early]): an op in the same program after the K / V cache write (its cores'
+        semaphore sem_id counts the K and V kernels' signals: 2; the drafter's block attention; early: they signal once
+        the head-sharded k / v are written, the op reads the block's rows from them: fuse_fn(qo, (ko, vo))). Returns the head-sharded
         (q, k, v). parts(): (kernels, cbs, semaphores, io, (q, k, v)) of the program; wait = (semaphore id, count): the
         reader first waits for a producer of q / k / v in the same program (the drafter's QKV); sem_base: the KV
         write's semaphore ids (sem_base, + 1)."""
@@ -229,7 +233,7 @@ class DraftQKPrep:
             ),
         ]
         sems, io = [], [q, k, v, gamma, self.cos, self.sin, rot_pos, self.trans]
-        fused = fuse_fn(qo) if fuse_fn is not None else None
+        fused = fuse_fn(qo, (ko, vo)) if fuse_fn is not None else None
         if kv is not None:
             writer, k_cache, v_cache, pos, page_table = kv
             kk, kcb = writer.parts(
@@ -243,6 +247,7 @@ class DraftQKPrep:
                 cb_id=14,
                 wait=(sem_base, self.M),
                 notify=(fused[3], fused[4]) if fused is not None else None,
+                notify_early=fused is not None and len(fused) > 6 and fused[6],
             )
             kernels += kk
             cbs += kcb
@@ -251,7 +256,7 @@ class DraftQKPrep:
             io += [pos, page_table, k_cache, v_cache]
         if fused is not None:
             assert kv is not None, "the fused op waits for the K / V cache write"
-            f_kernels, f_cbs, f_io, _, f_sem, f_sems = fused
+            f_kernels, f_cbs, f_io, _, f_sem, f_sems = fused[:6]
             kernels += list(f_kernels)
             cbs += list(f_cbs)
             sems += [ttnn.SemaphoreDescriptor(f_sem, ttnn.CoreType.WORKER, f_kernels[0].core_ranges, 0)] + list(f_sems)

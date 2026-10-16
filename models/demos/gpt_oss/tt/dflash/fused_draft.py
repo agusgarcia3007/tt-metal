@@ -618,12 +618,21 @@ class FusedDraft:
             )
             fuse_fn = None
             if ba_fused:
+                # DFLASH_DRAFT_BA_PATCH=1: block attention reads the block's chunks with the old ones and patches the
+                # block's rows in from the head-sharded K / V itself (signalled once those are written), instead of
+                # waiting for the KV write's cache tiles
+                ba_patch = os.environ.get("DFLASH_DRAFT_BA_PATCH", "1") == "1"
 
-                def fuse_fn(qo, kc=kc, vc=vc):
+                def fuse_fn(qo, kv_src=None, kc=kc, vc=vc):
+                    coords = self.prep_kv_write.coords
+                    patch = None
+                    if ba_patch and kv_src is not None:
+                        patch = (kv_src[0], kv_src[1], list(zip(coords[0::2], coords[1::2])))
                     kern, cbs, io = self.ba.parts(
-                        qo, kc, vc, d.t_bound, d.page_table, None, d.hd**-0.5, wait=(BA_PREP_SEM, 2)
+                        qo, kc, vc, d.t_bound, d.page_table, None, d.hd**-0.5, wait=(BA_PREP_SEM, 2), patch=patch
                     )
-                    return kern, cbs, io, self.ba.notify_order(), BA_PREP_SEM, self.ba.semaphores()
+                    out = (kern, cbs, io, self.ba.notify_order(), BA_PREP_SEM, self.ba.semaphores())
+                    return out + (patch is not None,)
 
             # DFLASH_DRAFT_PREP_FUSE=1: the prep (+ KV write + block attention) runs in the QKV program, after its
             # writers' signal

@@ -109,6 +109,32 @@ void kernel_main() {
         const uint32_t cb_o = x == 0 ? cb_qo : cb_ko;
         cb_reserve_back(cb_o, 2);
         // both 32-column tiles d = 0, 1 per step (DST 0, 1)
+#if defined(PREP_MERGE_G) && defined(PREP_JOINT)
+        // PREP_MERGE_G: xn = (x * rs) * g in one pass: the weights copied into DST 2, 3, an SFPU multiply in DST (no
+        // fp32 round trip through cb_t1)
+        cfg(cb_x, cb_rs, cb_xn);
+        tile_regs_acquire();
+        mul_bcast_cols_init(cb_x, cb_rs);
+        for (uint32_t d = 0; d < 2; ++d) {
+            mul_tiles_bcast_cols(cb_x, cb_rs, d, x, d);
+        }
+        reconfig_data_format_srca(cb_x, cb_g);
+        copy_init(cb_g);
+        for (uint32_t d = 0; d < 2; ++d) {
+            copy_tile(cb_g, d, 2 + d);
+        }
+        mul_binary_tile_init();
+        for (uint32_t d = 0; d < 2; ++d) {
+            mul_binary_tile(d, 2 + d, d);
+        }
+        tile_regs_commit();
+        cb_reserve_back(cb_xn, 2);
+        tile_regs_wait();
+        pack_tile(0, cb_xn);
+        pack_tile(1, cb_xn);
+        tile_regs_release();
+        cb_push_back(cb_xn, 2);
+#else
         cfg(cb_x, cb_rs, cb_t1);
         tile_regs_acquire();
         mul_bcast_cols_init(cb_x, cb_rs);
@@ -145,6 +171,7 @@ void kernel_main() {
         tile_regs_release();
         cb_push_back(cb_xn, 2);
         cb_pop_front(cb_t1, 2);
+#endif
 
         cb_wait_front(cb_xn, 2);
         cfg(cb_t, cb_xn, cb_t2);  // matmul: in1 to SrcA, in0 to SrcB

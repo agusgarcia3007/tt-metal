@@ -135,7 +135,7 @@ class BlockAttention:
         noc = self.noc_cores()
         return [noc[i] for i in sorted(range(len(noc)), key=lambda i: (i % self.S, i))]
 
-    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, wait):
+    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, wait, patch=None):
         """(kernels, cbs, io); q: the packed Q [1, nkv, Tt * 32, 64] (tile (g, t, d) at page (g Tt + t) 2 + d); pos:
         INT32 [>= M] (row r at pos[r], non-decreasing, consecutive rows within 32 positions); page_table: INT32 [*,
         blocks] (row 0 used); sinks: the heads' [heads, 32] BF16 sink tile; wait = (semaphore id, count): the QKV
@@ -224,6 +224,14 @@ class BlockAttention:
             + idx_words
             + noc_words
         )
+        if patch is not None:
+            # patch = (k, v, noc coords (x, y) per row): the head-sharded K / V the block's rows come from (uniform,
+            # BF16 cache; the wait semaphore signals them written, dflash/kv_write.py notify_early)
+            assert self.uniform and kv_dtype == ttnn.bfloat16 and len(patch[2]) >= self.M
+            patch_arg = len(reader_common)
+            pn = [(x << 8) | y for x, y in patch[2][: self.M]] + [0] * (self.M % 2)
+            reader_common += [patch[0].buffer_address(), patch[1].buffer_address()]
+            reader_common += [pn[w] | (pn[w + 1] << 16) for w in range(0, len(pn), 2)]
         writer_common = [self.out.buffer_address(), pos.buffer_address()] + idx_words + noc_words
         defines = [("BA_WAIT_SEM", str(wait[0])), ("BA_WAIT_N", str(wait[1])), ("BA_TREE_SEM", str(TREE_SEM))]
         defines += [("BA_TPC", str(self.TC)), ("BA_TQ", str(self.Tq)), ("BA_GX", str(gx))]
@@ -236,8 +244,12 @@ class BlockAttention:
             defines.append(("BA_CAP0", os.environ["DFLASH_BA_CAP0"]))
         if self.uniform:
             defines.append(("BA_UNIFORM", "1"))
+            if os.environ.get("DFLASH_BA_P0_HI") == "1":  # (A/B) the old prefetch bound: groups before pos[M - 1]
+                defines.append(("BA_P0_HI", "1"))
         if self.q_rows:
             defines.append(("BA_Q_ROWS", "1"))
+        if patch is not None:
+            defines.append(("BA_PATCH", str(patch_arg)))
         if self.window:  # uniform: one window for all rows; else per row (a sliding-window layer)
             defines.append(("BA_WINDOW" if self.uniform else "BA_SLIDE", str(self.window)))
         dm = ttnn.DataMovementConfigDescriptor

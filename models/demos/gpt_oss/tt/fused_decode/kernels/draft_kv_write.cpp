@@ -20,6 +20,9 @@
 // KV_SEL = 0 / 1 (defined): this kernel writes only K / V (two kernels on BRISC and NCRISC of the same core, each with
 // its own scratch header); else both.
 //
+// KV_NOTIFY_N: signal the fused attention cores once the cache tiles are written (KV_NOTIFY_EARLY: once the source
+// shards are, before this kernel reads them).
+//
 // runtime args: [k_src, v_src, k_cache, v_cache, pos, page_table, (noc_x, noc_y) x rows]
 
 #include <stdint.h>
@@ -136,6 +139,20 @@ void kernel_main() {
     }
     DeviceTimestampedData("KVW_T", 1);  // (profiling: the source shards written)
 #endif
+#if defined(KV_NOTIFY_N) && defined(KV_NOTIFY_EARLY)
+    // KV_NOTIFY_EARLY: the attention cores patch the block's rows into their own copies of the cache tiles (from the
+    // source shards, kernels/ba_reader.cpp BA_PATCH): signal them once the source shards are written, not after the
+    // cache write
+    for (uint32_t i = 0; i < KV_NOTIFY_N; ++i) {
+        noc_semaphore_inc(
+            get_noc_addr(
+                get_arg_val<uint32_t>(KV_NOTIFY_ARG + 2 * i),
+                get_arg_val<uint32_t>(KV_NOTIFY_ARG + 2 * i + 1),
+                get_semaphore(KV_NOTIFY_SEM)),
+            1);
+    }
+    noc_async_atomic_barrier();
+#endif
 #ifndef KVW_TILES
     // Each valid row's 32-byte face rows straight from its user core into the landed cache tiles (row pos % 32):
     // no staging of the whole source tiles, no copy loop.
@@ -234,7 +251,7 @@ void kernel_main() {
     }
     noc_async_write_barrier();
     DeviceTimestampedData("KVW_T", 2);  // (profiling: the cache tiles written)
-#ifdef KV_NOTIFY_N
+#if defined(KV_NOTIFY_N) && !defined(KV_NOTIFY_EARLY)
     // fused with the drafter's block attention (dflash/qk_prep.py): this kernel's K or V rows are in the cache;
     // increment program semaphore KV_NOTIFY_SEM on every attention core (runtime args KV_NOTIFY_ARG..: noc x, y)
     for (uint32_t i = 0; i < KV_NOTIFY_N; ++i) {

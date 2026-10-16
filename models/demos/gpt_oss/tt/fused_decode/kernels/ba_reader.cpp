@@ -96,12 +96,17 @@ void kernel_main() {
         }
         cb_push_back(BA_CB_POS, 1);
     }
-    const uint32_t p0 = static_cast<uint32_t>(pos[0]);
+    uint32_t p0 = static_cast<uint32_t>(pos[0]);  // the block's first position (its K / V rows written by QKV)
 #ifdef BA_UNIFORM
     // every row attends [lo, hi = pos[M - 1]] (the drafter; lo = 0, or hi + 1 - BA_WINDOW with a window): the last
     // chunk masked past hi (mask e = 0), with a window the first chunk before lo (mask e = 1, slice 0's chunk 0), no
     // sinks
     const uint32_t hi = static_cast<uint32_t>(pos[M - 1]);
+    // pos holds hi for every row, but the block's rows (written this round) are hi + 1 - M .. hi: a group ending
+    // before hi may still hold some of them (the block crossing a chunk boundary), so it is not old before they land
+#ifndef BA_P0_HI
+    p0 = hi + 1 >= M ? hi + 1 - M : 0;
+#endif
 #ifdef BA_WINDOW
     const uint32_t lo = hi + 1 >= BA_WINDOW ? hi + 1 - BA_WINDOW : 0;
 #else
@@ -129,6 +134,17 @@ void kernel_main() {
     constexpr uint32_t NM = 2;
 #endif
     volatile tt_l1_ptr uint32_t* qkv_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(BA_WAIT_SEM));
+    auto kv_ready = [&]() {
+        invalidate_l1_cache();
+        return *qkv_sem >= BA_WAIT_N;
+    };
+#ifdef BA_PATCH
+    // BA_PATCH (the drafter, fused after its K / V cache write, dflash/kv_write.py notify_early): the block's chunks
+    // (holding rows hi + 1 - M .. hi) are read from DRAM with the old ones (their other rows are old), and the block's
+    // rows are patched in from the head-sharded K / V (row r: user core r's shard, kv head g = tile row g) once the
+    // KV write signals that those are written (BA_WAIT_N): the cache write is off this op's path.
+    // common args BA_PATCH..: [k_src, v_src, noc (x << 8 | y) per row (2 per word)]
+#endif
     if (sl.c_hi == sl.c_lo) {
         // idle slice: done (the QKV writers' increments may still land here: harmless, the next program on this core
         // starts after this one completes, i.e. after those writers' atomic barriers)
@@ -263,8 +279,18 @@ void kernel_main() {
         }
         noc_async_read_set_trid(0);
     };
+#ifdef BA_PATCH
+    const uint32_t kv_c0 = (hi + 1 - M) / 32;  // the block's first chunk
+    auto block_chunks = [&](uint32_t gi) {     // group gi holds a block chunk
+        const uint32_t c0 = sl.c_lo + gi * G, c1 = sl.c_lo + ((gi + 1) * G < nc ? (gi + 1) * G : nc);
+        return c1 > kv_c0 && c0 <= hi / 32;
+    };
+#endif
     // a group is old when its last chunk ends before position p0 (the QKV writes start there)
     auto old_group = [&](uint32_t gi) {
+#ifdef BA_PATCH
+        return true;  // (the block's rows are patched in after the read)
+#endif
         const uint32_t j_last = (gi + 1) * G < nc ? (gi + 1) * G - 1 : nc - 1;
         return (sl.c_lo + j_last) * 32 + 31 < p0;
     };
@@ -297,6 +323,39 @@ void kernel_main() {
         q_done = true;
         DeviceTimestampedData("BA_R", 1);  // (profiling: Q read)
     };
+#ifdef BA_PATCH
+    // the block's rows of group gi's chunks (landed in its slot): row r (position hi + 1 - M + r) = head row g of user
+    // core r's K / V shard (2 tiles d, 32 bytes per face f) -> row pos % 32 of the chunk's tiles
+    auto patch = [&](uint32_t gi) {
+        const uint32_t slot = gi % cap_groups;
+        const uint32_t kl1 = k_base + slot * group_pages * kv_tile_bytes,
+                       vl1 = v_base + slot * group_pages * kv_tile_bytes;
+        const uint32_t k_src = get_common_arg_val<uint32_t>(BA_PATCH),
+                       v_src = get_common_arg_val<uint32_t>(BA_PATCH + 1);
+        const uint32_t src_off = (g < 16 ? 0 : 1024) + (g % 16) * 32;
+        const uint32_t c0 = sl.c_lo + gi * G;
+        for (uint32_t r = 0; r < M; ++r) {
+            const uint32_t p = hi + 1 - M + r, c = p / 32;
+            if (c < c0 || c >= c0 + G || c >= sl.c_hi) {
+                continue;
+            }
+            const uint32_t j = c - c0;
+            const uint32_t nw = get_common_arg_val<uint32_t>(BA_PATCH + 2 + r / 2) >> (16 * (r % 2));
+            const uint32_t x = (nw >> 8) & 0xFF, y = nw & 0xFF;
+            const uint32_t rr = p % 32;
+            const uint32_t dst_off = (rr < 16 ? 0 : 1024) + (rr % 16) * 32;
+            for (uint32_t d = 0; d < 2; ++d) {
+                for (uint32_t f = 0; f < 2; ++f) {
+                    const uint32_t so = d * tile + src_off + f * 512, dof = (2 * j + d) * tile + dst_off + f * 512;
+                    noc_async_read(get_noc_addr(x, y, k_src + so), kl1 + dof, 32);
+                    noc_async_read(get_noc_addr(x, y, v_src + so), vl1 + dof, 32);
+                }
+            }
+        }
+        noc_async_read_barrier();
+        DeviceTimestampedData("BA_R", 2);  // (profiling: block rows patched)
+    };
+#endif
     uint32_t pushed = 0;
     auto q_ready = [&]() {
         invalidate_l1_cache();
@@ -306,7 +365,7 @@ void kernel_main() {
             return false;
         }
 #endif
-        return *qkv_sem >= BA_WAIT_N;
+        return kv_ready();
     };
     uint32_t issued = 0;
 #ifdef BA_SHARE
@@ -385,6 +444,16 @@ void kernel_main() {
         }
         if (issued > pushed) {
             noc_async_read_barrier_with_trid(1 + pushed % cap_groups);
+#ifdef BA_PATCH
+            if (block_chunks(pushed)) {
+                if (!q_done) {
+                    while (!kv_ready()) {  // the source shards (and Q) written
+                    }
+                    read_q();
+                }
+                patch(pushed);
+            }
+#endif
             cb_push_back(cb_k, group_pages);
             cb_push_back(cb_v, group_pages);
             ++pushed;
@@ -393,13 +462,15 @@ void kernel_main() {
             noc_semaphore_inc(get_noc_addr(pnx, pny, get_semaphore(BA_LAND_SEM)), 1);  // the partner may copy it
 #endif
         } else if (!q_done) {
-            noc_semaphore_wait(qkv_sem, BA_WAIT_N);  // nothing in flight: the next group needs the block's rows
+            while (!kv_ready()) {  // nothing in flight: the next group needs the block's rows
+            }
             read_q();
         }
         // else: the CBs are full (compute frees a slot)
     }
     if (!q_done) {
-        noc_semaphore_wait(qkv_sem, BA_WAIT_N);
+        while (!kv_ready()) {
+        }
         read_q();
     }
 #ifdef BA_SHARE

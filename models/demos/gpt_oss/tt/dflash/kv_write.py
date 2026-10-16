@@ -56,9 +56,12 @@ class DraftKVWrite:
         wait=None,
         more_caches=(),
         notify=None,
+        notify_early=False,
     ):
         """(kernels, cbs) of the write on `core`; wait = (first semaphore id, count): the K / V kernel first waits for
-        `count` increments of semaphore id / id + 1 (fused after the producer of k / v, dflash/qk_prep.py)."""
+        `count` increments of semaphore id / id + 1 (fused after the producer of k / v, dflash/qk_prep.py); notify =
+        (noc cores, semaphore id): each kernel increments it on every core once its rows are in the cache (notify_early:
+        once its source shards are written, for consumers that read the rows from the shards)."""
         cores = ttnn.CoreRangeSet([ttnn.CoreRange(core, core)])
         ct = [cb_id, self.rows, self.kv_heads, self.head_tiles, self.block, page_table.shape[-1] * 4, head_offset]
         for t in (k_cache, v_cache, pos, page_table):
@@ -83,7 +86,7 @@ class DraftKVWrite:
                 ("KV_NOTIFY_N", str(len(notify[0]))),
                 ("KV_NOTIFY_SEM", str(notify[1])),
                 ("KV_NOTIFY_ARG", str(n_args)),
-            ]
+            ] + ([("KV_NOTIFY_EARLY", "1")] if notify_early else [])
         # K on BRISC / NOC0 and V on NCRISC / NOC1 of the same core, in parallel
         kernels = [
             ttnn.KernelDescriptor(
