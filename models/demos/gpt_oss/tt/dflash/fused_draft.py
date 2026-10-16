@@ -277,8 +277,9 @@ class FusedDraft:
         taken |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.b.cores, row_wise=True)}
         taken |= {(h.x, h.y) for h in getattr(self.b, "helpers", [])}
         S = min(int(os.environ.get("DFLASH_BA_S", "24")), (grid.x * grid.y - len(taken)) // per_slice)
+        # DFLASH_DRAFT_BA_MIN_CHUNKS: the drafter's own minimum chunks per slice (default BA_MIN_CHUNKS)
+        min_chunks = int(os.environ.get("DFLASH_DRAFT_BA_MIN_CHUNKS", os.environ.get("BA_MIN_CHUNKS", "4")))
         if window:  # a window caps the history: no more slices than its chunks give work (cores cost launch time)
-            min_chunks = int(os.environ.get("BA_MIN_CHUNKS", "4"))
             S = min(S, -(-(window // 32 + 2) // min_chunks))
         return BlockAttention(
             mesh,
@@ -292,6 +293,7 @@ class FusedDraft:
             uniform=True,
             window=window,
             q_rows=True,
+            min_chunks=min_chunks,
         )
 
     def _prep_fusable(self):

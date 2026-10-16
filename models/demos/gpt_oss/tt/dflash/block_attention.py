@@ -52,6 +52,7 @@ class BlockAttention:
         uniform=False,
         window=0,
         q_rows=False,
+        min_chunks=None,
     ):
         """cores: cores_needed(n_kv, rows, slices) logical cores: (kv head g, tile group q, slice s) = cores[(g Tq + q)
         slices + s], each tile group (BA_TPC packed Q tiles per core, Tq = Tt / BA_TPC groups) with its own slices and
@@ -73,7 +74,7 @@ class BlockAttention:
         self.grid = mesh_device.compute_with_storage_grid_size()
         assert len(self.core_list) < 0xFF
         self.cores = _rects(self.core_list)
-        self.min_chunks = int(os.environ.get("BA_MIN_CHUNKS", "4"))
+        self.min_chunks = min_chunks or int(os.environ.get("BA_MIN_CHUNKS", "4"))
         self.G = int(os.environ.get("BA_G", "8"))
         self.cap = int(os.environ.get("BA_CAP", "3"))  # 4 clashes with the verify pass's L1 buffers
         self.rounds = max(1, (slices - 1).bit_length())

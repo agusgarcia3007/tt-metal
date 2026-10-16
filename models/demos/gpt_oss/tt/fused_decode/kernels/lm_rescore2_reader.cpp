@@ -66,6 +66,7 @@ void kernel_main() {
         ones[i] = (i < 16 * rows && i % 16 < nbias) ? 0x3F80 : 0;  // the bias rows (as the stream writers)
     }
 
+    DeviceTimestampedData("RS_T", 1);  // (profiling: start)
     if (j == 0) {  // A
         cb_reserve_back(cb_scr, 1);
         const uint32_t scr = get_write_ptr(cb_scr);
@@ -74,6 +75,7 @@ void kernel_main() {
         }
         noc_async_read_barrier();
         invalidate_l1_cache();
+        DeviceTimestampedData("RS_T", 2);  // (profiling: lists read)
         volatile tt_l1_ptr int32_t* q = reinterpret_cast<volatile tt_l1_ptr int32_t*>(scr);
         int32_t bk[K];
         uint32_t bi[K];
@@ -99,6 +101,7 @@ void kernel_main() {
         for (uint32_t k = 0; k < K; ++k) {
             o[k] = bi[k];
         }
+        DeviceTimestampedData("RS_T", 3);  // (profiling: merged)
         noc_async_write(scr, get_noc_addr(hx, hy, tab + 4 * r * K), 4 * K);
         noc_async_write_barrier();
         noc_semaphore_inc(get_noc_addr(hx, hy, get_semaphore(0)), 1);
@@ -117,6 +120,7 @@ void kernel_main() {
     }
     noc_semaphore_wait(sem1, 1);  // C
     invalidate_l1_cache();
+    DeviceTimestampedData("RS_T", 4);  // (profiling: table here)
     volatile tt_l1_ptr uint32_t* t_ = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(tab);
     const uint32_t n = t_[e] / 32;
     bool owner = true;
@@ -138,6 +142,7 @@ void kernel_main() {
             get_noc_addr_from_bank_id<true>(n / C, w_addr + (n % C) * col_bytes), get_write_ptr(cb_w), col_bytes);
 #endif
         noc_async_read_barrier();
+        DeviceTimestampedData("RS_T", 5);  // (profiling: column read)
         cb_push_back(cb_x, kx + 1);
         cb_push_back(cb_w, kx + 1);
     }

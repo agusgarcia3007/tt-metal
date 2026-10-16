@@ -36,6 +36,7 @@ void kernel_main() {
     constexpr uint32_t page = 2048;
 
     cb_wait_front(cb_v, 1);
+    DeviceTimestampedData("BNDW_T", 1);  // (profiling: v computed)
     const uint32_t v = get_read_ptr(cb_v);
     const uint32_t slot = get_write_ptr(cb_xchg) + index * v_bytes;  // same address on every helper
     for (uint32_t h = 0; h < helpers; ++h) {
@@ -48,8 +49,10 @@ void kernel_main() {
         noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(6 + 2 * h), get_arg_val<uint32_t>(7 + 2 * h), sem), 1);
     }
     cb_pop_front(cb_v, 1);
+    DeviceTimestampedData("BNDW_T", 2);  // (profiling: v sent)
 
     cb_wait_front(cb_x, PH);
+    DeviceTimestampedData("BNDW_T", 3);  // (profiling: x computed)
     if constexpr (!x_on_helpers) {
         noc_async_write(get_read_ptr(cb_x), get_noc_addr(bx, by, x_addr + page0 * page), valid * page);
     }
@@ -80,5 +83,6 @@ void kernel_main() {
     noc_semaphore_inc(get_noc_addr(bx, by, get_semaphore(relay_sem)), 1);
 #endif
     noc_async_atomic_barrier();
+    DeviceTimestampedData("BNDW_T", 4);  // (profiling: consumers notified)
     cb_pop_front(cb_x, PH);
 }

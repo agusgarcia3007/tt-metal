@@ -156,7 +156,10 @@ void kernel_main() {
     cb_pop_front(cb_gamma, PH);
 
     // 3. sum of the helpers' v (helper order) -> s = P v -> rs -> x
-    cb_wait_front(cb_xchg, helpers);
+    {
+        DeviceZoneScopedN("BND_C3_XWAIT");
+        cb_wait_front(cb_xchg, helpers);
+    }
     cfg(cb_xchg, cb_xchg, cb_rsum);
     tile_regs_acquire();
     if constexpr (helpers == 1) {
