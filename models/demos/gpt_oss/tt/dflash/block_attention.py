@@ -51,16 +51,18 @@ class BlockAttention:
         out_mc=None,
         uniform=False,
         window=0,
+        q_rows=False,
     ):
         """cores: cores_needed(n_kv, rows, slices) logical cores: (kv head g, tile group q, slice s) = cores[(g Tq + q)
         slices + s], each tile group (BA_TPC packed Q tiles per core, Tq = Tt / BA_TPC groups) with its own slices and
         merge tree. uniform: every row attends [0, pos[M - 1]] (the drafter's block: no causal mask inside it), no
         sinks; window (uniform only): the rows attend the last `window` positions [pos[M - 1] + 1 - window, pos[M - 1]].
+        q_rows: q comes in the rows layout [1, M, heads, 64] (the reader gathers the packed tiles: no repacking op).
         """
         assert head_dim == 64 and n_heads // n_kv == 8 and rows % 4 == 0
         self.mesh, self.M, self.nq, self.nkv, self.hd = mesh_device, rows, n_heads, n_kv, head_dim
         self.block, self.S, self.Tt = block_size, slices, rows // 4
-        self.uniform, self.window = uniform, window
+        self.uniform, self.window, self.q_rows = uniform, window, q_rows
         assert not window or uniform
         self.TC = self.tiles_per_core(rows)
         self.Tq = self.Tt // self.TC
@@ -229,6 +231,8 @@ class BlockAttention:
             defines += [("BA_SHARE", "1"), ("BA_LAND_SEM", str(LAND_SEM)), ("BA_COPY_SEM", str(COPY_SEM))]
         if self.uniform:
             defines.append(("BA_UNIFORM", "1"))
+        if self.q_rows:
+            defines.append(("BA_Q_ROWS", "1"))
         if self.window:
             defines.append(("BA_WINDOW", str(self.window)))
         dm = ttnn.DataMovementConfigDescriptor

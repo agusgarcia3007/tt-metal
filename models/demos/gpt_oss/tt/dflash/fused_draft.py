@@ -213,6 +213,9 @@ class FusedDraft:
         grid = mesh.compute_with_storage_grid_size()
         per_slice = BlockAttention.cores_needed(d.nkv, self.M, 1)
         S = min(int(os.environ.get("DFLASH_BA_S", "24")), grid.x * grid.y // per_slice)
+        if window:  # a window caps the history: no more slices than its chunks give work (cores cost launch time)
+            min_chunks = int(os.environ.get("BA_MIN_CHUNKS", "4"))
+            S = min(S, -(-(window // 32 + 2) // min_chunks))
         return BlockAttention(
             mesh,
             self.M,
@@ -224,6 +227,7 @@ class FusedDraft:
             S,
             uniform=True,
             window=window,
+            q_rows=True,
         )
 
     def shared_allowed(self):
@@ -518,10 +522,10 @@ class FusedDraft:
             kr.deallocate(True)
             vs.deallocate(True)
             if shared:
-                self.shared.load_q(qr)
-                if self.ba is not None:
-                    attn = self.ba(self.shared.q, kc, vc, d.t_bound, d.page_table, None, d.hd**-0.5)
+                if self.ba is not None:  # (the reader gathers Q from qr's rows layout)
+                    attn = self.ba(qr, kc, vc, d.t_bound, d.page_table, None, d.hd**-0.5)
                 else:
+                    self.shared.load_q(qr)
                     attn = self.shared.attend(kc, vc, None, d.hd**-0.5, d.ck)
             else:
                 attn = ttnn.transformer.paged_scaled_dot_product_attention_decode(

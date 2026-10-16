@@ -238,9 +238,24 @@ void kernel_main() {
         cb_reserve_back(cb_q, 2 * TC);
         const uint32_t ql1 = get_write_ptr(cb_q);
         noc_async_read_set_trid(15);
+#ifdef BA_Q_ROWS
+        // Q in the rows layout [1, M, heads, 64] (row r's tiles 2 r + d, heads in tile rows): gather packed tile (t, d)
+        // rows 8 i .. 8 i + 7 = row 4 (t0 + t) + i's heads 8 g .. 8 g + 7 (256-byte segments per 16-column half f)
+        for (uint32_t t = 0; t < TC; ++t) {
+            for (uint32_t d = 0; d < 2; ++d) {
+                for (uint32_t i = 0; i < 4; ++i) {
+                    const uint64_t src = s_q.get_noc_addr(2 * (4 * (t0 + t) + i) + d);
+                    for (uint32_t f = 0; f < 2; ++f) {
+                        noc_async_read(src + rows8(g, f), ql1 + (2 * t + d) * tile + rows8(i, f), 256);
+                    }
+                }
+            }
+        }
+#else
         for (uint32_t t = 0; t < 2 * TC; ++t) {
             noc_async_read(s_q.get_noc_addr(g * 2 * Tt + 2 * t0 + t), ql1 + t * tile, tile);
         }
+#endif
         noc_async_read_set_trid(0);
         noc_async_read_barrier_with_trid(15);
         cb_push_back(cb_q, 2 * TC);

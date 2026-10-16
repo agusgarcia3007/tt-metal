@@ -94,6 +94,7 @@ def test_block_attn(mesh_device, device_params):
                     S,
                     uniform=True,
                     window=w,
+                    q_rows=True,  # (the drafter's case: Q in the rows layout)
                 )
     ra = v.row_attn
     v.row_attn = None  # _sdpa: the ttnn per-row path
@@ -180,7 +181,7 @@ def test_block_attn(mesh_device, device_params):
         if unis and href is not None:
             urefs = {w: host_ref(p, uniform=True, window=w) for w in (0, UNI_W)}
             for (S, w), ba in unis.items():
-                ba(shared.q, k_cache, v_cache, v.pos, v.page_table, None, scale)
+                ba(v.q, k_cache, v_cache, v.pos, v.page_table, None, scale)
                 shared._copy("SPEC_OUT", (ba.out, shared.out))
                 got = dev0(shared.out).clone()
                 up = [_pcc(urefs[w][r], got[0, r, :16]) for r in range(v.M)]
