@@ -404,7 +404,13 @@ def load_decode_down_bal(
     E, H = config.num_experts, config.hidden_size
     banks = mesh_device.dram_grid_size().x
     tile = ttnn.TILE_SIZE
-    plan = down_bal_plan(H, inter_pad, inter_local, banks, EXPERT_BANK_ROT)
+    # banks whose optimal reader cores share a row (the MoE's row placement puts their readers on it)
+    workers = mesh_device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0)
+    rows = {}
+    for b, w in enumerate(workers):
+        rows.setdefault(w.y, []).append(b)
+    shared = [g for g in rows.values() if len(g) > 1]
+    plan = down_bal_plan(H, inter_pad, inter_local, banks, EXPERT_BANK_ROT, shared_rows=shared)
     bank_cols, seg_inter = plan
     C = max(n for _, n in bank_cols)
     n_tiles = -(-H // tile)

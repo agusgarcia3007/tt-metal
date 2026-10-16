@@ -139,10 +139,15 @@ def down_bank_columns(n_tiles, seg_tiles, bank_load, caps):
     return out
 
 
-def down_bal_plan(hidden, inter_pad, real_inter, banks, rot, gate_up_readers=3, cores_per_bank=6):
+def down_bal_plan(hidden, inter_pad, real_inter, banks, rot, gate_up_readers=3, cores_per_bank=6, shared_rows=()):
     """The balanced down layout's (bank_cols, seg_inter) for the fused verify MoE (dflash/moe_fused.py: per bank
     gate_up_readers gate|up cores (those whose pairs are all padding dropped) and the rest of cores_per_bank row cores
-    for down). Gate|up load per bank: its kept cores' pairs x 2 columns x (hidden / 32 + 1) tiles."""
+    for down). Gate|up load per bank: its kept cores' pairs x 2 columns x (hidden / 32 + 1) tiles.
+    shared_rows: groups of banks whose reader cores share one row (row_placement): the fully loaded banks of a group
+    count DFLASH_DOWN_BAL_SHARED (48) extra tiles, so they take fewer down columns. QuietBox 2: banks 0 and 4 share
+    logical row 9 and bank 4's gate|up readers finished 8-12 us after the median core, on chips 1 / 3 setting every
+    all-reduce: bank 4 11 -> 9 down columns (banks 5 / 6 10 -> 11): 4.962 -> 4.881 / 5.165 -> 5.079 / 5.591 -> 5.499 /
+    6.281 -> 6.211 / 7.369 -> 7.306 ms at 256 / 4K / 32K / 64K / 130752, same tokens."""
     P = inter_pad // TILE // banks
     pairs = P // gate_up_readers
     kt = hidden // TILE + 1
@@ -152,6 +157,17 @@ def down_bal_plan(hidden, inter_pad, real_inter, banks, rot, gate_up_readers=3, 
         kept = sum(1 for r in range(gate_up_readers) if (L * P + r * pairs) * TILE < real_inter)
         load.append(kept * pairs * 2 * kt)
         caps.append(4 * (cores_per_bank - kept))
+    extra = int(os.environ.get("DFLASH_DOWN_BAL_SHARED", "48"))
+    for group in shared_rows:
+        full = max(load[b] for b in group)
+        for b in group:
+            if load[b] == full:
+                load[b] += extra
+    # DFLASH_DOWN_BAL_ADJ="b:tiles,...": more extra load (tiles per expert) counted for DRAM bank b (experiments)
+    for item in os.environ.get("DFLASH_DOWN_BAL_ADJ", "").split(","):
+        if item:
+            b, t = item.split(":")
+            load[int(b)] += int(t)
     seg_inter = -(-real_inter // TILE)
     return down_bank_columns(-(-hidden // TILE), seg_inter + 1, load, caps), seg_inter
 
