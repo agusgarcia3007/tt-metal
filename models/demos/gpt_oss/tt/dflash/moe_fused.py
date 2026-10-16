@@ -185,7 +185,7 @@ class MoEFused:
         MOE_ = MOE + ([("MOE_ACTIVE_ROWS", str(active_rows))] if active_rows else [])
         # DFLASH_MOE_EARLY_UNION=1 (with the router row split): the router releases gate|up / down on the union, the
         # softmax weights follow (semaphore EARLY_WSEM; kernels/stream_linear_writer.cpp MOE_EARLY_UNION)
-        early = bool(self.split_defines) and not STEAL and os.environ.get("DFLASH_MOE_EARLY_UNION", "0") == "1"
+        early = bool(self.split_defines) and not STEAL and os.environ.get("DFLASH_MOE_EARLY_UNION", "1") == "1"
         if early:
             MOE_ = MOE_ + [("MOE_WSEM", str(EARLY_WSEM))]
         b, mesh = self.boundary, self.mesh
