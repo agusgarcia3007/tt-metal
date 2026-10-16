@@ -135,7 +135,7 @@ class BlockAttention:
         noc = self.noc_cores()
         return [noc[i] for i in sorted(range(len(noc)), key=lambda i: (i % self.S, i))]
 
-    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, wait, patch=None):
+    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, wait, patch=None, out_notify=None):
         """(kernels, cbs, io); q: the packed Q [1, nkv, Tt * 32, 64] (tile (g, t, d) at page (g Tt + t) 2 + d); pos:
         INT32 [>= M] (row r at pos[r], non-decreasing, consecutive rows within 32 positions); page_table: INT32 [*,
         blocks] (row 0 used); sinks: the heads' [heads, 32] BF16 sink tile; wait = (semaphore id, count): the QKV
@@ -250,6 +250,14 @@ class BlockAttention:
             defines.append(("BA_Q_ROWS", "1"))
         if patch is not None:
             defines.append(("BA_PATCH", str(patch_arg)))
+        if out_notify is not None:  # (noc cores, semaphore id): the roots signal a consumer once out is written
+            nw = [(p.x << 8) | p.y for p in out_notify[0]] + [0] * (len(out_notify[0]) % 2)
+            defines += [
+                ("BA_OUT_NOTIFY_N", str(len(out_notify[0]))),
+                ("BA_OUT_NOTIFY_SEM", str(out_notify[1])),
+                ("BA_OUT_NOTIFY_ARG", str(len(writer_common))),
+            ]
+            writer_common += [nw[w] | (nw[w + 1] << 16) for w in range(0, len(nw), 2)]
         if self.window:  # uniform: one window for all rows; else per row (a sliding-window layer)
             defines.append(("BA_WINDOW" if self.uniform else "BA_SLIDE", str(self.window)))
         dm = ttnn.DataMovementConfigDescriptor

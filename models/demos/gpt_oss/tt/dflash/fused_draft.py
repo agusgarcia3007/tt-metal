@@ -46,6 +46,8 @@ class _Norm:
 # program semaphores of the fused drafter attention chain (clear of the boundary consumer's 0 and helpers' 5, 6, and
 # the block attention's 9 .. 11): the KV write (12, 13), QKV -> prep (14), KV write -> block attention (15)
 PREP_SEM_BASE, PREP_QKV_SEM, BA_PREP_SEM = 12, 14, 15
+OPROJ_X_SEM = 7  # DFLASH_DRAFT_OPROJ_FUSE: block attention's roots -> o_proj's writers
+OPROJ_R_WAIT = os.environ.get("DFLASH_DRAFT_OPROJ_R_WAIT", "1") == "1"
 # DFLASH_DRAFT_BANK_ROT=r (fused MLP): the MLP weights' logical bank (b + r) % banks on DRAM bank b, each slice's
 # intermediate padding at its end (the same pair positions in every slice) and the cores whose columns are all padding
 # dropped: r = 7 puts the padding on DRAM bank 0, the slowest for the streaming readers (fused_decode/stream.py
@@ -78,6 +80,15 @@ class FusedDraft:
             rows=M,
             prefetch_cols=2,
         )
+        # DFLASH_DRAFT_OPROJ_FUSE=1: o_proj (+ the attn-site boundary send) runs in the attention program (q / k prep +
+        # KV write + block attention): its weights stream in while attention runs, block attention's roots signal it.
+        # The prep then takes the shifted layout ((1 + r % 8, r // 8), KV write (9, 0): clear of the boundary core).
+        self.oproj_fuse = os.environ.get("DFLASH_DRAFT_OPROJ_FUSE", "0") == "1" and b.ccl == "fabric"
+        prep_shift = os.environ.get("DFLASH_DRAFT_PREP_FUSE", "0") == "1" or self.oproj_fuse
+        prep_xy = [(1 + r % 8, r // 8) for r in range(M)] + [(9, 0)] if prep_shift else []
+        # (o_proj's readers placed around these also stay off the boundary sender's and helpers' cores)
+        bnd_xy = [(c.x, c.y) for c in ttnn.corerange_to_cores(b.cores, row_wise=True)]
+        bnd_xy += [(h.x, h.y) for h in getattr(b, "helpers", [])]
         self.o = LinearStream(
             mesh,
             nq * hd // TILE,
@@ -88,6 +99,7 @@ class FusedDraft:
             out_mode=5,
             rows=M,
             gather_split=os.environ.get("DFLASH_OPROJ_SPLIT", "1") == "1",
+            exclude=prep_xy + bnd_xy if self.oproj_fuse else (),
         )
         # DFLASH_DRAFT_MLP_BFP4=1: the MLP weights in BFP4 (half the bytes of the drafter's largest stream)
         self.mlp_dtype = ttnn.bfloat4_b if os.environ.get("DFLASH_DRAFT_MLP_BFP4", "0") == "1" else dtype
@@ -202,7 +214,7 @@ class FusedDraft:
             # DFLASH_DRAFT_PREP_FUSE=1: the prep (+ KV write + block attention) runs in the QKV program: its cores
             # move off the QKV / boundary cores ((0, 0), the KV write's (0, 1)): one column right, KV write at (9, 0)
             self.prep_kv_write = draft.kv_write
-            if os.environ.get("DFLASH_DRAFT_PREP_FUSE", "0") == "1":
+            if prep_shift:
                 from .kv_write import DraftKVWrite
 
                 head_mc = ttnn.create_sharded_memory_config(
@@ -279,6 +291,8 @@ class FusedDraft:
         taken |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.qkv.cores, row_wise=True)}
         taken |= {(c.x, c.y) for c in ttnn.corerange_to_cores(self.b.cores, row_wise=True)}
         taken |= {(h.x, h.y) for h in getattr(self.b, "helpers", [])}
+        if self.oproj_fuse:  # o_proj runs in the attention program
+            taken |= {(c.x, c.y) for c, *_ in self.o.assignments}
         S = min(int(os.environ.get("DFLASH_BA_S", "24")), (grid.x * grid.y - len(taken)) // per_slice)
         # DFLASH_DRAFT_BA_MIN_CHUNKS: the drafter's own minimum chunks per slice (default BA_MIN_CHUNKS)
         min_chunks = int(os.environ.get("DFLASH_DRAFT_BA_MIN_CHUNKS", os.environ.get("BA_MIN_CHUNKS", "4")))
@@ -298,6 +312,68 @@ class FusedDraft:
             q_rows=True,
             min_chunks=min_chunks,
         )
+
+    def _attention_oproj(self, i, kv, fuse_fn):
+        """Layer i's q / k prep + KV write + block attention + o_proj + the attn-site boundary send as one program per
+        device (DFLASH_DRAFT_OPROJ_FUSE): o_proj's readers buffer all their weight columns while attention runs; its
+        writers wait for block attention's roots (semaphore OPROJ_X_SEM), then notify the boundary sender (semaphore
+        4). Returns the prep's (q, k, v) head shards."""
+        d, b = self.d, self.b
+        pk, pc, ps, pio, (qr, kr, vs) = self.prep.parts(
+            self.q, self.k, self.vv, self.prep_gamma[i], d.t_rot, kv=kv, fuse_fn=fuse_fn, sem_base=PREP_SEM_BASE
+        )
+        oprog, oio = self.o(
+            self.ba.out,
+            self.w_o[i],
+            self.v.partial,
+            build_only=True,
+            spec_tt=self.shared.Tt,
+            x_wait=(OPROJ_X_SEM, self.ba.nkv * self.ba.Tq),
+            notify=(b.noc_xy[0], b.noc_xy[1], 4),
+            # DFLASH_DRAFT_OPROJ_R_WAIT=1: the weight stream starts at the KV write's signal (after the prep's reads)
+            extra_defines=[("LIN_R_WAIT_SEM", str(BA_PREP_SEM)), ("LIN_R_WAIT_N", "2")] if OPROJ_R_WAIT else None,
+        )
+        if not getattr(self, "_oproj_checked", False):
+            self._oproj_checked = True
+            kc = lambda ks: {(c.x, c.y) for k in ks for c in ttnn.corerange_to_cores(k.core_ranges, row_wise=True)}
+            a, o = kc(pk), kc(oprog.kernels)
+            assert not (a & o) and not (
+                a & {(c.x, c.y) for c in ttnn.corerange_to_cores(b.cores)}
+            ), f"attention / o_proj cores clash: {sorted(a & o)}"
+            ids = [sd.id for sd in list(ps) + list(oprog.semaphores)] + [4, OPROJ_X_SEM]
+            ids = [i for i in ids if i != BA_PREP_SEM] + [BA_PREP_SEM]  # (BA and o_proj cores: two descriptors)
+            assert len(ids) == len(set(ids)), f"semaphore ids clash: {ids}"
+        n_o = self.o.cores.num_cores()
+        mesh_program = ttnn.MeshProgramDescriptor()
+        for coord in b.coords:
+            program = ttnn.ProgramDescriptor(
+                kernels=list(pk) + list(oprog.kernels),
+                semaphores=list(ps)
+                + list(oprog.semaphores)
+                + [
+                    ttnn.SemaphoreDescriptor(4, ttnn.CoreType.WORKER, self.o.cores.merge(b.cores), 0),
+                    ttnn.SemaphoreDescriptor(OPROJ_X_SEM, ttnn.CoreType.WORKER, self.o.cores, 0),
+                ]
+                + (
+                    [ttnn.SemaphoreDescriptor(BA_PREP_SEM, ttnn.CoreType.WORKER, self.o.cores, 0)]
+                    if OPROJ_R_WAIT
+                    else []
+                ),
+                cbs=list(pc) + list(oprog.cbs),
+            )
+            links = min(b.links, b.chunks)
+            for link in range(links):
+                sender = b._sender_kernel(
+                    coord, self.v.partial, "attn", producers=n_o, sem_id=4, link=link, links=links
+                )
+                b._add_sender(coord, program, sender, link)
+            mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
+        io = []
+        for t in [*pio, qr, kr, vs, *oio]:
+            if all(t is not u for u in io):
+                io.append(t)
+        ttnn.generic_op(io, mesh_program)
+        return qr, kr, vs
 
     def _prep_fusable(self):
         """The prep / KV write cores are clear of the QKV program's cores (QKV writers, boundary, helpers)."""
@@ -617,11 +693,23 @@ class FusedDraft:
                 and os.environ.get("DFLASH_DRAFT_BA_FUSE", "1") == "1"
             )
             fuse_fn = None
+            o_fused = False
             if ba_fused:
                 # DFLASH_DRAFT_BA_PATCH=1: block attention reads the block's chunks with the old ones and patches the
                 # block's rows in from the head-sharded K / V itself (signalled once those are written), instead of
                 # waiting for the KV write's cache tiles
                 ba_patch = os.environ.get("DFLASH_DRAFT_BA_PATCH", "1") == "1"
+                o_fused = (
+                    fab
+                    and self.oproj_fuse
+                    and self.prep is not None
+                    and self.prep_kv
+                    and os.environ.get("DFLASH_DRAFT_PREP_FUSE", "0") != "1"
+                )
+                o_notify = None
+                if o_fused:
+                    o_noc = [self.mesh.worker_core_from_logical_core(c) for c, *_ in self.o.assignments]
+                    o_notify = (o_noc, OPROJ_X_SEM)
 
                 def fuse_fn(qo, kv_src=None, kc=kc, vc=vc):
                     coords = self.prep_kv_write.coords
@@ -629,9 +717,19 @@ class FusedDraft:
                     if ba_patch and kv_src is not None:
                         patch = (kv_src[0], kv_src[1], list(zip(coords[0::2], coords[1::2])))
                     kern, cbs, io = self.ba.parts(
-                        qo, kc, vc, d.t_bound, d.page_table, None, d.hd**-0.5, wait=(BA_PREP_SEM, 2), patch=patch
+                        qo,
+                        kc,
+                        vc,
+                        d.t_bound,
+                        d.page_table,
+                        None,
+                        d.hd**-0.5,
+                        wait=(BA_PREP_SEM, 2),
+                        patch=patch,
+                        out_notify=o_notify,
                     )
-                    out = (kern, cbs, io, self.ba.notify_order(), BA_PREP_SEM, self.ba.semaphores())
+                    notify = self.ba.notify_order() + (o_notify[0] if o_notify and OPROJ_R_WAIT else [])
+                    out = (kern, cbs, io, notify, BA_PREP_SEM, self.ba.semaphores())
                     return out + (patch is not None,)
 
             # DFLASH_DRAFT_PREP_FUSE=1: the prep (+ KV write + block attention) runs in the QKV program, after its
@@ -676,6 +774,8 @@ class FusedDraft:
             pending.residual.deallocate(True)
             if prep_fused:
                 pass
+            elif o_fused and not prep_fused:
+                qr, kr, vs = self._attention_oproj(i, kv, fuse_fn)
             elif self.prep is not None:
                 qr, kr, vs = self.prep(self.q, self.k, self.vv, self.prep_gamma[i], d.t_rot, kv=kv, fuse_fn=fuse_fn)
             else:
@@ -708,13 +808,16 @@ class FusedDraft:
                     memory_config=self.inter_mc,
                 )
             qr.deallocate(True)
-            self.o(
-                attn,
-                self.w_o[i],
-                v.partial,
-                send=(b, "attn") if fab else None,
-                spec_tt=self.shared.Tt if shared else None,
-            )
+            if o_fused and not prep_fused:
+                pass  # (o_proj ran in the attention program)
+            else:
+                self.o(
+                    attn,
+                    self.w_o[i],
+                    v.partial,
+                    send=(b, "attn") if fab else None,
+                    spec_tt=self.shared.Tt if shared else None,
+                )
             if self.ba is None or attn is not self.ba.out:  # block attention's output is persistent
                 attn.deallocate(True)
             pending = PendingBoundary(b, res, self.g_ln2[i], v.partial, "attn", sent=fab)

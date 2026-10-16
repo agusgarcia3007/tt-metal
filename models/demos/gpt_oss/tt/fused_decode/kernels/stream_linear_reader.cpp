@@ -34,6 +34,11 @@ void kernel_main() {
     static_assert(pages_per_col * page_bytes == col_bytes, "page size must divide the block");
 
     const uint64_t w_base = get_noc_addr_from_bank_id<true>(bank_id, w_addr);
+#ifdef LIN_R_WAIT_SEM
+    // a fused program's earlier stage reads first (the drafter's attention + o_proj, dflash/fused_draft.py): start
+    // streaming after LIN_R_WAIT_N increments of program semaphore LIN_R_WAIT_SEM
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(LIN_R_WAIT_SEM)), LIN_R_WAIT_N);
+#endif
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, noc_index);
     noc_async_read_one_packet_set_state<true>(w_base, page_bytes, vc);
 

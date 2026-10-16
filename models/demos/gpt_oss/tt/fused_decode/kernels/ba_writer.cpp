@@ -98,6 +98,15 @@ void kernel_main() {
             noc_async_write(src + t * tile, s_out.get_noc_addr(g * 2 * Tt + 2 * t0 + t), tile);
         }
         noc_async_write_barrier();
+#ifdef BA_OUT_NOTIFY_N
+        // a consumer in the same program (the drafter's o_proj, dflash/fused_draft.py): increment its semaphore
+        // BA_OUT_NOTIFY_SEM on each of its cores (common args BA_OUT_NOTIFY_ARG..: noc (x << 8 | y), 2 per word)
+        for (uint32_t i = 0; i < BA_OUT_NOTIFY_N; ++i) {
+            const uint32_t w = get_common_arg_val<uint32_t>(BA_OUT_NOTIFY_ARG + i / 2) >> (16 * (i % 2));
+            noc_semaphore_inc(get_noc_addr((w >> 8) & 0xFF, w & 0xFF, get_semaphore(BA_OUT_NOTIFY_SEM)), 1);
+        }
+        noc_async_atomic_barrier();
+#endif
         cb_pop_front(cb_out, 2 * TC);
     } else {
         constexpr uint32_t fp32_tile = 4096;
