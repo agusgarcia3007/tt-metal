@@ -83,7 +83,7 @@ class FusedDraft:
         # DFLASH_DRAFT_OPROJ_FUSE=1: o_proj (+ the attn-site boundary send) runs in the attention program (q / k prep +
         # KV write + block attention): its weights stream in while attention runs, block attention's roots signal it.
         # The prep then takes the shifted layout ((1 + r % 8, r // 8), KV write (9, 0): clear of the boundary core).
-        self.oproj_fuse = os.environ.get("DFLASH_DRAFT_OPROJ_FUSE", "0") == "1" and b.ccl == "fabric"
+        self.oproj_fuse = os.environ.get("DFLASH_DRAFT_OPROJ_FUSE", "1") == "1" and b.ccl == "fabric"
         prep_shift = os.environ.get("DFLASH_DRAFT_PREP_FUSE", "0") == "1" or self.oproj_fuse
         prep_xy = [(1 + r % 8, r // 8) for r in range(M)] + [(9, 0)] if prep_shift else []
         # (o_proj's readers placed around these also stay off the boundary sender's and helpers' cores)
