@@ -123,10 +123,23 @@ void kernel_main() {
         const uint32_t scr = get_write_ptr(MOE_SPLIT_CB_SCR);
         volatile tt_l1_ptr uint32_t* ids = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scr + 128 + 64 * rows + 128);
         volatile tt_l1_ptr uint32_t* wq = ids + rows * topk;
+#ifdef MOE_EARLY_UNION
+        // ids first (the union goes out before the softmax), then the weights (stream_linear_writer.cpp)
+        volatile tt_l1_ptr uint32_t* keys = wq + rows * topk;
+        router_topk::rows_ids<topk, rows>(reinterpret_cast<const uint32_t*>(src), rows / 2, rows, ids, keys);
+        asm volatile("fence" ::: "memory");
+        noc_semaphore_inc(get_noc_addr(get_semaphore(MOE_SPLIT_SEM)), 1);
+        noc_async_atomic_barrier();
+        router_topk::rows_softmax<topk>(rows / 2, rows, keys, wq);
+        asm volatile("fence" ::: "memory");
+        noc_semaphore_inc(get_noc_addr(get_semaphore(MOE_SPLIT_SEM)), 1);
+        noc_async_atomic_barrier();
+#else
         router_topk::rows_topk<topk, rows>(reinterpret_cast<const uint32_t*>(src), rows / 2, rows, ids, wq);
         asm volatile("fence" ::: "memory");
         noc_semaphore_inc(get_noc_addr(get_semaphore(MOE_SPLIT_SEM)), 1);
         noc_async_atomic_barrier();
+#endif
     }
 #endif
 }

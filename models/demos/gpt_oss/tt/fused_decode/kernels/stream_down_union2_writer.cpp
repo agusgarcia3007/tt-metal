@@ -79,7 +79,9 @@ void kernel_main() {
         hub_x, hub_y, get_arg_val<uint32_t>(9), scr + 128 + 64 * rows + 16, MOE_PRED_SEM, pred);
 #endif
     noc_async_read(s_uni.get_noc_addr(0), scr, 128);
+#ifndef MOE_WSEM
     noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
+#endif
     noc_async_read_barrier();
     invalidate_l1_cache();
     volatile tt_l1_ptr uint16_t* uni = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr);
@@ -87,6 +89,13 @@ void kernel_main() {
     ckernel::mailbox_write(ckernel::ThreadId::UnpackThreadId, num_sel);
     ckernel::mailbox_write(ckernel::ThreadId::MathThreadId, num_sel);
     ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, num_sel);
+#ifdef MOE_WSEM
+    // the router releases the union first, the routing weights after (semaphore MOE_WSEM)
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(MOE_WSEM)), 1);
+    noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
+    noc_async_read_barrier();
+    invalidate_l1_cache();
+#endif
     volatile tt_l1_ptr uint16_t* w = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr + 128);
     uint32_t order[32];
 #ifdef MOE_PRED

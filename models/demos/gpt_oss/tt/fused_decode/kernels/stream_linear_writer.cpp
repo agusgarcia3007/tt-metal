@@ -484,7 +484,58 @@ void kernel_main() {
                 // entry i = row r's softmax weight of union expert i (0 when row r did not route to it).
 
                 invalidate_l1_cache();
-#ifdef MOE_SPLIT_ROWS
+#if defined(MOE_SPLIT_ROWS) && defined(MOE_EARLY_UNION)
+                // MOE_EARLY_UNION: the top-4 ids of every row (rows [rows / 2, rows) on NCRISC, MOE_SPLIT_SEM 1), the
+                // union out and the gate|up / down cores released (zeroed counters, semaphore 1) before the softmax;
+                // then the weights (NCRISC's rows: MOE_SPLIT_SEM 2) and semaphore MOE_WSEM on the same cores
+                {
+                    volatile tt_l1_ptr uint32_t* ids =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks + 128 + 64 * rows + 128);
+                    volatile tt_l1_ptr uint32_t* wq = ids + rows * q_cols;
+                    volatile tt_l1_ptr uint32_t* keys = wq + rows * q_cols;
+                    volatile tt_l1_ptr uint32_t* split =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(MOE_SPLIT_SEM));
+                    router_topk::rows_ids<q_cols, rows>(reinterpret_cast<const uint32_t*>(src), 0, rows / 2, ids, keys);
+                    noc_semaphore_wait_min(split, 1);
+                    invalidate_l1_cache();
+                    uint32_t slot[32];
+                    const uint32_t u = router_topk::union_ids<q_cols, rows>(
+                        ids, reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks), slot);
+                    DeviceTimestampedData("MOE_T", 104);
+                    noc_async_write(exp_chunks, s_out.get_noc_addr(0), 128);
+                    volatile tt_l1_ptr uint32_t* ctr =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_val<uint32_t>(5));
+                    for (uint32_t i = 0; i < 32 * 4; ++i) {
+                        ctr[i] = 0;
+                    }
+                    noc_async_write_barrier();
+                    const uint32_t n_rel = get_arg_val<uint32_t>(6);
+                    for (uint32_t i = 0; i < n_rel; ++i) {
+                        noc_semaphore_inc(
+                            get_noc_addr(
+                                get_arg_val<uint32_t>(7 + 2 * i), get_arg_val<uint32_t>(8 + 2 * i), get_semaphore(1)),
+                            1);
+                    }
+                    DeviceTimestampedData("MOE_T", 106);
+                    router_topk::rows_softmax<q_cols>(0, rows / 2, keys, wq);
+                    noc_semaphore_wait_min(split, 2);
+                    invalidate_l1_cache();
+                    router_topk::union_weights<q_cols, rows>(
+                        u, slot, ids, wq, reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks + 128));
+                    noc_async_write(exp_chunks + 128, s_k.get_noc_addr(0), 64 * rows);
+                    noc_async_write_barrier();
+                    for (uint32_t i = 0; i < n_rel; ++i) {
+                        noc_semaphore_inc(
+                            get_noc_addr(
+                                get_arg_val<uint32_t>(7 + 2 * i),
+                                get_arg_val<uint32_t>(8 + 2 * i),
+                                get_semaphore(MOE_WSEM)),
+                            1);
+                    }
+                    noc_async_atomic_barrier();
+                    DeviceTimestampedData("MOE_T", 107);
+                }
+#elif defined(MOE_SPLIT_ROWS)
                 // rows [rows / 2, rows) run on NCRISC (stream_linear_reader.cpp), which signals MOE_SPLIT_SEM
                 {
                     volatile tt_l1_ptr uint32_t* ids =
@@ -505,11 +556,13 @@ void kernel_main() {
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks),
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(exp_chunks + 128));
 #endif
+#ifndef MOE_EARLY_UNION
 #ifdef MOE_FUSED
                 DeviceTimestampedData("MOE_T", 104);
 #endif
                 noc_async_write(exp_chunks, s_out.get_noc_addr(0), 128);
                 noc_async_write(exp_chunks + 128, s_k.get_noc_addr(0), 64 * rows);
+#endif
             } else if constexpr (out_mode == 6) {
                 // BF16 b -> signed order key: s = (int16) b; key = s ^ ((s >> 31) & 0x7FFF) (monotonic in the
                 // value, as signed ints). Word loads (two values), values in index order (strict > keeps the lowest).
@@ -736,6 +789,7 @@ void kernel_main() {
     // this core's L1, runtime arg 5), then release the gate|up and down cores (program semaphore 1; runtime args 6:
     // their count, 7..: noc x, y). The union / weights writes above are complete (barrier).
     {
+#ifndef MOE_EARLY_UNION  // (released above, after the union)
         DeviceTimestampedData("MOE_T", 106);
 #ifndef MOE_STEAL
         volatile tt_l1_ptr uint32_t* ctr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_val<uint32_t>(5));
@@ -750,6 +804,9 @@ void kernel_main() {
             noc_semaphore_inc(get_noc_addr(get_arg_val<uint32_t>(7 + 2 * i), get_arg_val<uint32_t>(8 + 2 * i), sem), 1);
         }
         noc_async_atomic_barrier();
+#else
+        const uint32_t n = get_arg_val<uint32_t>(6);
+#endif
 #ifdef MOE_PRED
         // Next round's prediction for this layer: the P union experts routed by the most rows (ties: lower slot),
         // written once every gate|up / down kernel read the current one (program semaphore MOE_PRED_SEM).

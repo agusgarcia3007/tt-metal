@@ -115,7 +115,9 @@ void kernel_main() {
 #endif
     DeviceTimestampedData("MOE_T", 202);
     noc_async_read(s_uni.get_noc_addr(0), scr, 128);
+#ifndef MOE_WSEM
     noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
+#endif
 #endif
     noc_async_read_barrier();
     invalidate_l1_cache();
@@ -149,6 +151,13 @@ void kernel_main() {
     ckernel::mailbox_write(ckernel::ThreadId::PackThreadId, hits);
 #endif
 
+#if defined(MOE_FUSED) && defined(MOE_WSEM)
+    // the router releases the union first, the routing weights after (semaphore MOE_WSEM)
+    noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(MOE_WSEM)), 1);
+    noc_async_read(s_w.get_noc_addr(0), scr + 128, 64 * rows);
+    noc_async_read_barrier();
+    invalidate_l1_cache();
+#endif
     volatile tt_l1_ptr uint16_t* w = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr + 128);
     cb_reserve_back(cb_sc, num_sel);
     const uint32_t sc_l1 = get_write_ptr(cb_sc);

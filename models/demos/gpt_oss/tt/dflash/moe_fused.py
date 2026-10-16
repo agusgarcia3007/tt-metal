@@ -27,6 +27,7 @@ from ..fused_decode.stream import EXPERT_BANK_ROT
 from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion
 
 MOE = [("MOE_FUSED", "1")]
+EARLY_WSEM = 7  # DFLASH_MOE_EARLY_UNION: routing weights ready (gate|up / down cores)
 # DFLASH_MOE_STEAL=1: gate|up work stealing within a bank (kernels/stream_gate_up_union_reader.cpp), per-(slot, pair)
 # done flags instead of per-slot counters
 STEAL = os.environ.get("DFLASH_MOE_STEAL", "0") == "1"
@@ -182,6 +183,11 @@ class MoEFused:
         down and sends the down partial to the moe site. Sets pending.residual_out / pending.x. active_rows: only rows
         [0, active_rows) route to experts (0: all)."""
         MOE_ = MOE + ([("MOE_ACTIVE_ROWS", str(active_rows))] if active_rows else [])
+        # DFLASH_MOE_EARLY_UNION=1 (with the router row split): the router releases gate|up / down on the union, the
+        # softmax weights follow (semaphore EARLY_WSEM; kernels/stream_linear_writer.cpp MOE_EARLY_UNION)
+        early = bool(self.split_defines) and not STEAL and os.environ.get("DFLASH_MOE_EARLY_UNION", "0") == "1"
+        if early:
+            MOE_ = MOE_ + [("MOE_WSEM", str(EARLY_WSEM))]
         b, mesh = self.boundary, self.mesh
         ctr = self.counters.buffer_address()
         rx, ry = self.router_noc.x, self.router_noc.y
@@ -198,7 +204,7 @@ class MoEFused:
             (union, weights),
             build_only=True,
             consumer_cores=self.R.merge(self.G_all),
-            extra_defines=MOE_ + self.split_defines + pdef,
+            extra_defines=MOE_ + self.split_defines + pdef + ([("MOE_EARLY_UNION", "1")] if early else []),
             extra_writer_rt=router_rt,
         )
         x = pending.x
@@ -211,6 +217,9 @@ class MoEFused:
         ]
         if self.split_defines:
             sems.append(ttnn.SemaphoreDescriptor(3, ttnn.CoreType.WORKER, self.R, 0))
+        if early:
+            assert not LOCKSTEP
+            sems.append(ttnn.SemaphoreDescriptor(EARLY_WSEM, ttnn.CoreType.WORKER, self.G_all.merge(self.D_all), 0))
         if P:
             sems.append(ttnn.SemaphoreDescriptor(4, ttnn.CoreType.WORKER, self.R, 0))
         if STEAL or LOCKSTEP:  # gate|up progress (7) and per-mate claims / issued columns (8 + reader index)
