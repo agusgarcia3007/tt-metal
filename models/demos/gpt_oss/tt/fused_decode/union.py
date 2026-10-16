@@ -174,8 +174,9 @@ class ExpertGateUpUnion(_BankStreamOp):
             self._cb(cb_id, self.weight_dtype, self.tile_bytes, 1),
             self._cb(cb_act, ttnn.bfloat16, tiny, 4, tiny=True, rows=M),
         ]
-        if pred_p:
-            cbs.append(self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * 2 * self.pairs * self.kt))
+        if pred_p:  # first: at the CB base address, where an early prefetch (MOE_EARLY, dflash/early_prefetch.py) left
+            # the first predictions' columns in the program before
+            cbs.insert(0, self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * 2 * self.pairs * self.kt))
         steal = any(d[0] == "MOE_STEAL" for d in (extra_defines or []))
         lockstep = any(d[0] == "MOE_LOCKSTEP" for d in (extra_defines or []))
         if steal:  # work stealing (kernels/stream_gate_up_union_reader.cpp): the reader's task queue (cb 8)
@@ -368,8 +369,8 @@ class ExpertDownUnion(_BankStreamOp):
             self._cb(cb_scr, ttnn.bfloat16, 128 + 64 * M + 128, 1),  # (+ the stealing poll's 128 B of done flags)
             self._cb(cb_out, ttnn.bfloat16, tiny, 4, tiny=True, rows=M),
         ]
-        if pred_p:  # MOE_PRED: the predicted experts' prefetched blocks (CB 6)
-            cbs.append(self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * block))
+        if pred_p:  # MOE_PRED: the predicted experts' prefetched blocks (CB 6), first (at the CB base, see gate|up)
+            cbs.insert(0, self._cb(6, self.weight_dtype, self.tile_bytes, pred_p * block))
         reader_rt, writer_rt, compute_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         for core, bank, r, vc in self.assignments:
             if self.balanced:  # (slot in the bank, columns, first output column) of this core

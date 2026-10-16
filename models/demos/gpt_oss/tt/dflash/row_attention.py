@@ -24,13 +24,21 @@ def _f32_bits(v):
 
 
 class RowAttention:
-    def __init__(self, mesh_device, rows, n_heads, n_kv, head_dim, block_size, max_chunks, cores_start=(0, 0)):
+    def __init__(
+        self, mesh_device, rows, n_heads, n_kv, head_dim, block_size, max_chunks, cores_start=(0, 0), core_list=None
+    ):
+        """core_list: explicit logical cores (rows x n_kv, any placement) instead of the 8-wide block at cores_start."""
         assert head_dim == 64 and n_heads <= TILE and n_heads // n_kv == 8, "one 32-row tile of heads, 8 per kv head"
         self.mesh, self.M, self.nq, self.nkv, self.hd = mesh_device, rows, n_heads, n_kv, head_dim
         self.block, self.max_chunks = block_size, max_chunks
-        x0, y0 = cores_start
-        self.core_list = [ttnn.CoreCoord(x0 + (i % 8), y0 + i // 8) for i in range(rows * n_kv)]
-        self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(self.core_list[0], self.core_list[-1])])
+        if core_list is not None:
+            assert len(core_list) == rows * n_kv
+            self.core_list = [ttnn.CoreCoord(*c) for c in core_list]
+            self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in self.core_list])
+        else:
+            x0, y0 = cores_start
+            self.core_list = [ttnn.CoreCoord(x0 + (i % 8), y0 + i // 8) for i in range(rows * n_kv)]
+            self.cores = ttnn.CoreRangeSet([ttnn.CoreRange(self.core_list[0], self.core_list[-1])])
         # DFLASH_RA_OUT_L1=1: the output in L1 (the o_proj stream reads rows straight from it; a DRAM source is staged
         # whole tiles first)
         out_mc = ttnn.L1_MEMORY_CONFIG if os.environ.get("DFLASH_RA_OUT_L1", "1") == "1" else ttnn.DRAM_MEMORY_CONFIG

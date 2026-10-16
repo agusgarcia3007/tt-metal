@@ -302,6 +302,59 @@ class FusedVerify:
                 real_inter=cfg.intermediate_size // tp if os.environ.get("DFLASH_SKIP_PAD", "1") == "1" else None,
                 down_bal_plan=bal_plan,
             )
+        # DFLASH_SLIDE_OFF_MOE=1: the sliding-window layers' QKV + row attention and o_proj on cores the MoE program does
+        # not use (second QKV / row attention / o_proj objects), so the MoE's cores are idle while those run
+        self.slide_off = None
+        # DFLASH_EARLY_PF=E (implies DFLASH_SLIDE_OFF_MOE): the sliding layers' QKV + row attention program also reads
+        # the layer's first E predicted experts into the MoE cores' L1 (MoEFused.early_parts) once its QKV weights
+        # landed; the MoE then prefetches only the next DFLASH_MOE_PRED predictions itself
+        self.early_pf = int(os.environ.get("DFLASH_EARLY_PF", "0"))
+        if (
+            self.moe_fused is not None
+            and self.row_attn is not None
+            and (os.environ.get("DFLASH_SLIDE_OFF_MOE", "0") == "1" or self.early_pf)
+        ):
+            mf = self.moe_fused
+            moe_xy = {(c.x, c.y) for cs in (mf.G_all, mf.D_all, mf.R) for c in ttnn.corerange_to_cores(cs)}
+            bnd_xy = {(c.x, c.y) for c in ttnn.corerange_to_cores(self.boundary.cores)}
+            bnd_xy |= {(h.x, h.y) for h in getattr(self.boundary, "helpers", [])}
+            qkv_s = LinearStream(
+                mesh,
+                H // TILE,
+                (self.nq + 2 * self.nkv) * self.hd,
+                QKV_DECODE_WEIGHT_DTYPE,
+                readers=int(os.environ.get("DFLASH_QKV_READERS", QKV_STREAM_READERS)),
+                out_mode=3,
+                heads=(self.nq * self.hd // TILE, self.nkv * self.hd // TILE),
+                rows=M,
+                exclude=sorted(moe_xy | bnd_xy),
+            )
+            used = moe_xy | bnd_xy | {(c.x, c.y) for c in ttnn.corerange_to_cores(qkv_s.cores)}
+            grid = mesh.compute_with_storage_grid_size()
+            free = [(x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in used]
+            n_ra = M * self.nkv
+            assert len(free) >= n_ra, f"{len(free)} free cores for row attention ({n_ra})"
+            ra_s = RowAttention(
+                mesh, M, self.nq, self.nkv, self.hd, 64, max_chunks=self.row_attn_max // TILE, core_list=free[:n_ra]
+            )
+            o_s = LinearStream(
+                mesh,
+                self.nq * self.hd // TILE,
+                H,
+                OPROJ_DECODE_WEIGHT_DTYPE,
+                readers=int(os.environ.get("DFLASH_OPROJ_READERS", "3")),
+                x_pages=self.hd // TILE,
+                out_mode=5,
+                rows=M,
+                gather_split=os.environ.get("DFLASH_OPROJ_SPLIT", "1") == "1",
+                exclude=sorted(moe_xy | bnd_xy),
+            )
+            self.slide_off = dict(qkv=qkv_s, ra=ra_s, o=o_s)
+            print(
+                f"slide off MoE: qkv {[(c.x, c.y) for c, *_ in qkv_s.assignments]}, ra {free[:n_ra]}, "
+                f"o_proj {[(c.x, c.y) for c, *_ in o_s.assignments]}",
+                flush=True,
+            )
         term = model.decode_terminal
         self.vd = term.vd
         lm_readers = int(os.environ.get("DFLASH_LM_READERS", "2"))
@@ -505,6 +558,10 @@ class FusedVerify:
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
             k_cache, v_cache = self.kv_cache[i]
+            so = self.slide_off if (self.slide_off is not None and attn.config.sliding_window) else None
+            qkv_l = so["qkv"] if so else self.qkv
+            ra_l = so["ra"] if so else self.row_attn
+            o_l = so["o"] if so else self.o_proj
             rk = QKVRopeCache.rows(
                 self.rot, self.cos_table, self.sin_table, self.pos, self.page_table, k_cache, v_cache
             )
@@ -517,7 +574,7 @@ class FusedVerify:
             if ra_here and getattr(self, "ra_fuse", False):
                 k_cache, v_cache = self.kv_cache[i]
                 o_noc = _noc_list(self.mesh, o_f.cores) if o_f is not None else None
-                kern, cbs, io = self.row_attn.parts(
+                kern, cbs, io = ra_l.parts(
                     self.q,
                     k_cache,
                     v_cache,
@@ -526,11 +583,11 @@ class FusedVerify:
                     attn.weights.decode_sinks,
                     attn.config.scaling,
                     window=attn.config.sliding_window or 0,
-                    wait=(3, len(self.qkv.assignments)),
+                    wait=(3, len(qkv_l.assignments)),
                     notify=(o_noc, 7) if o_f is not None else None,
                 )
-                mc = self.row_attn.cores if os.environ.get("DFLASH_QKV_NOTIFY_MC", "0") == "1" else None
-                fuse = (kern, cbs, io, self.row_attn.noc_cores(), 3, [], mc)
+                mc = ra_l.cores if os.environ.get("DFLASH_QKV_NOTIFY_MC", "0") == "1" else None
+                fuse = (kern, cbs, io, ra_l.noc_cores(), 3, [], mc)
             shared = (self.shared_kv is not None and self.use_shared and not attn.config.sliding_window) or (
                 slide_ba is not None
             )
@@ -547,7 +604,7 @@ class FusedVerify:
                     self.page_table,
                     attn.weights.decode_sinks,
                     attn.config.scaling,
-                    wait=(3, len(self.qkv.assignments)),
+                    wait=(3, len(qkv_l.assignments)),
                     q_sem=Q_FIRST_SEM if q_first else None,
                 )
                 # DFLASH_QKV_NOTIFY_MC=1: the QKV writers signal block attention with multicast increments
@@ -558,15 +615,15 @@ class FusedVerify:
                 fuse = (kern, cbs, io, lba.notify_order(), 3, ba_sems, mc, Q_FIRST_SEM if q_first else None)
             if o_f is not None:
                 # QKV + row attention + o_proj + the attn-site boundary send: one program per device
-                qprog, qio = self.qkv(
+                qprog, qio = qkv_l(
                     pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse, build_only=True
                 )
                 oprog, oio = o_f(
-                    self.row_attn.out,
+                    ra_l.out,
                     attn.weights.o_proj_stream,
                     self.partial,
                     build_only=True,
-                    x_wait=(7, len(self.row_attn.core_list)),
+                    x_wait=(7, len(ra_l.core_list)),
                     notify=(b.noc_xy[0], b.noc_xy[1], 4),
                 )
                 n_o = o_f.cores.num_cores()
@@ -596,7 +653,7 @@ class FusedVerify:
                 ttnn.generic_op(io, mesh_program)
             elif shared:  # Q straight into the shared-KV attention's packed layout
                 sq = lba.q if lba is not None else self.shared_kv.q
-                self.qkv(
+                qkv_l(
                     pending,
                     attn.weights.wqkv_stream,
                     (sq, sq, sq),
@@ -605,8 +662,49 @@ class FusedVerify:
                     fuse=fuse,
                     q_first=q_first,
                 )
+            elif so is not None and self.early_pf:
+                # + the early expert prefetch on the MoE's cores, gated on the QKV readers' weights
+                # the gate: a row attention core (not a QKV reader: its readers count there with NOC atomics)
+                gate = ra_l.core_list[0]
+                gate_noc = mesh_noc = self.mesh.worker_core_from_logical_core(gate)
+                dw_i = layer.mlp.experts.decode_weights
+                ek, ecb, eio = self.moe_fused.early_parts(
+                    i,
+                    self.early_pf,
+                    dw_i.gate_up_stream,
+                    self.down_bal.get(i, dw_i.down_stream),
+                    gate_noc,
+                    len(qkv_l.assignments),
+                )
+                gsem = self.moe_fused.EARLY_GATE_SEM
+                qprog, qio = qkv_l(
+                    pending,
+                    attn.weights.wqkv_stream,
+                    (self.q, self.q, self.q),
+                    rope_kv=rk,
+                    fuse=fuse,
+                    build_only=True,
+                    extra_defines=[
+                        ("LIN_DONE_SEM", str(gsem)),
+                        ("LIN_DONE_X", str(mesh_noc.x)),
+                        ("LIN_DONE_Y", str(mesh_noc.y)),
+                    ],
+                )
+                assert all(sd.id != gsem for sd in qprog.semaphores)
+                qprog.kernels = list(qprog.kernels) + ek
+                qprog.cbs = list(qprog.cbs) + ecb
+                qprog.semaphores = list(qprog.semaphores) + [
+                    ttnn.SemaphoreDescriptor(
+                        gsem, ttnn.CoreType.WORKER, ttnn.CoreRangeSet([ttnn.CoreRange(gate, gate)]), 0
+                    )
+                ]
+                io = list(qio)
+                for t in eio:
+                    if all(t is not u for u in io):
+                        io.append(t)
+                ttnn.generic_op(io, qprog)
             else:
-                self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse)
+                qkv_l(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse)
             res = pending.residual_out
             pending.x.deallocate(True)
             pending.residual.deallocate(True)
@@ -615,7 +713,7 @@ class FusedVerify:
             if shared and lba is not None:
                 sdpa = lba.out
             elif fuse is not None:
-                sdpa = self.row_attn.out
+                sdpa = ra_l.out
             elif shared:
                 sdpa = self.shared_kv.attend(
                     k_cache,
@@ -627,7 +725,7 @@ class FusedVerify:
             else:
                 sdpa = self._sdpa(i)
             if o_f is None:
-                self.o_proj(
+                o_l(
                     sdpa,
                     attn.weights.o_proj_stream,
                     self.partial,
@@ -652,6 +750,7 @@ class FusedVerify:
                     self.partial,
                     layer=i,
                     active_rows=self.active_rows,
+                    early_pf=self.early_pf if so is not None else 0,
                 )
                 res = pending.residual_out
                 pending.residual.deallocate(True)
@@ -801,7 +900,13 @@ class FusedVerify:
         # the row attention / shared-KV outputs are reused by every layer
         return any(
             o is not None and t is o.out
-            for o in (self.row_attn, self.shared_kv, self.block_attn, self.block_attn_slide)
+            for o in (
+                self.row_attn,
+                self.shared_kv,
+                self.block_attn,
+                self.block_attn_slide,
+                (self.slide_off or {}).get("ra"),
+            )
         )
 
     def _sdpa(self, i):

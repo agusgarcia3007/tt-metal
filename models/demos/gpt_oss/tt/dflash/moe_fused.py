@@ -23,6 +23,7 @@ import torch
 
 import ttnn
 
+from ..fused_decode.boundary import KERNEL_DIR
 from ..fused_decode.stream import EXPERT_BANK_ROT
 from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion
 
@@ -186,18 +187,19 @@ class MoEFused:
             memory_config=ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard),
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
         )
-        # Expert prediction (MOE_PRED): per layer, the previous round's P most-routed experts (16 B per layer in the
-        # router core's L1), prefetched by gate|up during the boundary + router and processed first if routed again.
+        # Expert prediction (MOE_PRED): per layer, the previous round's P (<= 8) most-routed experts (32 B per layer in
+        # the router core's L1), prefetched by gate|up / down during the boundary + router and processed first if routed
+        # again.
         self.pred_p = int(os.environ.get("DFLASH_MOE_PRED", "3"))
         self.pred = ttnn.from_torch(
-            torch.zeros(32, 4, dtype=torch.int32),
+            torch.zeros(32, 8, dtype=torch.int32),
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=mesh_device,
             memory_config=ttnn.MemoryConfig(
                 ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
                 ttnn.BufferType.L1,
-                ttnn.ShardSpec(self.R, [32, 4], ttnn.ShardOrientation.ROW_MAJOR),
+                ttnn.ShardSpec(self.R, [32, 8], ttnn.ShardOrientation.ROW_MAJOR),
             ),
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
         )
@@ -210,7 +212,60 @@ class MoEFused:
     def _part(self, coord):
         return self.parts.get((coord[0], coord[1])) or self.parts[None]
 
-    def __call__(self, pending, router_ws, union, weights, gate_up_ws, act, down_ws, partial, layer=0, active_rows=0):
+    EARLY_GATE_SEM = 14
+
+    def early_parts(self, layer, E, gate_up_ws, down_ws, gate_noc, gate_n):
+        """(kernels, cbs, io) of the early expert prefetch (kernels/moe_early_prefetch.cpp) for the program before
+        this layer's MoE, on every gate|up / down core (which that program must leave free): this core's columns of the
+        layer's first E predicted experts into its CB 6 at the CB base, where the MoE program's prediction CB (first
+        on the core, MOE_EARLY = E) takes them. gate_noc / gate_n: the core whose program semaphore EARLY_GATE_SEM the
+        program's weight readers increment once their weights landed (the prefetch waits for gate_n)."""
+        assert E > 0 and self.pred_p + E <= 8, "the router keeps 8 predictions per layer"
+        gu, dn = self.gate_up, self.down
+        assert len(self.parts) == 1, "one placement for every device"
+        rx, ry = self.router_noc.x, self.router_noc.y
+        pred_addr = self.pred.buffer_address() + 32 * layer
+        kernels, cbs = [], []
+        for op, ws in ((gu, gate_up_ws), (dn, down_ws)):
+            rt = ttnn.RuntimeArgs()
+            if op is gu:
+                slot = 2 * gu.pairs * gu.col_bytes
+                pages = 2 * gu.pairs * gu.kt
+                for core, bank, r, vc in gu.assignments:
+                    rt[core.x][core.y] = [ws.buffer_address(), bank, r * slot, slot, gu.expert_stride]
+            else:
+                slot = dn.cols * dn.seg_bytes
+                pages = dn.cols * dn.seg_tiles
+                for core, bank, r, vc in dn.assignments:
+                    if dn.balanced:
+                        s0, ncols, _ = dn.core_cols[(core.x, core.y)]
+                    else:
+                        s0, ncols = r * dn.cols, dn.cols
+                    rt[core.x][core.y] = [ws.buffer_address(), bank, s0 * dn.seg_bytes, ncols * dn.seg_bytes]
+                    rt[core.x][core.y] = list(rt[core.x][core.y]) + [dn.expert_stride]
+            for core, *_ in op.assignments:
+                rt[core.x][core.y] = list(rt[core.x][core.y]) + [rx, ry, pred_addr, gate_noc.x, gate_noc.y, gate_n]
+            cbs += [
+                op._cb(6, op.weight_dtype, op.tile_bytes, E * pages),
+                op._cb(7, ttnn.uint32, 64, 1),
+            ]
+            kernels.append(
+                ttnn.KernelDescriptor(
+                    kernel_source=str(KERNEL_DIR / "moe_early_prefetch.cpp"),
+                    core_ranges=op.cores,
+                    compile_time_args=[6, 7, slot, pages, E],
+                    runtime_args=rt,
+                    defines=[("EARLY_GATE_SEM", str(self.EARLY_GATE_SEM))],
+                    config=ttnn.DataMovementConfigDescriptor(
+                        processor=ttnn.DataMovementProcessor.RISCV_1, noc=ttnn.NOC.NOC_0
+                    ),
+                )
+            )
+        return kernels, cbs, [gate_up_ws, down_ws, self.pred]
+
+    def __call__(
+        self, pending, router_ws, union, weights, gate_up_ws, act, down_ws, partial, layer=0, active_rows=0, early_pf=0
+    ):
         """pending: the attn-site PendingBoundary (its partial sent by o_proj); runs the boundary, router, gate|up and
         down and sends the down partial to the moe site. Sets pending.residual_out / pending.x. active_rows: only rows
         [0, active_rows) route to experts (0: all)."""
@@ -227,9 +282,11 @@ class MoEFused:
         rx, ry = self.router_noc.x, self.router_noc.y
         gd = _noc(mesh, self.G_all) + _noc(mesh, self.D_all)
         router_rt = [ctr, len(gd)] + [v for p in gd for v in (p.x, p.y)]
-        P = self.pred_p
-        pred_addr = self.pred.buffer_address() + 16 * layer
+        P = self.pred_p + early_pf  # (early_pf: the first predictions were read by the program before)
+        pred_addr = self.pred.buffer_address() + 32 * layer
         pdef = [("MOE_PRED", str(P)), ("MOE_PRED_SEM", "4"), ("MOE_PRED_CB", "6")] if P else []
+        # early_pf (early_parts): the first early_pf predictions' columns were read by the program before
+        edef = [("MOE_EARLY", str(early_pf))] if early_pf else []
         if P:
             router_rt += [pred_addr, 2 * (self.G.num_cores() + self.D.num_cores())]
         rprog, rio = self.router(
@@ -272,7 +329,7 @@ class MoEFused:
                 gate_up_ws,
                 act,
                 build_only=True,
-                extra_defines=MOE_ + pdef + _wait_n(b),
+                extra_defines=MOE_ + pdef + edef + _wait_n(b),
                 extra_writer_rt=[ctr, rx, ry] + ([pred_addr] if P else []),
                 extra_reader_rt=[rx, ry, pred_addr] if P else None,
                 pred_p=P,
@@ -285,7 +342,7 @@ class MoEFused:
                 down_ws,
                 partial,
                 build_only=True,
-                extra_defines=MOE_ + pdef,
+                extra_defines=MOE_ + pdef + edef,
                 extra_writer_rt=[ctr, rx, ry, n_g] + ([pred_addr] if P else []),
                 notify_args=[1, b.noc_xy[0], b.noc_xy[1], 2],
                 extra_reader_rt=[rx, ry, pred_addr] if P else None,

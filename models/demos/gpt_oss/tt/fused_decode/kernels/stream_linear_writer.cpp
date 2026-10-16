@@ -845,7 +845,7 @@ void kernel_main() {
                     cnt[i] += wts[r * 32 + i] != 0 ? 1 : 0;
                 }
             }
-            uint32_t pick[4] = {0, 1, 2, 3};
+            uint32_t pick[8] = {0, 1, 2, 3, 4, 5, 6, 7};
             for (uint32_t k = 0; k < MOE_PRED && k < u; ++k) {
                 uint32_t best = 32;
                 for (uint32_t i = 0; i < u; ++i) {
@@ -864,7 +864,7 @@ void kernel_main() {
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(MOE_PRED_SEM)),
                 get_arg_val<uint32_t>(8 + 2 * n));
             volatile tt_l1_ptr uint32_t* pr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pred_addr);
-            for (uint32_t k = 0; k < 4; ++k) {
+            for (uint32_t k = 0; k < 8; ++k) {
                 pr[k] = pick[k];
             }
         }

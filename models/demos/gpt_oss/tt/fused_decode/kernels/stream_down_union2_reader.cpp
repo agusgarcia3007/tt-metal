@@ -69,7 +69,12 @@ void kernel_main() {
         get_arg_val<uint32_t>(5), get_arg_val<uint32_t>(6), get_arg_val<uint32_t>(7), idx_l1 + 128, MOE_PRED_SEM, pred);
     cb_reserve_back(MOE_PRED_CB, MOE_PRED * block_tiles);
     const uint32_t pre = get_write_ptr(MOE_PRED_CB);
-    for (uint32_t k = 0; k < MOE_PRED; ++k) {
+#ifdef MOE_EARLY
+    constexpr uint32_t k0 = MOE_EARLY;  // the first MOE_EARLY blocks are in place (gate|up reader, MOE_EARLY)
+#else
+    constexpr uint32_t k0 = 0;
+#endif
+    for (uint32_t k = k0; k < MOE_PRED; ++k) {
         const uint64_t src = get_noc_addr_from_bank_id<true>(bank_id, w_addr + pred[k] * expert_stride + reader_offset);
         noc_async_read(src, pre + k * block_bytes, read_bytes);
     }

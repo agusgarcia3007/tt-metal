@@ -39,12 +39,14 @@ inline uint32_t make_order(
     return kept;
 }
 
-// Read the P predicted ids (16 B at pred_addr in the hub core's L1) through scratch_l1 and tell the hub (program
-// semaphore sem_id) that they were read (the router overwrites them for the next round once every reader did).
+// Read the P (<= 8) predicted ids (32 B at pred_addr in the hub core's L1) through scratch_l1 and tell the hub
+// (program semaphore sem_id) that they were read (the router overwrites them for the next round once every reader
+// did).
 template <uint32_t P>
 inline void read_pred(
     uint32_t hub_x, uint32_t hub_y, uint32_t pred_addr, uint32_t scratch_l1, uint32_t sem_id, uint32_t* pred) {
-    noc_async_read(get_noc_addr(hub_x, hub_y, pred_addr), scratch_l1, 16);
+    static_assert(P <= 8, "the prediction holds 8 ids per layer");
+    noc_async_read(get_noc_addr(hub_x, hub_y, pred_addr), scratch_l1, 32);
     noc_async_read_barrier();
     invalidate_l1_cache();
     for (uint32_t k = 0; k < P; ++k) {

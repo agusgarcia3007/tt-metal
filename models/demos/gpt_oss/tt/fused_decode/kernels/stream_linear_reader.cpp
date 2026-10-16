@@ -119,6 +119,12 @@ void kernel_main() {
         cb_push_back(cb_w, kt);
         trid_to_wait = trid_to_wait == num_buffers ? 1 : trid_to_wait + 1;
     }
+#ifdef LIN_DONE_SEM
+    // this core's weight columns have landed: count it on the gate core (program semaphore LIN_DONE_SEM), which holds
+    // the early expert prefetch of the program's MoE cores (kernels/moe_early_prefetch.cpp)
+    noc_semaphore_inc(get_noc_addr(LIN_DONE_X, LIN_DONE_Y, get_semaphore(LIN_DONE_SEM)), 1);
+    noc_async_atomic_barrier();
+#endif
 #ifdef MOE_SPLIT_ROWS
     // Router of the fused MoE (dflash/moe_fused.py): the second half of the rows' top-k (stream_linear_writer.cpp
     // runs the first half and the union), from the logits tile in cb_out (the writer pops it after the union).
