@@ -327,6 +327,15 @@ class DenseMLPFused:
             [tuple(map(int, c.split(","))) for c in os.environ.get(k, v).split(";") if c]
             for k, v in (("DFLASH_DRAFT_G_EXCLUDE", "1,1"), ("DFLASH_DRAFT_D_EXCLUDE", ""))
         )
+        # DFLASH_DRAFT_MLP_ROWS=1: the readers on their DRAM bank's row (fused_decode/stream.py row_placement; the
+        # exclusions above do not apply): per bank the gate_up_readers nearest cores to gate|up, the next to down
+        gp = dp = None
+        if os.environ.get("DFLASH_DRAFT_MLP_ROWS", "0") == "1":
+            from ..fused_decode.stream import row_placement
+
+            rp = row_placement(mesh_device, gate_up_readers + down_readers, exclude=taken)
+            gp = [(rp[b][r], b, r) for b in sorted(rp) for r in range(gate_up_readers)]
+            dp = [(rp[b][gate_up_readers + r], b, r) for b in sorted(rp) for r in range(down_readers)]
         self.gate_up = ExpertGateUpUnion(
             mesh_device,
             hidden,
@@ -341,6 +350,7 @@ class DenseMLPFused:
             exclude=taken + g_ex,
             real_inter=real_inter,
             rot=rot,
+            placed=gp,
         )
         taken += [(c.x, c.y) for c, *_ in self.gate_up.assignments]
         self.down = ExpertDownUnion(
@@ -356,6 +366,7 @@ class DenseMLPFused:
             exclude=taken + d_ex,
             rot=rot,
             skip_pad=real_hidden,
+            placed=dp,
         )
         self.G, self.D = self.gate_up.cores, self.down.cores
         if os.environ.get("DFLASH_LOG_CORES") == "1":
