@@ -53,6 +53,9 @@ from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion, act_buffer,
 TILE = ttnn.TILE_SIZE
 
 
+Q_FIRST_SEM = 13  # DFLASH_QKV_Q_FIRST: the QKV writers' Q columns written (block attention cores)
+
+
 def _noc_list(mesh_device, cores):
     return [mesh_device.worker_core_from_logical_core(c) for c in ttnn.corerange_to_cores(cores, row_wise=True)]
 
@@ -512,6 +515,9 @@ class FusedVerify:
                 slide_ba is not None
             )
             lba = slide_ba if slide_ba is not None else ba  # this layer's block attention
+            # DFLASH_QKV_Q_FIRST=1: in the block-attention layers the QKV writers send Q first and signal it (semaphore
+            # Q_FIRST_SEM): block attention runs on the history while the K / V columns are converted and written
+            q_first = shared and lba is not None and os.environ.get("DFLASH_QKV_Q_FIRST", "0") == "1"
             if shared and lba is not None:  # block attention fused into the QKV program (Q in its packed layout)
                 kern, cbs, io = lba.parts(
                     lba.q,
@@ -522,10 +528,14 @@ class FusedVerify:
                     attn.weights.decode_sinks,
                     attn.config.scaling,
                     wait=(3, len(self.qkv.assignments)),
+                    q_sem=Q_FIRST_SEM if q_first else None,
                 )
                 # DFLASH_QKV_NOTIFY_MC=1: the QKV writers signal block attention with multicast increments
                 mc = lba.cores if os.environ.get("DFLASH_QKV_NOTIFY_MC", "0") == "1" else None
-                fuse = (kern, cbs, io, lba.notify_order(), 3, lba.semaphores(), mc)
+                ba_sems = lba.semaphores()
+                if q_first:
+                    ba_sems = ba_sems + [ttnn.SemaphoreDescriptor(Q_FIRST_SEM, ttnn.CoreType.WORKER, lba.cores, 0)]
+                fuse = (kern, cbs, io, lba.notify_order(), 3, ba_sems, mc, Q_FIRST_SEM if q_first else None)
             if o_f is not None:
                 # QKV + row attention + o_proj + the attn-site boundary send: one program per device
                 qprog, qio = self.qkv(
@@ -567,7 +577,13 @@ class FusedVerify:
             elif shared:  # Q straight into the shared-KV attention's packed layout
                 sq = lba.q if lba is not None else self.shared_kv.q
                 self.qkv(
-                    pending, attn.weights.wqkv_stream, (sq, sq, sq), rope_kv=rk, spec_tt=self.shared_kv.Tt, fuse=fuse
+                    pending,
+                    attn.weights.wqkv_stream,
+                    (sq, sq, sq),
+                    rope_kv=rk,
+                    spec_tt=self.shared_kv.Tt,
+                    fuse=fuse,
+                    q_first=q_first,
                 )
             else:
                 self.qkv(pending, attn.weights.wqkv_stream, (self.q, self.q, self.q), rope_kv=rk, fuse=fuse)

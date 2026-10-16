@@ -132,7 +132,7 @@ def stream_linear_layout(w, bias, banks, order=None):
     return _bank_columns(cols, banks)
 
 
-def qkv_column_order(n_tiles, q_cols, banks):
+def qkv_column_order(n_tiles, q_cols, banks, q_first=False):
     """Slot order of the QKV stream with fused RoPE + KV-cache write (QKVRopeCache): the K / V columns (>= q_cols) go
     first on each bank, round-robin, then the Q columns, then the bank padding. A K / V column's cache update (BFP8
     conversion + DRAM write by the writer core) then overlaps the bank's later Q columns, and no bank ends the op on
@@ -148,6 +148,9 @@ def qkv_column_order(n_tiles, q_cols, banks):
             n = next(q, None)
             sl.append(n if n is not None else next(pad))
     assert all(len(sl) == C for sl in slots) and next(q, None) is None
+    if q_first:  # q_first: each bank's Q columns, then its K / V, then padding (Q is out before the cache update)
+        rank = lambda n: 0 if n < q_cols else (1 if n < n_tiles else 2)
+        slots = [sorted(sl, key=lambda n: (rank(n), sl.index(n))) for sl in slots]
     return [n for sl in slots for n in sl]
 
 
@@ -620,10 +623,21 @@ class LinearStream(_BankStreamOp):
     def weight_rows(self):
         return self.C * self.kt * TILE
 
-    def _slot_columns(self, bank, r, order):
-        """Output column of each of a worker's weight slots (the weights' slot order, stream_linear_layout)."""
+    def _slot_columns(self, bank, r, order, q_first=False):
+        """Output column of each of a worker's weight slots (the weights' slot order, stream_linear_layout); q_first:
+        rotated past the leading K / V slots (the reader streams them last, LIN_ROT)."""
         first = bank * self.C + r * self.cols
-        return [order[first + c] for c in range(self.cols)]
+        sl = [order[first + c] for c in range(self.cols)]
+        if q_first:
+            k = self._qf_rot(sl)
+            sl = sl[k:] + sl[:k]
+        return sl
+
+    def _qf_rot(self, sl):
+        k = 0
+        while k < len(sl) and self.heads[0] <= sl[k] < self.n_tiles:
+            k += 1
+        return k if k < len(sl) else 0
 
     def __call__(
         self,
@@ -641,8 +655,11 @@ class LinearStream(_BankStreamOp):
         x_wait=None,
         notify=None,
         spec_tt=None,
+        q_first=False,
     ):
-        """spec_tt = Tt (rows > 1): x (x_pages > 0) is / Q (out_mode 3) goes to the shared-KV attention's packed layout
+        """q_first (rope_kv): each bank's Q columns before its K / V (qkv_column_order; no K / V split); with fuse[7] =
+        a semaphore id, the writers increment it on the fused op's cores once their Q columns are written.
+        spec_tt = Tt (rows > 1): x (x_pages > 0) is / Q (out_mode 3) goes to the shared-KV attention's packed layout
         (dflash/shared_kv_attention.py, Tt packed row-tiles per kv head) instead of [M, heads, head_dim].
         fuse = (kernels, cbs, io, noc_cores, sem_id[, semaphores]): another op's parts on other cores added to this
         program (with its own program semaphores); the writers increment program semaphore sem_id on noc_cores once all
@@ -726,6 +743,11 @@ class LinearStream(_BankStreamOp):
                 gs_noc += [p.x, p.y]
         for i, (core, bank, r, vc) in enumerate(self.assignments):
             reader_rt[core.x][core.y] = [weights.buffer_address(), bank, vc, r * self.cols * self.col_bytes]
+            if q_first and order is not None:  # (LIN_ROT) the slots from the first Q one on
+                first = bank * self.C + r * self.cols
+                reader_rt[core.x][core.y] = list(reader_rt[core.x][core.y]) + [
+                    self._qf_rot([order[first + c] for c in range(self.cols)])
+                ]
             writer_rt[core.x][core.y] = [
                 mirror.buffer_address() if x_local else x.buffer_address(),
                 outs[0].buffer_address(),
@@ -739,7 +761,9 @@ class LinearStream(_BankStreamOp):
                 writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [i, len(self.assignments)] + gs_noc
             if rope_kv is not None:
                 writer_rt[core.x][core.y] = (
-                    list(writer_rt[core.x][core.y]) + rope_kv.writer_runtime_args() + self._slot_columns(bank, r, order)
+                    list(writer_rt[core.x][core.y])
+                    + rope_kv.writer_runtime_args()
+                    + self._slot_columns(bank, r, order, q_first=q_first)
                 )
             if extra_writer_rt is not None:
                 writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + list(extra_writer_rt)
@@ -768,8 +792,8 @@ class LinearStream(_BankStreamOp):
             compute_ct += [cb_y, cb_rot, cb_cs, self.heads[0] + self.heads[1], self.heads[0], self.head_tiles]
             compute_rt = ttnn.RuntimeArgs()
             for core, bank, r, vc in self.assignments:
-                compute_rt[core.x][core.y] = self._slot_columns(bank, r, order)
-            defines = [("QKV_ROPE_KV", "1")]
+                compute_rt[core.x][core.y] = self._slot_columns(bank, r, order, q_first=q_first)
+            defines = [("QKV_ROPE_KV", "1")] + ([("LIN_ROT", "1")] if q_first else [])
         if M > 1:
             defines = (defines or []) + [("ROWS", str(M))]
         if self.x_tile_rows:
@@ -789,6 +813,9 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("LIN_X_WAIT_SEM", str(x_wait[0])), ("LIN_X_WAIT_N", str(x_wait[1]))]
         if fuse is not None and mc_rects is not None:
             defines = (defines or []) + [("QKV_NOTIFY_MC", "1")]
+        if fuse is not None and len(fuse) > 7 and fuse[7] is not None:
+            assert q_first and mc_rects is None
+            defines = (defines or []) + [("QKV_Q_NOTIFY_SEM", str(fuse[7]))]
         if fuse is not None:
             defines = (defines or []) + [
                 ("QKV_NOTIFY_N", str(len(mc_rects) if mc_rects is not None else len(fuse[3]))),
@@ -800,7 +827,7 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("LIN_T", "1")]
         # DFLASH_KV_SPLIT=1 (multi-row QKV with the K / V cache write): the reader converts half the rows of the first
         # (K / V) output column to BFP8 while the writer converts the others (kernels/stream_linear_reader.cpp)
-        kv_split = rope_kv is not None and M > 1 and os.environ.get("DFLASH_KV_SPLIT", "1") == "1"
+        kv_split = rope_kv is not None and M > 1 and not q_first and os.environ.get("DFLASH_KV_SPLIT", "1") == "1"
         if kv_split:
             defines = (defines or []) + [
                 ("KV_SPLIT", "1"),

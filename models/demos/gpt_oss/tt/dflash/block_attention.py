@@ -135,7 +135,7 @@ class BlockAttention:
         noc = self.noc_cores()
         return [noc[i] for i in sorted(range(len(noc)), key=lambda i: (i % self.S, i))]
 
-    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, wait, patch=None, out_notify=None):
+    def parts(self, q, k_cache, v_cache, pos, page_table, sinks, scale, wait, patch=None, out_notify=None, q_sem=None):
         """(kernels, cbs, io); q: the packed Q [1, nkv, Tt * 32, 64] (tile (g, t, d) at page (g Tt + t) 2 + d); pos:
         INT32 [>= M] (row r at pos[r], non-decreasing, consecutive rows within 32 positions); page_table: INT32 [*,
         blocks] (row 0 used); sinks: the heads' [heads, 32] BF16 sink tile; wait = (semaphore id, count): the QKV
@@ -263,6 +263,8 @@ class BlockAttention:
             defines.append(("BA_Q_ROWS", "1"))
         if patch is not None:
             defines.append(("BA_PATCH", str(patch_arg)))
+        if q_sem is not None:  # Q ready at wait[1] increments of q_sem, the block's K / V rows at the wait semaphore's
+            defines.append(("BA_Q_SEM", str(q_sem)))
         if out_notify is not None:  # (noc cores, semaphore id): the roots signal a consumer once out is written
             nw = [(p.x << 8) | p.y for p in out_notify[0]] + [0] * (len(out_notify[0]) % 2)
             defines += [

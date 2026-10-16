@@ -52,7 +52,15 @@ void kernel_main() {
     uint32_t trid_to_wait = 1;
 
     uint32_t src = reader_offset;
+#ifdef LIN_ROT
+    // LIN_ROT: this core's columns streamed from slot `rot` on, wrapping (runtime arg 4; the QKV writer's Q-first
+    // order, fused_decode/stream.py q_first: the leading K / V slots last)
+    const uint32_t rot = get_arg_val<uint32_t>(4);
+#endif
     for (uint32_t c = 0; c < cols; ++c) {
+#ifdef LIN_ROT
+        src = reader_offset + ((c + rot) % cols) * col_bytes;
+#endif
         noc_async_read_set_trid(trid);
         for (uint32_t p = 0; p < pages_per_col; ++p) {
             noc_async_read_one_packet_with_state_with_trid(w_base, src, l1_write, trid);

@@ -457,7 +457,30 @@ void kernel_main() {
         cb_reserve_back(cb_scr, 1);
         exp_chunks = get_write_ptr(cb_scr);
     }
+#ifdef QKV_Q_NOTIFY_SEM
+    // QKV_Q_NOTIFY_SEM (QKV + block attention, Q columns first): once this core's Q columns are written, increment
+    // QKV_Q_NOTIFY_SEM on the attention cores (they start on the history while the K / V columns follow; the usual
+    // notify below then signals Q + K / V)
+    bool q_sent = false;
+    auto q_notify = [&]() {
+        noc_async_write_barrier();
+        for (uint32_t i = 0; i < QKV_NOTIFY_N; ++i) {
+            noc_semaphore_inc(
+                get_noc_addr(
+                    get_arg_val<uint32_t>(QKV_NOTIFY_ARG + 2 * i),
+                    get_arg_val<uint32_t>(QKV_NOTIFY_ARG + 2 * i + 1),
+                    get_semaphore(QKV_Q_NOTIFY_SEM)),
+                1);
+        }
+        q_sent = true;
+    };
+#endif
     for (uint32_t c = 0; c < cols; ++c) {
+#ifdef QKV_Q_NOTIFY_SEM
+        if (!q_sent && slot_column(c) >= q_cols) {
+            q_notify();
+        }
+#endif
         cb_wait_front(cb_out, 1);
 #ifdef MOE_FUSED
         DeviceTimestampedData("MOE_T", 103);
@@ -857,6 +880,11 @@ void kernel_main() {
         noc_semaphore_inc(get_noc_addr(notify_x, notify_y, get_semaphore(notify_sem)), 1);
         noc_async_atomic_barrier();
     }
+#ifdef QKV_Q_NOTIFY_SEM
+    if (!q_sent) {
+        q_notify();
+    }
+#endif
 #ifdef QKV_NOTIFY_N
     // QKV fused with row attention (dflash/verify.py): Q and this core's K / V cache rows are written; increment
     // program semaphore QKV_NOTIFY_SEM on every row-attention core (runtime args QKV_NOTIFY_ARG..: their noc x, y)

@@ -138,6 +138,17 @@ void kernel_main() {
         invalidate_l1_cache();
         return *qkv_sem >= BA_WAIT_N;
     };
+#ifdef BA_Q_SEM
+    // BA_Q_SEM (verify, the QKV writers' Q columns first): Q is ready at BA_WAIT_N increments of BA_Q_SEM, the block's
+    // K / V rows at BA_WAIT_N of BA_WAIT_SEM (the groups holding them wait for that)
+    volatile tt_l1_ptr uint32_t* q_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(BA_Q_SEM));
+    auto q_sem_ready = [&]() {
+        invalidate_l1_cache();
+        return *q_sem >= BA_WAIT_N;
+    };
+#else
+    auto q_sem_ready = [&]() { return kv_ready(); };
+#endif
 #ifdef BA_PATCH
     // BA_PATCH (the drafter, fused after its K / V cache write, dflash/kv_write.py notify_early): the block's chunks
     // (holding rows hi + 1 - M .. hi) are read from DRAM with the old ones (their other rows are old), and the block's
@@ -365,8 +376,14 @@ void kernel_main() {
             return false;
         }
 #endif
-        return kv_ready();
+        return q_sem_ready();
     };
+    // the groups holding the block's rows: issued once Q (no BA_Q_SEM) / the K / V rows (BA_Q_SEM) are written
+#ifdef BA_Q_SEM
+    auto new_ok = [&]() { return kv_ready(); };
+#else
+    auto new_ok = [&]() { return q_done; };
+#endif
     uint32_t issued = 0;
 #ifdef BA_SHARE
     // BA_SHARE (2 tile groups, 1 Q tile per core): the tile-group-0 core of each (kv head, slice) reads K / V from DRAM
@@ -407,7 +424,7 @@ void kernel_main() {
                 noc_async_read_set_trid(0);
             } else {
                 // holds the block's rows (written by QKV): read straight from DRAM after Q, no hop via the leader
-                if (!q_done) {
+                if (!q_done || !new_ok()) {
                     continue;
                 }
                 issue_group(pushed);
@@ -427,9 +444,9 @@ void kernel_main() {
 #ifdef BA_CAP0
         // before Q: at most BA_CAP0 groups in flight (the QKV weights and every core's first group land sooner)
         while (issued < n_groups && issued - pushed < (q_done ? cap_groups : BA_CAP0) &&
-               (q_done || old_group(issued)) &&
+               ((q_done && new_ok()) || old_group(issued)) &&
 #else
-        while (issued < n_groups && issued - pushed < cap_groups && (q_done || old_group(issued)) &&
+        while (issued < n_groups && issued - pushed < cap_groups && ((q_done && new_ok()) || old_group(issued)) &&
 #endif
 #ifdef BA_SHARE
                slot_free(issued) &&
@@ -462,14 +479,14 @@ void kernel_main() {
             noc_semaphore_inc(get_noc_addr(pnx, pny, get_semaphore(BA_LAND_SEM)), 1);  // the partner may copy it
 #endif
         } else if (!q_done) {
-            while (!kv_ready()) {  // nothing in flight: the next group needs the block's rows
+            while (!q_sem_ready()) {  // nothing in flight: the next group needs the block's rows
             }
             read_q();
         }
         // else: the CBs are full (compute frees a slot)
     }
     if (!q_done) {
-        while (!kv_ready()) {
+        while (!q_sem_ready()) {
         }
         read_q();
     }
