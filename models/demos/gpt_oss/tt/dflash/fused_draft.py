@@ -462,13 +462,16 @@ class FusedDraft:
         )
         self.g_hidden = b.flat_gamma(_Norm(d.hidden_norm))
         nkv, hd, L = d.nkv, d.hd, d.layers
-        self.fc = LinearStream(mesh, self.ctx_kx, H, dtype, readers=2, out_mode=5, rows=M)
+        # DFLASH_CTX_FC_READERS / DFLASH_CTX_KV_READERS: the context fc / K V streams' readers per bank
+        self.fc = LinearStream(
+            mesh, self.ctx_kx, H, dtype, readers=int(os.environ.get("DFLASH_CTX_FC_READERS", "2")), out_mode=5, rows=M
+        )
         self.kv = LinearStream(
             mesh,
             H // TILE,
             L * 2 * nkv * hd,
             dtype,
-            readers=1,
+            readers=int(os.environ.get("DFLASH_CTX_KV_READERS", "4")),
             out_mode=3,
             heads=(0, L * nkv * hd // TILE),
             rows=M,
@@ -541,7 +544,14 @@ class FusedDraft:
             kr, k_unused, vs = self.ctx_prep(self.Kc, self.Kc, self.Vc, self.ctx_gamma, d.t_crot)
             k_unused.deallocate(True)
             if os.environ.get("DFLASH_CTX_KV1", "1") == "1":  # every layer's cache write in one program
-                d.kv_write.write_layers(kr, vs, [d.caches[l] for l in range(d.layers)], d.t_cpos, d.page_table)
+                d.kv_write.write_layers(
+                    kr,
+                    vs,
+                    [d.caches[l] for l in range(d.layers)],
+                    d.t_cpos,
+                    d.page_table,
+                    cores=int(os.environ.get("DFLASH_CTX_KV_CORES", "4")),
+                )
             else:
                 for l in range(d.layers):
                     kc, vc = d.caches[l]

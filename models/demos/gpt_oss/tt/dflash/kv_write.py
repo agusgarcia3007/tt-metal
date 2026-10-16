@@ -34,10 +34,29 @@ class DraftKVWrite:
         program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
         ttnn.generic_op([k, v, pos, page_table, k_cache, v_cache], program)
 
-    def write_layers(self, k, v, caches, pos, page_table):
+    def write_layers(self, k, v, caches, pos, page_table, cores=1):
         """One program for several layers' caches (the drafter's context pass): layer l's K / V heads are head rows
-        l * kv_heads .. of k / v; caches = [(k_cache, v_cache)] per layer."""
-        kernels, cbs = self.parts(k, v, caches[0][0], caches[0][1], pos, page_table, more_caches=caches[1:])
+        l * kv_heads .. of k / v; caches = [(k_cache, v_cache)] per layer. cores > 1: the layers split over that many
+        cores (CORE, CORE + (1, 0), ..), each writing its own in parallel."""
+        n = len(caches)
+        cores = max(1, min(cores, n))
+        kernels, cbs = [], []
+        for g in range(cores):
+            l0, l1 = g * n // cores, (g + 1) * n // cores
+            c = ttnn.CoreCoord(CORE.x + g, CORE.y)
+            kk, kc = self.parts(
+                k,
+                v,
+                caches[l0][0],
+                caches[l0][1],
+                pos,
+                page_table,
+                head_offset=l0 * self.kv_heads,
+                core=c,
+                more_caches=caches[l0 + 1 : l1],
+            )
+            kernels += kk
+            cbs += kc
         program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
         io = [k, v, pos, page_table] + [t for kc_vc in caches for t in kc_vc]
         ttnn.generic_op(io, program)
