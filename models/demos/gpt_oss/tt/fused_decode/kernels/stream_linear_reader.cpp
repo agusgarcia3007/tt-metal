@@ -76,7 +76,9 @@ void kernel_main() {
         constexpr uint32_t rows = ROWS;
         constexpr uint32_t half_row = 32;  // one row of a [rows, 16] face
         constexpr uint32_t row_face = 32 * rows;
+        DeviceTimestampedData("KVS_T", 1);  // (profiling: the reader reaches the K / V conversion)
         cb_wait_front(KV_SPLIT_CB_OUT, 1);
+        DeviceTimestampedData("KVS_T", 2);
         invalidate_l1_cache();
         const uint32_t src = get_read_ptr(KV_SPLIT_CB_OUT);
         volatile tt_l1_ptr uint32_t* st =
@@ -94,6 +96,7 @@ void kernel_main() {
             }
         }
         asm volatile("fence" ::: "memory");
+        DeviceTimestampedData("KVS_T", 3);
         noc_semaphore_inc(get_noc_addr(get_semaphore(KV_SPLIT_SEM)), 1);
         noc_async_atomic_barrier();
     }

@@ -608,7 +608,9 @@ void kernel_main() {
                 }
 #ifdef KV_SPLIT
                 if (c == 0) {
+                    DeviceTimestampedData("KVS_T", 4);  // (profiling: the writer's half converted)
                     noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(KV_SPLIT_SEM)), 1);
+                    DeviceTimestampedData("KVS_T", 5);
                     invalidate_l1_cache();
                     volatile tt_l1_ptr uint32_t* st =
                         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(KV_SPLIT_CB_STAGE));

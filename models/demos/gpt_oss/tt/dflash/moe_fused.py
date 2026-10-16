@@ -43,6 +43,14 @@ VERIFY_ROWS = int(os.environ.get("DFLASH_VERIFY_ROWS", "0"))
 # DFLASH_SKIP_PAD=1: drop the gate|up and down cores whose columns are all padding (with GPT_OSS_EXPERT_BANK_ROT=7
 # they read DRAM bank 0, the MoE's slowest)
 SKIP_PAD = os.environ.get("DFLASH_SKIP_PAD", "1") == "1"
+# DFLASH_MOE_D_EXCLUDE / DFLASH_MOE_G_EXCLUDE="x,y;x,y": logical cores the down / gate|up readers do not use. The
+# defaults (QuietBox 2, 11 x 10 grid) are the profiled stragglers: down (7, 7) finished its last slot ~9 us after every
+# other core on all chips, (2, 1) ~4 us on chips 1 / 3; the gate|up readers in column 6 (the right banks' third readers)
+# ~16 us after the median on chips 1-3. Without them: verify pass 4295 -> 4098 us (ISL 256), MoE 122 -> 114 us.
+D_EXCLUDE = [tuple(map(int, c.split(","))) for c in os.environ.get("DFLASH_MOE_D_EXCLUDE", "7,7;2,1").split(";") if c]
+G_EXCLUDE = [
+    tuple(map(int, c.split(","))) for c in os.environ.get("DFLASH_MOE_G_EXCLUDE", "6,1;6,6;6,4;6,9").split(";") if c
+]
 
 
 def _wait_n(b):
@@ -90,7 +98,7 @@ class MoEFused:
                 alpha,
                 readers=gate_up_readers,
                 rows=rows,
-                exclude=taken,
+                exclude=taken + G_EXCLUDE,
                 real_inter=real_inter,
                 coord=coord,
                 rot=EXPERT_BANK_ROT,
@@ -102,7 +110,7 @@ class MoEFused:
                 readers=down_readers,
                 rows=rows,
                 expert_outer=True,
-                exclude=taken + [(c.x, c.y) for c, *_ in gu.assignments],
+                exclude=taken + [(c.x, c.y) for c, *_ in gu.assignments] + D_EXCLUDE,
                 coord=coord,
                 rot=EXPERT_BANK_ROT,
                 skip_pad=SKIP_PAD,
@@ -277,6 +285,12 @@ class DenseMLPFused:
         self.mesh, self.boundary, self.slices = mesh_device, boundary, slices
         taken = [(boundary.core.x, boundary.core.y)]
         taken += [(h.x, h.y) for h in getattr(boundary, "helpers", [])] if getattr(boundary, "mc", False) else []
+        # DFLASH_DRAFT_G_EXCLUDE / DFLASH_DRAFT_D_EXCLUDE="x,y;x,y": logical cores the readers do not use (default:
+        # gate|up (1, 1), a profiled straggler: MLP 49.5 -> 48.2 us; the MoE's column-6 exclusion is slower here)
+        g_ex, d_ex = (
+            [tuple(map(int, c.split(","))) for c in os.environ.get(k, v).split(";") if c]
+            for k, v in (("DFLASH_DRAFT_G_EXCLUDE", "1,1"), ("DFLASH_DRAFT_D_EXCLUDE", ""))
+        )
         self.gate_up = ExpertGateUpUnion(
             mesh_device,
             hidden,
@@ -288,7 +302,7 @@ class DenseMLPFused:
             dense_silu=True,
             max_experts=slices,
             weight_dtype=weight_dtype,
-            exclude=taken,
+            exclude=taken + g_ex,
             real_inter=real_inter,
             rot=rot,
         )
@@ -303,11 +317,17 @@ class DenseMLPFused:
             max_experts=slices,
             weight_dtype=weight_dtype,
             num_buffers=2,
-            exclude=taken,
+            exclude=taken + d_ex,
             rot=rot,
             skip_pad=real_hidden,
         )
         self.G, self.D = self.gate_up.cores, self.down.cores
+        if os.environ.get("DFLASH_LOG_CORES") == "1":
+            print(
+                f"DenseMLPFused: gate|up {[(c.x, c.y, b, r) for c, b, r, _ in self.gate_up.assignments]}, "
+                f"down {[(c.x, c.y, b, r) for c, b, r, _ in self.down.assignments]}",
+                flush=True,
+            )
         # (stealing needs the router's done flags; lockstep the bank-mate semaphores of MoEFused)
         moe = [d for d in MOE if d[0] not in ("MOE_STEAL", "MOE_LOCKSTEP")]
         self.defines = moe + [("MOE_NO_ROUTER", "1"), ("MOE_CTR_SEM", str(self.CTR_SEM))]
