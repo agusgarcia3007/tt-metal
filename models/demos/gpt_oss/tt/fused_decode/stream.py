@@ -189,6 +189,32 @@ def _page_bytes(tiles, tile_bytes):
     return max(d for d in range(1, tiles + 1) if tiles % d == 0 and d * tile_bytes <= MAX_PACKET_BYTES) * tile_bytes
 
 
+def mc_rectangles(mesh_device, cores, noc1=False):
+    """Logical CoreRangeSet -> multicast rectangles [noc start x, y, end x, y, cores] in virtual coordinates, each split
+    where consecutive logical columns are not consecutive virtual columns (no non-worker columns inside); NOC1:
+    start = the larger corner."""
+    out = []
+    for cr in cores.ranges():
+        s, e = cr.start, cr.end
+        cols = list(range(s.x, e.x + 1))
+        runs, run = [], [cols[0]]
+        for x in cols[1:]:
+            a = mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(run[-1], s.y)).x
+            b = mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(x, s.y)).x
+            if b == a + 1:
+                run.append(x)
+            else:
+                runs.append(run)
+                run = [x]
+        runs.append(run)
+        for r in runs:
+            p0 = mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(r[0], s.y))
+            p1 = mesh_device.worker_core_from_logical_core(ttnn.CoreCoord(r[-1], e.y))
+            n = len(r) * (e.y - s.y + 1)
+            out.append([p1.x, p1.y, p0.x, p0.y, n] if noc1 else [p0.x, p0.y, p1.x, p1.y, n])
+    return out
+
+
 def row_placement(mesh_device, per_bank, exclude=(), coord=None):
     EAST = os.environ.get("DFLASH_ROW_EAST", "0") == "1"
     """per_bank logical reader cores per DRAM bank, on the row of the bank's optimal NOC0 worker: nearest that worker
@@ -629,6 +655,11 @@ class LinearStream(_BankStreamOp):
         in this op (kernels/stream_qkv_rope_compute.cpp) and K / V are written straight into the paged KV cache at the
         current position instead of the K / V head tensors (replacing rotary_embedding_llama_fused_qk and
         paged_fused_update_cache)."""
+        # fuse[6] (optional): the fused op's cores as rectangles (CoreRangeSet): the writers notify them with one
+        # multicast increment per rectangle (writer on NOC1: start / end swapped; split where the virtual x jumps)
+        mc_rects = None
+        if fuse is not None and len(fuse) > 6 and fuse[6] is not None:
+            mc_rects = mc_rectangles(self.mesh_device, fuse[6], noc1=True)
         pending = None
         if not isinstance(x, ttnn.Tensor):
             pending = x
@@ -714,7 +745,12 @@ class LinearStream(_BankStreamOp):
                 writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + list(extra_writer_rt)
             if fuse is not None:
                 notify_arg = len(writer_rt[core.x][core.y])
-                writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [v for p in fuse[3] for v in (p.x, p.y)]
+                if mc_rects is not None:  # [sx, sy, ex, ey, cores] per rectangle (multicast increments)
+                    writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [v for r in mc_rects for v in r]
+                else:
+                    writer_rt[core.x][core.y] = list(writer_rt[core.x][core.y]) + [
+                        v for p in fuse[3] for v in (p.x, p.y)
+                    ]
         reader_ct = [cb_w, self.kt, self.cols, self.tile_bytes, self.page_bytes, w_cols]
         writer_ct = [cb_x, cb_out, cb_scr, self.kx, self.x_pages, NBIAS, self.cols, self.n_tiles, self.out_mode]
         writer_ct += [self.out_page_bytes, stage, cb_stage, self.heads[0], self.heads[1], self.head_tiles]
@@ -751,9 +787,11 @@ class LinearStream(_BankStreamOp):
             defines = (defines or []) + [("X_SPEC_TT" if self.x_pages else "Q_SPEC_TT", str(spec_tt))]
         if x_wait is not None:  # (semaphore id, count): x is written in the same program
             defines = (defines or []) + [("LIN_X_WAIT_SEM", str(x_wait[0])), ("LIN_X_WAIT_N", str(x_wait[1]))]
+        if fuse is not None and mc_rects is not None:
+            defines = (defines or []) + [("QKV_NOTIFY_MC", "1")]
         if fuse is not None:
             defines = (defines or []) + [
-                ("QKV_NOTIFY_N", str(len(fuse[3]))),
+                ("QKV_NOTIFY_N", str(len(mc_rects) if mc_rects is not None else len(fuse[3]))),
                 ("QKV_NOTIFY_SEM", str(fuse[4])),
                 ("QKV_NOTIFY_ARG", str(notify_arg)),
             ]

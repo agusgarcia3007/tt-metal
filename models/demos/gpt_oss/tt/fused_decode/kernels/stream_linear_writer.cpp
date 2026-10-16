@@ -861,6 +861,22 @@ void kernel_main() {
     // QKV fused with row attention (dflash/verify.py): Q and this core's K / V cache rows are written; increment
     // program semaphore QKV_NOTIFY_SEM on every row-attention core (runtime args QKV_NOTIFY_ARG..: their noc x, y)
     noc_async_write_barrier();
+#ifdef QKV_NOTIFY_MC
+    // QKV_NOTIFY_MC: one multicast increment per rectangle of the attention cores (runtime args QKV_NOTIFY_ARG..:
+    // [noc start x, y, end x, y (this NOC's order), cores] per rectangle) instead of one increment per core
+    for (uint32_t i = 0; i < QKV_NOTIFY_N; ++i) {
+        const uint32_t a = QKV_NOTIFY_ARG + 5 * i;
+        noc_semaphore_inc_multicast(
+            get_noc_multicast_addr(
+                get_arg_val<uint32_t>(a),
+                get_arg_val<uint32_t>(a + 1),
+                get_arg_val<uint32_t>(a + 2),
+                get_arg_val<uint32_t>(a + 3),
+                get_semaphore(QKV_NOTIFY_SEM)),
+            1,
+            get_arg_val<uint32_t>(a + 4));
+    }
+#else
     for (uint32_t i = 0; i < QKV_NOTIFY_N; ++i) {
         noc_semaphore_inc(
             get_noc_addr(
@@ -869,6 +885,7 @@ void kernel_main() {
                 get_semaphore(QKV_NOTIFY_SEM)),
             1);
     }
+#endif
     noc_async_atomic_barrier();
 #endif
 }

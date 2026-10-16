@@ -506,7 +506,8 @@ class FusedVerify:
                     wait=(3, len(self.qkv.assignments)),
                     notify=(o_noc, 7) if o_f is not None else None,
                 )
-                fuse = (kern, cbs, io, self.row_attn.noc_cores(), 3)
+                mc = self.row_attn.cores if os.environ.get("DFLASH_QKV_NOTIFY_MC", "0") == "1" else None
+                fuse = (kern, cbs, io, self.row_attn.noc_cores(), 3, [], mc)
             shared = (self.shared_kv is not None and self.use_shared and not attn.config.sliding_window) or (
                 slide_ba is not None
             )
@@ -522,7 +523,9 @@ class FusedVerify:
                     attn.config.scaling,
                     wait=(3, len(self.qkv.assignments)),
                 )
-                fuse = (kern, cbs, io, lba.notify_order(), 3, lba.semaphores())
+                # DFLASH_QKV_NOTIFY_MC=1: the QKV writers signal block attention with multicast increments
+                mc = lba.cores if os.environ.get("DFLASH_QKV_NOTIFY_MC", "0") == "1" else None
+                fuse = (kern, cbs, io, lba.notify_order(), 3, lba.semaphores(), mc)
             if o_f is not None:
                 # QKV + row attention + o_proj + the attn-site boundary send: one program per device
                 qprog, qio = self.qkv(
