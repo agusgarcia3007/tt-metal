@@ -98,7 +98,7 @@ class MoEFused:
         # DFLASH_MOE_ROWS=1: gate|up / down readers on their DRAM bank's row (fused_decode/stream.py row_placement):
         # per bank its gate_up_readers nearest cores to gate|up, the next down_readers to down (the router moved off
         # the rows, dflash/verify.py); the straggler exclusions do not apply
-        rows_mode = os.environ.get("DFLASH_MOE_ROWS", "0") == "1"
+        rows_mode = os.environ.get("DFLASH_MOE_ROWS", "1") == "1"
         for coord in self.coords if per_device else [None]:
             gp = dp = None
             if rows_mode:
