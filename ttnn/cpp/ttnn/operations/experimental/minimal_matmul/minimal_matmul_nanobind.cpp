@@ -23,7 +23,7 @@ void bind_minimal_matmul(nb::module_& mod) {
     ttnn::bind_function<"minimal_matmul", "ttnn.experimental.">(
         mod,
         R"doc(
-        minimal_matmul(input_tensor, weight_tensor, bias_tensor=None, *, fused_activation=None, config=None, memory_config=None, dtype=None, compute_kernel_config=None, fuse_swiglu=False)
+        minimal_matmul(input_tensor, weight_tensor, bias_tensor=None, *, fused_activation=None, config=None, memory_config=None, dtype=None, compute_kernel_config=None, fuse_swiglu=False, valid_rows_tensor=None, valid_rows_addend=0, valid_rows_divisor=1, valid_rows_multiplier=1, valid_rows_align=1, slot_tensor=None, kv_num_layers=1, kv_layer_idx=0, out_head_dim=None, in0_k_prefix=False)
 
         Experimental, high-performance matrix multiply (A @ B [+ bias]) with optional fused activation.
         This op expects TILE layout tensors on device and operates in tile units internally. It is designed
@@ -77,6 +77,39 @@ void bind_minimal_matmul(nb::module_& mod) {
             The bias (if provided) must use the same column layout. N must be divisible by 2*32 (two
             tile-aligned halves). Mutually exclusive with fused_activation.
 
+        valid_rows_tensor : Optional[ttnn.Tensor], default: None
+            1-element UINT32 ROW_MAJOR DRAM tensor read on device (trace-safe). Treats input_tensor as a
+            preallocated [batch..., M_cap, K] buffer and computes only its first
+            min(round_up(ceil(valid_rows_tensor[0] / valid_rows_divisor) * valid_rows_multiplier + valid_rows_addend,
+            valid_rows_align), M_cap) rows (rounded up to a tile) of one batch,
+            re-split across the grid at runtime. The output is [1, N / out_head_dim, M_cap, out_head_dim]
+            (out_head_dim defaults to N); rows past the valid count are left unwritten.
+            Not supported with chunks, fuse_swiglu, fused ternary or fused concat.
+
+        valid_rows_addend : int, default: 0
+            Added to the scaled valid_rows_tensor[0], e.g. the chunk length when the tensor holds the prefix length.
+
+        valid_rows_divisor, valid_rows_multiplier : int, default: 1, 1
+            Scale valid_rows_tensor[0] before the addend, e.g. a global prefix length to local cache rows
+            (divisor = global chunk length, multiplier = local chunk length).
+
+        valid_rows_align : int, default: 1
+            Round the row count up to this multiple, e.g. a consumer's chunk size so it never reads unwritten rows.
+
+        slot_tensor : Optional[ttnn.Tensor], default: None
+            1-element UINT32 ROW_MAJOR DRAM tensor; the in0 batch is slot_tensor[0] * kv_num_layers + kv_layer_idx.
+            Without it the batch is kv_layer_idx.
+
+        kv_num_layers, kv_layer_idx : int, default: 1, 0
+            Batch fold for slot_tensor.
+
+        out_head_dim : Optional[int], default: None
+            Tile-multiple head width; writes the output head-major as [1, N / out_head_dim, M_cap, out_head_dim].
+
+        in0_k_prefix : bool, default: False
+            Contract over only the first weight-K columns of each input_tensor row, which may be wider
+            (e.g. the 512 latent columns of a 576-wide kvpe cache). Not supported with fused concat.
+
         config : Optional[MinimalMatmulConfig], default: None
             Execution configuration in tile units. If omitted, reasonable defaults are selected based on tensor
             sizes and kernel flags.
@@ -87,6 +120,10 @@ void bind_minimal_matmul(nb::module_& mod) {
             - subblock_h: Sub-block height (M dimension) used by compute kernel within a block.
             - subblock_w: Sub-block width (N dimension) used by compute kernel within a block.
             - compute_with_storage_grid_size: Core grid (x, y) to run the op on.
+            - hw_mcast: Hardware-multicast each input block from its line's injector instead of relaying it core
+              to core (default False).
+            - transpose_core_grid: Put M along the grid's x axis (True) or y axis (False). Default None transposes
+              when M > N.
 
             Required invariants:
             - All block/subblock sizes must be > 0.
@@ -159,7 +196,17 @@ void bind_minimal_matmul(nb::module_& mod) {
         nb::arg("memory_config") = nb::none(),
         nb::arg("dtype") = nb::none(),
         nb::arg("compute_kernel_config") = nb::none(),
-        nb::arg("fuse_swiglu") = false);
+        nb::arg("fuse_swiglu") = false,
+        nb::arg("valid_rows_tensor") = nb::none(),
+        nb::arg("valid_rows_addend") = 0,
+        nb::arg("valid_rows_divisor") = 1,
+        nb::arg("valid_rows_multiplier") = 1,
+        nb::arg("valid_rows_align") = 1,
+        nb::arg("slot_tensor") = nb::none(),
+        nb::arg("kv_num_layers") = 1,
+        nb::arg("kv_layer_idx") = 0,
+        nb::arg("out_head_dim") = nb::none(),
+        nb::arg("in0_k_prefix") = false);
 
     auto py_minimal_matmul_config = nb::class_<MinimalMatmulConfig>(
                                         mod,
@@ -169,14 +216,35 @@ void bind_minimal_matmul(nb::module_& mod) {
                             )doc")
                                         .def(nb::init<>())
                                         .def(
-                                            nb::init<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, CoreCoord>(),
+                                            "__init__",
+                                            [](MinimalMatmulConfig* self,
+                                               uint32_t M_block_size,
+                                               uint32_t K_block_size,
+                                               uint32_t N_block_size,
+                                               uint32_t subblock_h,
+                                               uint32_t subblock_w,
+                                               CoreCoord compute_with_storage_grid_size,
+                                               bool hw_mcast,
+                                               std::optional<bool> transpose_core_grid) {
+                                                new (self) MinimalMatmulConfig{
+                                                    .M_block_size = M_block_size,
+                                                    .K_block_size = K_block_size,
+                                                    .N_block_size = N_block_size,
+                                                    .subblock_h = subblock_h,
+                                                    .subblock_w = subblock_w,
+                                                    .compute_with_storage_grid_size = compute_with_storage_grid_size,
+                                                    .hw_mcast = hw_mcast,
+                                                    .transpose_core_grid = transpose_core_grid};
+                                            },
                                             nb::kw_only(),
                                             nb::arg("M_block_size") = 1,
                                             nb::arg("K_block_size") = 1,
                                             nb::arg("N_block_size") = 1,
                                             nb::arg("subblock_h") = 1,
                                             nb::arg("subblock_w") = 1,
-                                            nb::arg("compute_with_storage_grid_size") = nb::cast(CoreCoord{1, 1}));
+                                            nb::arg("compute_with_storage_grid_size") = nb::cast(CoreCoord{1, 1}),
+                                            nb::arg("hw_mcast") = false,
+                                            nb::arg("transpose_core_grid") = nb::none());
 
     py_minimal_matmul_config.def_rw("M_block_size", &MinimalMatmulConfig::M_block_size, "");
     py_minimal_matmul_config.def_rw("K_block_size", &MinimalMatmulConfig::K_block_size, "");
@@ -185,6 +253,8 @@ void bind_minimal_matmul(nb::module_& mod) {
     py_minimal_matmul_config.def_rw("subblock_w", &MinimalMatmulConfig::subblock_w, "");
     py_minimal_matmul_config.def_rw(
         "compute_with_storage_grid_size", &MinimalMatmulConfig::compute_with_storage_grid_size, "");
+    py_minimal_matmul_config.def_rw("hw_mcast", &MinimalMatmulConfig::hw_mcast, "");
+    py_minimal_matmul_config.def_rw("transpose_core_grid", &MinimalMatmulConfig::transpose_core_grid, "");
 
     py_minimal_matmul_config.def(
         "__repr__", [](const MinimalMatmulConfig& config) { return fmt::format("{}", config); });

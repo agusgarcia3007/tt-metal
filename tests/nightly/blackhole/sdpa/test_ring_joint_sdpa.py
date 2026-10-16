@@ -121,6 +121,9 @@ class ModelConfig:
     use_ring_mla: bool = False
     matmul_math_fidelity: object = None
     nd_sharded_kv_cache: bool = False
+    # Indexed ND-sharded K cache (slot 1 of 2) with a batch-1 per-head V, as the MLA unrolled-V path runs it.
+    indexed_kv_cache: bool = False
+    v_single_slot: bool = False
 
 
 def generate_model_configs(mesh_config: MeshConfig) -> Dict[str, ModelConfig]:
@@ -1715,6 +1718,7 @@ def run_ring_joint_sdpa_chunked(
     segmented_accumulation: bool = False,
     math_fidelity=None,
     kv_mean_offset: float = 0.0,
+    v_single_slot: bool = False,
 ):
     """
     Validate ring joint SDPA chunked-prefill, or verify deterministic replay.
@@ -2045,7 +2049,7 @@ def run_ring_joint_sdpa_chunked(
                 ),
             )
             persistent_output_buffer_v = ttnn.from_torch(
-                torch.zeros(kv_buffer_batch, nhv, seq_len, d_v),
+                torch.zeros(1 if v_single_slot else kv_buffer_batch, nhv, seq_len, d_v),
                 dtype=kv_dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=mesh_device,
@@ -2191,6 +2195,8 @@ def run_ring_joint_sdpa_chunked(
                 V_input = torch.randn(cache_batch, nhv, e, d_v, dtype=V_balanced.dtype) * 100
                 K_input[kv_cache_batch_idx : kv_cache_batch_idx + 1] = K_balanced
                 V_input[kv_cache_batch_idx : kv_cache_batch_idx + 1] = V_balanced
+                if v_single_slot:
+                    V_input = V_balanced
             else:
                 K_input = K_balanced
                 V_input = V_balanced
@@ -2202,7 +2208,7 @@ def run_ring_joint_sdpa_chunked(
                 kv_cache_batch_idx_arg,
                 upload_q(Q_chunk),
                 upload_k(K_input, memory_config=k_memory_config),
-                upload_v(V_input, memory_config=v_memory_config),
+                upload_v(V_input, memory_config=None if v_single_slot else v_memory_config),
             )
 
         def get_persistent_buffers(shared_persistent_buffers, chunk_persistent_buffers):
@@ -3714,6 +3720,58 @@ def test_ring_joint_attention_chunked_nd_sharded_indexed_kv_cache_accuracy(fp32_
         k_chunk_size=model.k_chunk_sizes[0],
         indexed_nd_sharded_kv_cache=True,
         fp32_dest_acc_en=fp32_dest_acc_en,
+    )
+
+
+def test_ring_joint_attention_chunked_indexed_k_single_slot_v_accuracy():
+    """Indexed K cache (slot 1 of 2) with a batch-1 per-head V that is read and gathered from slot 0."""
+    mesh_config = MESH_CONFIG
+    local_heads = 4
+    chunk_seq_len = 64
+    total_seq_len = 128
+    model = ModelConfig(
+        name="mla_indexed_k_single_slot_v",
+        nhq=local_heads,
+        nhk=1,
+        nhv=local_heads,
+        d_q=64,
+        d_k=64,
+        d_v=32,
+        is_causal=True,
+        q_dtype=ttnn.bfloat16,
+        kv_dtype=ttnn.bfloat16,
+        q_chunk_sizes=[32],
+        k_chunk_sizes=[32],
+        seq_len=total_seq_len,
+    )
+    run_ring_joint_sdpa_chunked(
+        mesh_config,
+        model,
+        chunk_size=chunk_seq_len * mesh_config.sp_size,
+        total_seq=total_seq_len * mesh_config.sp_size,
+        pcc_threshold=DEFAULT_PCC_THRESHOLD,
+        rmse_threshold=DEFAULT_RMSE_THRESHOLD,
+        q_chunk_size=model.q_chunk_sizes[0],
+        k_chunk_size=model.k_chunk_sizes[0],
+        indexed_nd_sharded_kv_cache=True,
+        v_single_slot=True,
+    )
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize("q_chunk_size", [32, 64, 128, 160], ids=lambda q: f"q{q}")
+def test_ring_joint_attention_chunked_unrolled_v_accuracy(q_chunk_size):
+    """Production-sized unrolled-V MLA chunked prefill: indexed 576-wide latent K cache (slot 1 of 2), batch-1
+    per-head bfp8 V (d_v=128), 24 local heads, k512, every chunk checked against the full-sequence reference."""
+    model = UNROLLED_V_CHUNKED_MODEL_CONFIGS["kimi_k3_unrolled_v"]
+    run_ring_joint_sdpa_chunked(
+        MESH_CONFIG,
+        model,
+        chunk_size=CHUNKED_PREFILL_CHUNK_SIZE,
+        q_chunk_size=q_chunk_size,
+        k_chunk_size=512,
+        indexed_nd_sharded_kv_cache=True,
+        v_single_slot=True,
     )
 
 
@@ -5246,6 +5304,25 @@ def test_ring_joint_attention_logical_tensor_accuracy(is_causal, is_balanced):
     )
 
 
+def test_ring_joint_attention_shared_k_multi_batch_accuracy():
+    """B=2 shared-K (nhk=1) heads with fewer Q units than cores: rows hold both batches' units and some rows idle,
+    so the per-row K multicast must stay off (one batch's K would reach the other batch's cores)."""
+    run_ring_joint_sdpa(
+        MESH_CONFIG,
+        2,  # b
+        2,  # nhq
+        1,  # nhk
+        128 * MESH_CONFIG.sp_size,  # sq: 4 q32 chunks per head and batch -> 16 units
+        64,  # d_q
+        32,  # q_chunk_size
+        32,  # k_chunk_size
+        ttnn.bfloat16,
+        nhv=2,
+        d_v=32,
+        is_causal=True,
+    )
+
+
 @pytest.mark.skipif(os.environ.get("CI") == "true", reason="Performance test - skip on CI")
 @pytest.mark.parametrize(
     "b,sq,nhq,nhk,nhv,d_q,d_k,d_v,q_chunk_size,k_chunk_size,is_causal,is_balanced,q_dtype,kv_dtype",
@@ -5972,6 +6049,22 @@ RING_MLA_CHUNKED_MODEL_CONFIGS["kimi_k3"] = ModelConfig(
     k_chunk_sizes=[512, 640],
     seq_len=CHUNKED_PREFILL_CHUNK_SIZE,  # unused by chunked path
 )
+
+# Kimi-K3 with V unrolled ahead of the SDPA (MLA_UNROLLED_V=1): K is the 576-wide latent cache, V is the
+# per-head 128-wide bfp8 expansion; the indexed K cache keeps its slot while V is a single batch-1 slot.
+UNROLLED_V_CHUNKED_MODEL_CONFIGS = {
+    "kimi_k3_unrolled_v": replace(
+        RING_MLA_CHUNKED_MODEL_CONFIGS["kimi_k3"],
+        name="kimi_k3_unrolled_v",
+        d_v=128,
+        q_chunk_sizes=[32, 64, 128, 160],
+        k_chunk_sizes=[512],
+        use_ring_mla=False,
+        indexed_kv_cache=True,
+        v_single_slot=True,
+    ),
+}
+CHUNKED_PERF_MODEL_CONFIGS.update(UNROLLED_V_CHUNKED_MODEL_CONFIGS)
 
 # Minimax3 production chunked-prefill GQA shape. The full model is 64 Q heads and 4 K/V
 # heads. With TP=4, each chip sees one KV head; keep the config per-ring so the generic
@@ -7087,6 +7180,8 @@ def test_ring_joint_attention_chunked_perf_impl(model_name, qk_configs, chunk_si
     mesh_config = MESH_CONFIG
     model = CHUNKED_PERF_MODEL_CONFIGS[model_name]
     _, total_seq = get_chunked_perf_workload(model, mesh_config)
+    if model.indexed_kv_cache and reuse_kv_buffer:
+        pytest.skip("The indexed K/V cache brings its own cache layout; reuse_kv does not apply")
 
     run_ring_joint_sdpa_chunked(
         mesh_config,
@@ -7094,13 +7189,15 @@ def test_ring_joint_attention_chunked_perf_impl(model_name, qk_configs, chunk_si
         chunk_size=chunk_size,
         total_seq=total_seq,
         qk_configs=qk_configs,
-        persistent_buffer_mode="reuse_max",
+        persistent_buffer_mode="exact_per_chunk" if model.indexed_kv_cache else "reuse_max",
         do_check=False,
         reuse_kv_buffer=reuse_kv_buffer,
         sliding_window_size=model.sliding_window_size,
         use_ring_mla=model.use_ring_mla,
         matmul_math_fidelity=model.matmul_math_fidelity,
         nd_sharded_kv_cache=model.nd_sharded_kv_cache,
+        indexed_nd_sharded_kv_cache=model.indexed_kv_cache,
+        v_single_slot=model.v_single_slot,
     )
 
 
@@ -7415,8 +7512,12 @@ def test_ring_joint_attention_create_chunked_perf_table(model_name, q_chunk_size
         chunk_size,
         accuracy_test_name="test_ring_joint_attention_chunked_perf_impl",
         subdir="ttnn_ring_joint_sdpa_chunked_performance",
-        label="Ring Joint Chunked-Prefill (reuse KV buffer)",
-        id_suffix="-reuse_kv",
+        label=(
+            "Ring Joint Chunked-Prefill (fresh indexed KV)"
+            if model.indexed_kv_cache
+            else "Ring Joint Chunked-Prefill (reuse KV buffer)"
+        ),
+        id_suffix="-fresh_kv" if model.indexed_kv_cache else "-reuse_kv",
     )
 
 
@@ -7447,7 +7548,7 @@ def test_ring_joint_attention_minimax3_gqa_create_chunked_perf_table(
 
 
 def compute_chunked_prefill_perf_check_utilization(
-    mesh_config, model, chunk_size, perf_chunk, duration_ns, measured_core_count
+    mesh_config, model, chunk_size, perf_chunk, duration_ns, measured_core_count, round_to_grid_rows=True
 ):
     # Chunk geometry: q_per_dev Q rows attend to the full prefix (non-causal rectangle) plus
     # the current chunk's causal triangle. Folding the triangle into an effective K/V length
@@ -7457,7 +7558,9 @@ def compute_chunked_prefill_perf_check_utilization(
     effective_kv = prefix_k + chunk_size // 2
 
     # Match perf-table effective_cores rounding (ignore non-multiple-of-grid-row CCL strays).
-    effective_cores = measured_core_count - measured_core_count % mesh_config.grid_rows
+    effective_cores = (
+        measured_core_count - measured_core_count % mesh_config.grid_rows if round_to_grid_rows else measured_core_count
+    )
     assert (
         effective_cores > 0
     ), f"effective_cores=0 (measured_core_count={measured_core_count}) - profiler output incomplete"
@@ -7516,6 +7619,10 @@ else:
         # After the Blackhole NoC MID-address write skip (#56023): 4.567-4.591 ms (70.77-71.15% util)
         # across QB and QB2 runs, so the earlier bimodal spread no longer needs a wider band.
         ("kimi_k3", 32, 640, 4, 71.0, DEFAULT_PERF_MARGIN),
+        # 8-device ring (Blackhole LoudBox, sp=8 tp=1, 110 SDPA cores). Three-run medians:
+        # kimi50k 4.940 ms (69.74 / 69.76 / 69.80%), kimi_k3 8.449 ms (69.89 / 69.93 / 70.10%).
+        ("kimi50k", 32, 640, 8, 69.76, DEFAULT_PERF_MARGIN),
+        ("kimi_k3", 32, 640, 8, 69.93, DEFAULT_PERF_MARGIN),
     ]
 
 
@@ -7601,6 +7708,78 @@ def test_ring_mla_chunked_perf_check(model_name, q_chunk_size, k_chunk_size, rin
     assert lower <= utilization <= upper, (
         f"Math utilization {utilization:.2f}% outside band [{lower:.2f}, {upper:.2f}] "
         f"(expected {expected_util:.2f}%, margin +/- {margin*100:.1f}%)"
+    )
+
+
+# Unrolled-V K3 (separate per-head V, d_v=128) final 50k+5k chunk. Util counts d_v=128 FLOPs, so it is not
+# comparable to the ring_mla (d_v=512) numbers above; compare chunk latency end to end instead.
+UNROLLED_V_CHUNKED_PERF_CHECK_CONFIGS = [
+    # (model_name, q_chunk_size, k_chunk_size, ring_size, expected_util)
+    # 8-device ring on the Blackhole LoudBox (non-Galaxy, sp=8 tp=1, 110 SDPA cores). q160 is the model's pick
+    # (96 units, one wave): 5.863 / 5.864 ms on stock fabric packets.
+    ("kimi_k3_unrolled_v", 160, 512, 8, 65.20),
+]
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize(
+    "model_name, q_chunk_size, k_chunk_size, ring_size_expected, expected_util",
+    UNROLLED_V_CHUNKED_PERF_CHECK_CONFIGS,
+    ids=[f"{cfg[0]}-q{cfg[1]}-k{cfg[2]}-ring{cfg[3]}" for cfg in UNROLLED_V_CHUNKED_PERF_CHECK_CONFIGS],
+)
+@skip_with_llk_assert("No need to verify LLK asserts for performance tests.")
+@skip_with_watcher("Watcher perturbs kernel timing; perf checks are not meaningful with it enabled.")
+def test_ring_joint_attention_chunked_unrolled_v_perf_check(
+    model_name, q_chunk_size, k_chunk_size, ring_size_expected, expected_util
+):
+    """Math util of the final chunk of the unrolled-V MLA chunked prefill (indexed latent K cache, batch-1
+    per-head bfp8 V)."""
+    if MESH_CONFIG.is_galaxy or MESH_CONFIG.sp_size != ring_size_expected:
+        pytest.skip(f"Calibrated for a non-Galaxy ring of {ring_size_expected}, got sp={MESH_CONFIG.sp_size}")
+
+    model = CHUNKED_PERF_MODEL_CONFIGS[model_name]
+    chunk_size = CHUNKED_PREFILL_CHUNK_SIZE
+    n_chunks = CHUNKED_PREFILL_TOTAL_SEQ // chunk_size
+    perf_chunk = n_chunks - 1
+
+    config_id = f"{get_test_case_id(model, q_chunk_size, k_chunk_size)}-chunk{chunk_size}-indexed"
+    runtime = open_ring_joint_sdpa_runtime(MESH_CONFIG)
+    sdpa_cores = runtime.sdpa_compute_grid[0] * runtime.sdpa_compute_grid[1]
+    try:
+        with mock.patch.dict(os.environ, {CHUNKED_PREFILL_CHUNK_ID_ENV: str(perf_chunk)}):
+            duration_ns, perf_records = profile_ring_joint_runtime_duration_ns(
+                runtime.mesh_device,
+                lambda: run_ring_joint_sdpa_chunked(
+                    MESH_CONFIG,
+                    model,
+                    chunk_size=chunk_size,
+                    qk_configs=[(q_chunk_size, k_chunk_size)],
+                    persistent_buffer_mode="exact_per_chunk",
+                    do_check=False,
+                    indexed_nd_sharded_kv_cache=True,
+                    v_single_slot=True,
+                    matmul_math_fidelity=model.matmul_math_fidelity,
+                    runtime=runtime,
+                ),
+            )
+    finally:
+        close_ring_joint_sdpa_runtime(runtime)
+
+    utilization, _ = compute_chunked_prefill_perf_check_utilization(
+        MESH_CONFIG, model, chunk_size, perf_chunk, duration_ns, sdpa_cores, round_to_grid_rows=False
+    )
+    utilization /= get_matmul_peak_multiplier(model)
+
+    logger.info(
+        f"Unrolled-V chunked final-chunk perf check {config_id}: "
+        f"duration={duration_ns/1e6:.3f} ms, math_util={utilization:.2f}% sdpa_cores={sdpa_cores} "
+        f"(expected {expected_util}), profiler_records={len(perf_records)}"
+    )
+    lower = expected_util * (1 - DEFAULT_PERF_MARGIN)
+    upper = expected_util * (1 + DEFAULT_PERF_MARGIN)
+    assert lower <= utilization <= upper, (
+        f"Math utilization {utilization:.2f}% outside band [{lower:.2f}, {upper:.2f}] "
+        f"(expected {expected_util:.2f}%, margin +/- {DEFAULT_PERF_MARGIN*100:.1f}%)"
     )
 
 

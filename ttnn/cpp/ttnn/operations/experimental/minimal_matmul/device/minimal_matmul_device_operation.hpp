@@ -30,11 +30,22 @@ struct MinimalMatmulDeviceOperation {
             const MinimalMatmulParams& operation_attributes,
             const MinimalMatmulInputs& tensor_args,
             std::vector<Tensor>& tensor_return_value);
+
+        // Cache-hit hook: the tensor bindings and kv_layer_idx (left out of the program hash) move.
+        static tt::tt_metal::experimental::ProgramRunArgs override_runtime_arguments(
+            const MinimalMatmulParams& operation_attributes,
+            const MinimalMatmulInputs& tensor_args,
+            std::vector<Tensor>& tensor_return_value,
+            const std::optional<ttnn::MeshCoordinate>& mesh_dispatch_coordinate = std::nullopt);
     };
 
     using program_factory_t = std::variant<ProgramFactory>;
 
     static void validate_on_program_cache_miss(
+        const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
+
+    // Default hash minus kv_layer_idx, a runtime arg: every layer of a model shares one program.
+    static ttsl::hash::hash_t compute_program_hash(
         const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
 
     static spec_return_value_t compute_output_specs(
@@ -81,6 +92,16 @@ std::vector<Tensor> minimal_matmul(
     bool fuse_swiglu = false,
     // Fused concat (concat-free): when set, in0's K is input_tensor (prefix) then optional_input_tensor
     // (suffix); the split point is input_tensor's K width and the weight is stacked [W_prefix; W_suffix].
-    const std::optional<Tensor>& optional_input_tensor = std::nullopt);
+    const std::optional<Tensor>& optional_input_tensor = std::nullopt,
+    const std::optional<Tensor>& valid_rows_tensor = std::nullopt,
+    uint32_t valid_rows_addend = 0,
+    uint32_t valid_rows_divisor = 1,
+    uint32_t valid_rows_multiplier = 1,
+    uint32_t valid_rows_align = 1,
+    const std::optional<Tensor>& slot_tensor = std::nullopt,
+    uint32_t kv_num_layers = 1,
+    uint32_t kv_layer_idx = 0,
+    std::optional<uint32_t> out_head_dim = std::nullopt,
+    bool in0_k_prefix = false);
 
 }  // namespace ttnn::prim

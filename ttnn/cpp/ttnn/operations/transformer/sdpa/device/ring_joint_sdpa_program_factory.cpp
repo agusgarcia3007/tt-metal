@@ -697,7 +697,7 @@ void apply_ring_joint_scalar_runtime_args(
                         const uint32_t Ht = shape[2] / tt::constants::TILE_HEIGHT;
                         const uint32_t Wt = shape[3] / tt::constants::TILE_WIDTH;
                         const uint32_t input_batch_base =
-                            ag_rt::input_batch_base_pages(kv_cache_batch_idx, num_heads, Ht, Wt);
+                            ag_rt::input_batch_base_pages(shape[0] == 1 ? 0 : kv_cache_batch_idx, num_heads, Ht, Wt);
                         const uint32_t idx = header_count + in * descriptor_field_count + batch_base_offset;
                         if (core_args.size() > idx) {  // skip cores that don't run this kernel
                             write_runtime_arg(core_args, idx, input_batch_base, "all_gather_reader.input_batch_base");
@@ -1922,6 +1922,9 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
     if (math_fidelity == MathFidelity::LoFi) {
         defines["SDPA_COMPUTE_LOFI"] = "1";
     }
+    if (indexed_kv_cache && tensor_args.input_v.has_value() && tensor_args.input_v->logical_shape()[0] == 1) {
+        defines["V_SINGLE_SLOT"] = "1";
+    }
     defines["SLIDING_HALO_SLOT_COUNT"] =
         std::to_string(has_sliding_window ? chunked_sliding_halo_layout.halo_slot_count : 0);
     const uint32_t sliding_halo_hops =
@@ -2528,14 +2531,18 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         }
     }
 
-    // K multicast pass: one mcast chain per logical row. Shared-K keeps the all-or-nothing policy:
-    // every row must contain work, otherwise the previously built linear chain remains active.
+    // K multicast pass: one mcast chain per logical row. A row with no Q work sits out (its cores read no K and
+    // join no handshake), so a grid with more cores than Q units keeps multicast instead of falling back to the
+    // linear chain.
     bool k_mcast_enabled = false;
     std::string k_mcast_fallback_reason;
     std::vector<uint32_t> k_chain_max_q(batch_chain_configs.size(), 0);  // per-core loop-padding count
 
     if (!k_uses_batch_chain || !enable_kv_chains) {
         // No non-GQA shared-K chain to multicast.
+    } else if (!build_kv_chains) {
+        // A row may hold Q units of different batches, which need different K.
+        k_mcast_fallback_reason = "B > 1";
     } else if (num_cores < 2) {
         k_mcast_fallback_reason = "num_cores < 2";
     } else if (grid_size.x < 2) {
@@ -2546,18 +2553,20 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
         row_mcast_selections.reserve(grid_size.y);
         std::deque<uint32_t> recent_cols;  // FIFO of <= grid.x-1 most-recent claimed phys_x
 
-        bool all_chains_picked = true;
         for (uint32_t row = 0; row < grid_size.y; ++row) {
             const std::optional<RowWideChainMcastSelection> selection = select_row_wide_chain_mcast(row, recent_cols);
             if (!selection.has_value()) {
-                k_mcast_fallback_reason = fmt::format("row {} has no work", row);
-                all_chains_picked = false;
-                break;
+                // Idle row: drop any linear-chain role so its cores neither read nor forward K.
+                for (uint32_t col = 0; col < grid_size.x; ++col) {
+                    batch_chain_configs[row * grid_size.x + col] = ChainConfig{};
+                }
+                continue;
             }
             row_mcast_selections.push_back(*selection);
         }
-
-        if (all_chains_picked) {
+        if (row_mcast_selections.empty()) {
+            k_mcast_fallback_reason = "no row has work";
+        } else {
             k_mcast_enabled = true;
 
             for (const auto& selection : row_mcast_selections) {
@@ -3078,10 +3087,10 @@ tt::tt_metal::ProgramDescriptor build_ring_joint_sdpa_program_descriptor(
             reader_common_args.push_back(tensor_args.slot_id->buffer());
             reader_common_args.push_back(args.kv_cache_num_layers);
             reader_common_args.push_back(args.kv_cache_layer_idx);
-            reader_common_args.push_back(std::min(
-                tensor_args.input_k.logical_shape()[0],
-                tensor_args.input_v.has_value() ? tensor_args.input_v->logical_shape()[0]
-                                                : tensor_args.input_k.logical_shape()[0]));
+            const uint32_t k_cache_batch = tensor_args.input_k.logical_shape()[0];
+            const uint32_t v_cache_batch =
+                tensor_args.input_v.has_value() ? tensor_args.input_v->logical_shape()[0] : k_cache_batch;
+            reader_common_args.push_back(v_cache_batch == 1 ? k_cache_batch : std::min(k_cache_batch, v_cache_batch));
             reader_common_args.push_back(tensor_args.kv_actual_isl->buffer());
         }
         append_logical_length_common_args(reader_common_args);

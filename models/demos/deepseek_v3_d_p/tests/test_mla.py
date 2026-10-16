@@ -9,6 +9,7 @@ tests/test_kv_cache_table.py and tests/sparse_mla/test_sparse_mla.py.
 
 import math
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -525,18 +526,36 @@ K3_CHUNKED_RT_PERF_NS = 10_556_000
 K3_CHUNKED_RT_PERF_MARGIN = 0.03
 
 
+def _op_label(kernel_sources):
+    """Op directories of a program's kernels, e.g. 'experimental/minimal_matmul'; a fused program lists each
+    (the ring SDPAs carry their all-gather kernels)."""
+    ops = set()
+    for source in kernel_sources:
+        match = re.search(r"operations/(.+?)/(?:device/)?kernels/", source)
+        if match:
+            ops.add(match.group(1).removesuffix("/device"))
+    return " + ".join(sorted(ops)) if ops else "?"
+
+
 def _rt_profile_forward_ns(mesh_device, run_fn):
     """Profile one region; return (result, total_ns) where each program contributes its MAX duration
-    across chips (slowest chip gates that program) -- the sparse-MLA/PR #49840 convention."""
+    across chips (slowest chip gates that program) -- the sparse-MLA/PR #49840 convention. Logs the
+    per-op breakdown."""
     result, records = profile_realtime_program(mesh_device, run_fn, collect_all=True)
     per_program = {}
     for record in records:
         runtime_id = record["runtime_id"]
         if not runtime_id:  # 0 is the profiler's own sentinel
             continue
-        duration_ns = float(record["duration_ns"])
-        per_program[runtime_id] = max(per_program.get(runtime_id, 0.0), duration_ns)
-    return result, sum(per_program.values())
+        duration_ns, label = per_program.get(runtime_id, (0.0, _op_label(record["kernel_sources"])))
+        per_program[runtime_id] = (max(duration_ns, float(record["duration_ns"])), label)
+    per_op = {}
+    for duration_ns, label in per_program.values():
+        count, total = per_op.get(label, (0, 0.0))
+        per_op[label] = (count + 1, total + duration_ns)
+    for label, (count, total) in sorted(per_op.items(), key=lambda item: -item[1][1]):
+        logger.info(f"    {label}: {total / 1e6:.3f} ms over {count} program(s)")
+    return result, sum(duration_ns for duration_ns, _ in per_program.values())
 
 
 def _run_chunked_prefill(
@@ -1421,6 +1440,43 @@ def test_mistral4_mla_chunked_prefill_loudbox(request, mesh_device, device_param
         determinism_check=False,
         iters_isl=[5120],
         prefill_len=50 * 1024,
+    )
+
+
+# Measured 2026-10-16 (realtime profiler, two runs within 0.5%), forward ring_mla -> unrolled_v:
+#   kimi_k3   9.43 -> 7.20 ms (-24%): ring SDPA 8.02 -> 5.45 ms, + V expansion (minimal_matmul) 0.39 ms, - wkv_b2 0.06 ms
+#   kimi_k2_7 6.40 -> 5.52 ms (-14%): ring SDPA 5.47 -> 4.34 ms, + V expansion 0.29 ms, - wkv_b2 0.04 ms
+# The V expansion covers every local cache row, so at sp=8 it has a quarter of these rows.
+@pytest.mark.parametrize(
+    "mesh_device,device_params",
+    [pytest.param((2, 4), fabric2d_device_params(l1_small_size=1152), id="fabric2d-2x4")],
+    indirect=["mesh_device", "device_params"],
+)
+@pytest.mark.parametrize("unrolled_v", [False, True], ids=["ring_mla", "unrolled_v"])
+@pytest.mark.parametrize("variant", ["kimi_k2_7", "kimi_k3"], indirect=True, ids=["k2_7", "k3"])
+@pytest.mark.skipif(not is_blackhole(), reason="LoudBox (8x p150b) perf; the realtime profiler is Blackhole-only")
+@pytest.mark.timeout(0)
+def test_mla_chunked_perf_loudbox(request, mesh_device, device_params, variant, unrolled_v, monkeypatch):
+    """Chunked-prefill MLA forward on the LoudBox as a 2x4 mesh, ring_mla vs V unrolled ahead of ring_joint SDPA
+    (MLA_UNROLLED_V). sp=2 / tp=4 with a 640-row-per-chip chunk gives every chip the Galaxy's work -- 640 Q rows of
+    its per-chip heads against the 50k cached prefix -- and both paths their tuned 640 configs; only the ring is
+    shorter (2 chips, not 8)."""
+    monkeypatch.setenv("MLA_UNROLLED_V", "1" if unrolled_v else "0")
+    chunk_size_global = PREFILL_CHUNK_TOKENS_PER_CHIP * mesh_device.shape[0]
+    total_ns = _run_chunked_prefill(
+        request,
+        mesh_device,
+        reference=None,
+        topology=per_axis_topology(device_params["fabric_config"]),
+        profile=True,
+        chunk_size_global=chunk_size_global,
+        iters_isl=[chunk_size_global],
+        prefill_len=50 * 1024,
+    )
+    logger.info(
+        f"{variant.name} chunked 50k + {chunk_size_global} MLA forward ({'unrolled_v' if unrolled_v else 'ring_mla'}, "
+        f"LoudBox 2x4): "
+        f"{total_ns / 1e6:.3f} ms (realtime profiler)"
     )
 
 
