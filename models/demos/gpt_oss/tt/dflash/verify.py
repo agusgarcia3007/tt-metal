@@ -109,7 +109,7 @@ class FusedVerify:
             self.nq * self.hd // TILE,
             H,
             OPROJ_DECODE_WEIGHT_DTYPE,
-            readers=int(os.environ.get("DFLASH_OPROJ_READERS", "2")),  # 2: 4.81 vs 4.88 ms (1), 4.84 (3)
+            readers=int(os.environ.get("DFLASH_OPROJ_READERS", "3")),  # 3 (row-placed era): 5.020 -> 4.997 ms at 256
             x_pages=self.hd // TILE,
             out_mode=5,
             rows=M,

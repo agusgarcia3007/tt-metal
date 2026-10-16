@@ -94,7 +94,7 @@ class FusedDraft:
             nq * hd // TILE,
             H,
             dtype,
-            readers=2,
+            readers=int(os.environ.get("DFLASH_DRAFT_OPROJ_READERS", "2")),
             x_pages=hd // TILE,
             out_mode=5,
             rows=M,

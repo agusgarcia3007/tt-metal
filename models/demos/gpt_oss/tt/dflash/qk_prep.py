@@ -227,8 +227,11 @@ class DraftQKPrep:
                 compile_time_args=compute_ct,
                 runtime_args=[],
                 defines=self.defines,
+                # DFLASH_PREP_FID: the prep compute's math fidelity (HiFi4 default)
                 config=ttnn.ComputeConfigDescriptor(
-                    math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, math_approx_mode=False
+                    math_fidelity=getattr(ttnn.MathFidelity, os.environ.get("DFLASH_PREP_FID", "HiFi4")),
+                    fp32_dest_acc_en=True,
+                    math_approx_mode=False,
                 ),
             ),
         ]
