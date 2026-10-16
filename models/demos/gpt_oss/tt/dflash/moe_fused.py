@@ -247,8 +247,12 @@ class MoEFused:
                 semaphores=list(sems),
                 cbs=list(rprog.cbs) + list(gprog.cbs) + list(dprog.cbs),
             )
-            sender = b._sender_kernel(coord, partial, "moe", producers=dn.cores.num_cores(), sem_id=2)
-            b._add_sender(coord, program, sender)
+            links = min(b.links, b.chunks)  # (DFLASH_BOUNDARY_LINKS: one sender per fabric link, BRISC / NCRISC)
+            for link in range(links):
+                sender = b._sender_kernel(
+                    coord, partial, "moe", producers=dn.cores.num_cores(), sem_id=2, link=link, links=links
+                )
+                b._add_sender(coord, program, sender, link)
             mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
         io = []
         for t in [*rio, *gio, *dio, self.counters, self.pred]:
@@ -371,7 +375,14 @@ class DenseMLPFused:
                 semaphores=list(sems),
                 cbs=list(bcbs) + list(gprog.cbs) + list(dprog.cbs),
             )
-            b._add_sender(coord, program, b._sender_kernel(coord, partial, "moe", producers=n_d, sem_id=2))
+            links = min(b.links, b.chunks)  # one sender per fabric link (BRISC / NCRISC)
+            for link in range(links):
+                b._add_sender(
+                    coord,
+                    program,
+                    b._sender_kernel(coord, partial, "moe", producers=n_d, sem_id=2, link=link, links=links),
+                    link,
+                )
             mesh_program[ttnn.MeshCoordinateRange(coord, coord)] = program
         io = []
         for t in [*bio, *gio, *dio]:

@@ -79,7 +79,8 @@ class FusedVerify:
             cfg.rms_norm_eps,
             cluster_axis=1,
             rows=M,
-            links=int(os.environ.get("DFLASH_BOUNDARY_LINKS", "1")),
+            # 2: one sender per fabric link (4093 -> 4067 us verify pass at ISL 256)
+            links=int(os.environ.get("DFLASH_BOUNDARY_LINKS", "2")),
             ccl=os.environ.get("DFLASH_CCL", "fabric"),
             # DFLASH_BOUNDARY_HELPERS=n: the multi-core boundary on n helper cores of grid row 2 (no streamed-op worker
             # sits there)

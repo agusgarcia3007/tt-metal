@@ -151,6 +151,10 @@ class FusedDraft:
                 out_mode=6,
                 prefetch_cols=int(os.environ.get("DFLASH_LM_PREFETCH", LM_HEAD_STREAM_PREFETCH)),
                 rows=M,
+                # DFLASH_DRAFT_LM_EXCLUDE="x,y;x,y": logical cores its readers do not use (placement experiments)
+                exclude=[
+                    tuple(map(int, c.split(","))) for c in os.environ.get("DFLASH_DRAFT_LM_EXCLUDE", "").split(";") if c
+                ],
             )
         rep = ttnn.ReplicateTensorToMesh(mesh)
         # this LM head's own per-core argmax lists (its reader count may differ from the eager drafter's head)
