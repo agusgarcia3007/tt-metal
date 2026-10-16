@@ -27,7 +27,7 @@ from ..fused_decode.stream import EXPERT_BANK_ROT
 from ..fused_decode.union import ExpertDownUnion, ExpertGateUpUnion
 
 MOE = [("MOE_FUSED", "1")]
-EARLY_WSEM = 7  # DFLASH_MOE_EARLY_UNION: routing weights ready (gate|up / down cores)
+EARLY_WSEM = 12  # DFLASH_MOE_EARLY_UNION: routing weights ready (gate|up / down cores; 7.. : stealing)
 # DFLASH_MOE_STEAL=1: gate|up work stealing within a bank (kernels/stream_gate_up_union_reader.cpp), per-(slot, pair)
 # done flags instead of per-slot counters
 STEAL = os.environ.get("DFLASH_MOE_STEAL", "0") == "1"
@@ -198,7 +198,7 @@ class MoEFused:
         MOE_ = MOE + ([("MOE_ACTIVE_ROWS", str(active_rows))] if active_rows else [])
         # DFLASH_MOE_EARLY_UNION=1 (with the router row split): the router releases gate|up / down on the union, the
         # softmax weights follow (semaphore EARLY_WSEM; kernels/stream_linear_writer.cpp MOE_EARLY_UNION)
-        early = bool(self.split_defines) and not STEAL and os.environ.get("DFLASH_MOE_EARLY_UNION", "1") == "1"
+        early = bool(self.split_defines) and os.environ.get("DFLASH_MOE_EARLY_UNION", "1") == "1"
         if early:
             MOE_ = MOE_ + [("MOE_WSEM", str(EARLY_WSEM))]
         if os.environ.get("DFLASH_MOE_PRED_VC", "0") == "1":  # predicted-expert prefetch on the readers' VCs

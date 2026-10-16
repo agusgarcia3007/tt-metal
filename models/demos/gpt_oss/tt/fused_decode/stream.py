@@ -190,6 +190,7 @@ def _page_bytes(tiles, tile_bytes):
 
 
 def row_placement(mesh_device, per_bank, exclude=(), coord=None):
+    EAST = os.environ.get("DFLASH_ROW_EAST", "0") == "1"
     """per_bank logical reader cores per DRAM bank, on the row of the bank's optimal NOC0 worker: nearest that worker
     first, a row shared by two banks split at the right bank's worker column (DFLASH_ROW_SPLIT=half: equal halves,
     slower: 32K 5.626 -> 5.872 ms), a bank short of cores on its segment topped up from the rest of its row (32K
@@ -223,7 +224,9 @@ def row_placement(mesh_device, per_bank, exclude=(), coord=None):
             y, xs = cand[b][phase]
             if not 0 <= y < grid.y:
                 continue
-            for x in sorted(xs, key=lambda x: (abs(x - w.x), x)):
+            # DFLASH_ROW_EAST=1: the worker, then the cores east of it, then west (the first readers: gate|up)
+            order = (lambda x: (x < w.x, abs(x - w.x))) if EAST else (lambda x: (abs(x - w.x), x))
+            for x in sorted(xs, key=order):
                 if len(out[b]) < per_bank and (x, y) not in used:
                     used.add((x, y))
                     out[b].append(ttnn.CoreCoord(x, y))
