@@ -330,7 +330,7 @@ class DenseMLPFused:
         # DFLASH_DRAFT_MLP_ROWS=1: the readers on their DRAM bank's row (fused_decode/stream.py row_placement; the
         # exclusions above do not apply): per bank the gate_up_readers nearest cores to gate|up, the next to down
         gp = dp = None
-        if os.environ.get("DFLASH_DRAFT_MLP_ROWS", "0") == "1":
+        if os.environ.get("DFLASH_DRAFT_MLP_ROWS", "1") == "1":
             from ..fused_decode.stream import row_placement
 
             rp = row_placement(mesh_device, gate_up_readers + down_readers, exclude=taken)
